@@ -84,7 +84,7 @@ export default function ChartPage() {
       const tf  = timeframeRef.current
       const res = await marketApi.getKlines(sym, tf, 500)
       const candles = (res as any[]).map((c: any) => ({
-        time:  c.timestamp as Time,
+        time:  c.time as Time,
         open:  c.open,
         high:  c.high,
         low:   c.low,
