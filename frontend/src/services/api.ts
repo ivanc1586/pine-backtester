@@ -13,10 +13,24 @@ export interface BacktestRequest {
   initial_capital: number
 }
 
+export interface MarketDataRequest {
+  symbol: string
+  interval: string
+  source?: string
+  limit?: number
+}
+
 export const backtestApi = {
   runBacktest: (data: BacktestRequest) => api.post('/api/backtest', data),
   getResults: (id: string) => api.get(`/api/backtest/${id}`),
   listResults: () => api.get('/api/backtest'),
+}
+
+export const marketApi = {
+  getHistoricalData: (params: MarketDataRequest) =>
+    api.get('/api/market/klines', { params }),
+  getSymbols: () => api.get('/api/market/symbols'),
+  getPrice: (symbol: string) => api.get(`/api/market/price/${symbol}`),
 }
 
 export default api
