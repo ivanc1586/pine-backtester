@@ -45,3 +45,5 @@ export const marketApi = {
   getSymbols: () =>
     api.get('/api/market/symbols').then(r => r.data),
 }
+
+export default api
