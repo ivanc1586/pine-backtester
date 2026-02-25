@@ -21,7 +21,7 @@ async def get_symbols():
 
 @router.get("/klines")
 async def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", source: str = "binance", limit: int = 1000):
-    url = f"https://api.binance.com/api/v3/klines"
+    url = "https://api.binance.com/api/v3/klines"
     params = {
         "symbol": symbol.upper(),
         "interval": interval,
@@ -32,12 +32,12 @@ async def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", source: str 
         response.raise_for_status()
         raw = response.json()
 
-    # Binance klines format:
-    # [openTime, open, high, low, close, volume, closeTime, quoteVolume, trades, takerBuyBase, takerBuyQuote, ignore]
+    # Binance klines: [openTime(ms), open, high, low, close, volume, ...]
+    # Frontend expects: timestamp (ms), open, high, low, close, volume
     candles = []
     for k in raw:
         candles.append({
-            "time": int(k[0]) // 1000,  # convert ms to seconds
+            "timestamp": int(k[0]),   # keep as milliseconds - frontend divides by 1000
             "open": float(k[1]),
             "high": float(k[2]),
             "low": float(k[3]),
@@ -45,7 +45,7 @@ async def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", source: str 
             "volume": float(k[5]),
         })
 
-    return {"candles": candles}
+    return candles
 
 @router.websocket("/ws/{symbol}/{interval}")
 async def websocket_klines(websocket: WebSocket, symbol: str, interval: str):
@@ -66,7 +66,7 @@ async def websocket_klines(websocket: WebSocket, symbol: str, interval: str):
             if raw:
                 k = raw[0]
                 candle = {
-                    "time": int(k[0]) // 1000,
+                    "timestamp": int(k[0]),   # milliseconds - frontend divides by 1000
                     "open": float(k[1]),
                     "high": float(k[2]),
                     "low": float(k[3]),
@@ -78,7 +78,7 @@ async def websocket_klines(websocket: WebSocket, symbol: str, interval: str):
             await asyncio.sleep(5)
     except WebSocketDisconnect:
         pass
-    except Exception as e:
+    except Exception:
         try:
             await websocket.close()
         except:
