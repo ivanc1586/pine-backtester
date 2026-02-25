@@ -1,153 +1,117 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
-import {
-  createChart,
-  IChartApi,
-  ISeriesApi,
-  CandlestickData,
-  Time,
-  ColorType,
-} from 'lightweight-charts'
-import { RefreshCw, ChevronDown } from 'lucide-react'
+import { createChart, IChartApi, ISeriesApi, Time, CrosshairMode } from 'lightweight-charts'
+import { Search, RefreshCw, ChevronDown } from 'lucide-react'
 import PageHeader from '../components/PageHeader'
 import LoadingSpinner from '../components/LoadingSpinner'
 import { marketApi } from '../services/api'
+import { useStrategyStore } from '../store/strategyStore'
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-const INTERVALS = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w']
+const INTERVALS = ['1m','5m','15m','30m','1h','4h','1d','1w']
 const INTERVAL_LABELS: Record<string, string> = {
-  '1m': '1\u5206', '5m': '5\u5206', '15m': '15\u5206', '30m': '30\u5206',
-  '1h': '1\u5c0f\u6642', '4h': '4\u5c0f\u6642', '1d': '\u65e5\u7dda', '1w': '\u9031\u7dda',
+  '1m':'1分','5m':'5分','15m':'15分','30m':'30分',
+  '1h':'1小時','4h':'4小時','1d':'1天','1w':'1週'
 }
 const POPULAR_SYMBOLS = [
-  'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
-  'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT',
-  'LINKUSDT', 'UNIUSDT', 'LTCUSDT', 'ATOMUSDT', 'NEARUSDT',
-  'TRXUSDT', 'SHIBUSDT', 'TONUSDT', 'WLDUSDT', 'INJUSDT',
+  'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT',
+  'ADAUSDT','DOGEUSDT','AVAXUSDT','DOTUSDT','MATICUSDT',
+  'LINKUSDT','UNIUSDT','LTCUSDT','ATOMUSDT','NEARUSDT',
 ]
 
-const getSaved = (key: string, def: string) =>
-  localStorage.getItem(key) || def
+const getSavedSymbol    = () => localStorage.getItem('chart_symbol')   || 'BTCUSDT'
+const getSavedTimeframe = () => localStorage.getItem('chart_interval')  || '1h'
 
-// How often to poll the backend (ms) - backend already caches, so 15s is fine
 const POLL_MS = 15_000
 
-// ---------------------------------------------------------------------------
-// Component
-// ---------------------------------------------------------------------------
 export default function ChartPage() {
   const chartContainerRef = useRef<HTMLDivElement>(null)
-  const chartRef          = useRef<IChartApi | null>(null)
-  const seriesRef         = useRef<ISeriesApi<'Candlestick'> | null>(null)
-  const pollTimerRef      = useRef<number | null>(null)
-  const clockTimerRef     = useRef<number | null>(null)
-  const fetchingRef       = useRef(false)
+  const chartRef           = useRef<IChartApi | null>(null)
+  const candleSeriesRef    = useRef<ISeriesApi<'Candlestick'> | null>(null)
+  const pollTimerRef       = useRef<ReturnType<typeof window.setInterval> | null>(null)
+  const fetchingRef        = useRef(false)
 
-  // Keep current params in refs so async fetchData always reads fresh values
-  const symbolRef   = useRef(getSaved('chart_symbol', 'BTCUSDT'))
-  const tfRef       = useRef(getSaved('chart_tf', '1h'))   // 'tf' = timeframe, avoids shadowing
+  const symbolRef    = useRef(getSavedSymbol())
+  const timeframeRef = useRef(getSavedTimeframe())
 
-  // React state (drives re-renders for UI)
-  const [symbol,       setSymbol]       = useState(symbolRef.current)
-  const [tf,           setTf]           = useState(tfRef.current)
-  const [loading,      setLoading]      = useState(false)
-  const [error,        setError]        = useState<string | null>(null)
-  const [currentPrice, setCurrentPrice] = useState<number | null>(null)
-  const [lastSync,     setLastSync]     = useState<number | null>(null)   // Unix seconds from backend
-  const [nowSec,       setNowSec]       = useState(() => Math.floor(Date.now() / 1000))
-  const [searchQuery,  setSearchQuery]  = useState('')
-  const [showPanel,    setShowPanel]    = useState(false)
+  const [symbol,    setSymbol]    = useState(symbolRef.current)
+  const [timeframe, setTimeframe] = useState(timeframeRef.current)
+  const [loading,   setLoading]   = useState(false)
+  const [error,     setError]     = useState<string | null>(null)
+  const [lastUpdated,     setLastUpdated]     = useState<Date | null>(null)
+  const [searchQuery,     setSearchQuery]     = useState('')
+  const [showSymbolPanel, setShowSymbolPanel] = useState(false)
+  const [currentPrice,    setCurrentPrice]    = useState<number | null>(null)
+  const { selectedStrategy } = useStrategyStore()
 
-  // ---------------------------------------------------------------------------
-  // Chart init (once)
-  // ---------------------------------------------------------------------------
+  // Chart init — runs once only
   useEffect(() => {
-    const container = chartContainerRef.current
-    if (!container) return
-
-    const chart = createChart(container, {
-      layout: {
-        background: { type: ColorType.Solid, color: '#131722' },
-        textColor: '#d1d5db',
-      },
-      grid: {
-        vertLines: { color: '#1e2433' },
-        horzLines: { color: '#1e2433' },
-      },
-      crosshair: { mode: 1 },
-      timeScale: {
-        timeVisible: true,
-        secondsVisible: false,
-        borderColor: '#374151',
-      },
-      rightPriceScale: { borderColor: '#374151' },
-      width:  container.clientWidth,
-      height: container.clientHeight,
+    if (!chartContainerRef.current) return
+    const chart = createChart(chartContainerRef.current, {
+      layout: { background: { color: '#131722' }, textColor: '#d1d4dc' },
+      grid:   { vertLines: { color: '#1e2328' }, horzLines: { color: '#1e2328' } },
+      crosshair: { mode: CrosshairMode.Normal },
+      rightPriceScale: { borderColor: '#2b2b43' },
+      timeScale: { borderColor: '#2b2b43', timeVisible: true, secondsVisible: false },
+      width: chartContainerRef.current.clientWidth,
+      height: 600,
     })
-
-    const series = chart.addCandlestickSeries({
-      upColor:          '#26a69a',
-      downColor:        '#ef5350',
-      borderUpColor:    '#26a69a',
-      borderDownColor:  '#ef5350',
-      wickUpColor:      '#26a69a',
-      wickDownColor:    '#ef5350',
+    const candleSeries = chart.addCandlestickSeries({
+      upColor: '#26a69a', downColor: '#ef5350',
+      borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+      wickUpColor: '#26a69a', wickDownColor: '#ef5350'
     })
+    chartRef.current = chart
+    candleSeriesRef.current = candleSeries
 
-    chartRef.current  = chart
-    seriesRef.current = series
-
-    const onResize = () => {
-      chart.applyOptions({
-        width:  container.clientWidth,
-        height: container.clientHeight,
-      })
+    const handleResize = () => {
+      if (chartContainerRef.current && chartRef.current) {
+        chartRef.current.applyOptions({ width: chartContainerRef.current.clientWidth })
+      }
     }
-    window.addEventListener('resize', onResize)
-
+    window.addEventListener('resize', handleResize)
     return () => {
-      window.removeEventListener('resize', onResize)
+      window.removeEventListener('resize', handleResize)
       chart.remove()
     }
   }, [])
 
-  // ---------------------------------------------------------------------------
-  // Fetch data
-  // ---------------------------------------------------------------------------
   const fetchData = useCallback(async () => {
     if (fetchingRef.current) return
     fetchingRef.current = true
     setLoading(true)
+    setError(null)
     try {
-      setError(null)
-      const data = await marketApi.getKlines(symbolRef.current, tfRef.current, 500)
-      if (data.candles?.length && seriesRef.current) {
-        // Backend already returns ts in seconds - pass directly to lightweight-charts
-        const chartData: CandlestickData[] = data.candles.map((c) => ({
-          time:  c.time as Time,
-          open:  c.open,
-          high:  c.high,
-          low:   c.low,
-          close: c.close,
-        }))
-        seriesRef.current.setData(chartData)
-        chartRef.current?.timeScale().fitContent()
-        setCurrentPrice(data.currentPrice)
-        setLastSync(data.lastSync)
+      const sym = symbolRef.current
+      const tf  = timeframeRef.current
+      const res = await marketApi.getKlines(sym, tf, 500)
+      const candles = (res as any[]).map((c: any) => ({
+        time:  c.timestamp as Time,
+        open:  c.open,
+        high:  c.high,
+        low:   c.low,
+        close: c.close,
+      }))
+      if (candles.length > 0) {
+        candleSeriesRef.current?.setData(candles)
+        const lastClose = candles[candles.length - 1].close
+        setCurrentPrice(lastClose)
+        setLastUpdated(new Date())
       }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch data')
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail || err?.message || 'Failed to load data'
+      setError(detail)
     } finally {
-      fetchingRef.current = false
       setLoading(false)
+      fetchingRef.current = false
     }
   }, [])
 
-  // ---------------------------------------------------------------------------
-  // Auto-poll: refetch every POLL_MS
-  // ---------------------------------------------------------------------------
+  // On param change: update refs, persist to localStorage, fetch, restart poll
   useEffect(() => {
+    symbolRef.current    = symbol
+    timeframeRef.current = timeframe
+    localStorage.setItem('chart_symbol',   symbol)
+    localStorage.setItem('chart_interval', timeframe)
+
     fetchData()
 
     if (pollTimerRef.current) window.clearInterval(pollTimerRef.current)
@@ -156,96 +120,67 @@ export default function ChartPage() {
     return () => {
       if (pollTimerRef.current) window.clearInterval(pollTimerRef.current)
     }
-  }, [symbol, tf, fetchData])
+  }, [symbol, timeframe, fetchData])
 
-  // ---------------------------------------------------------------------------
-  // Clock ticker: update nowSec every second so "last updated" always shows
-  // real elapsed time without requiring a network call
-  // ---------------------------------------------------------------------------
-  useEffect(() => {
-    if (clockTimerRef.current) window.clearInterval(clockTimerRef.current)
-    clockTimerRef.current = window.setInterval(() => {
-      setNowSec(Math.floor(Date.now() / 1000))
-    }, 1000)
-    return () => {
-      if (clockTimerRef.current) window.clearInterval(clockTimerRef.current)
-    }
-  }, [])
+  const handleSymbolClick = (sym: string) => {
+    setSymbol(sym)
+    setShowSymbolPanel(false)
+    setSearchQuery('')
+  }
 
-  // ---------------------------------------------------------------------------
-  // Handlers
-  // ---------------------------------------------------------------------------
-  const handleSymbol = useCallback((s: string) => {
-    symbolRef.current = s
-    setSymbol(s)
-    localStorage.setItem('chart_symbol', s)
-    setShowPanel(false)
-  }, [])
+  const filteredSymbols = POPULAR_SYMBOLS.filter(s =>
+    s.toLowerCase().includes(searchQuery.toLowerCase())
+  )
 
-  const handleTf = useCallback((t: string) => {
-    tfRef.current = t
-    setTf(t)
-    localStorage.setItem('chart_tf', t)
-  }, [])
-
-  const handleRefresh = useCallback(() => { fetchData() }, [fetchData])
-
-  const filtered = searchQuery
-    ? POPULAR_SYMBOLS.filter((s) => s.includes(searchQuery.toUpperCase()))
-    : POPULAR_SYMBOLS
-
-  // Human-readable "last updated X seconds ago"
-  const lastUpdatedLabel = (() => {
-    if (!lastSync) return null
-    const elapsed = nowSec - lastSync
-    if (elapsed < 5)  return '\u525b\u525b\u66f4\u65b0'
-    if (elapsed < 60) return `${elapsed} \u79d2\u524d\u66f4\u65b0`
-    const m = Math.floor(elapsed / 60)
-    return `${m} \u5206\u9418\u524d\u66f4\u65b0`
-  })()
-
-  // ---------------------------------------------------------------------------
-  // Render
-  // ---------------------------------------------------------------------------
   return (
-    <div className="flex flex-col h-screen bg-gray-900 text-white">
-      <PageHeader title="K\u7dda\u5716" />
+    <div className="min-h-screen bg-[#0b0e11]">
+      <PageHeader
+        title="市場圖表"
+        description="即時加密貨幣K線圖表"
+        actions={
+          <button
+            onClick={fetchData}
+            disabled={loading}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+            重新整理
+          </button>
+        }
+      />
 
-      <div className="flex-1 flex flex-col overflow-hidden p-4 gap-3">
-
-        {/* \u2500\u2500 Controls \u2500\u2500 */}
-        <div className="flex flex-wrap items-center gap-2">
-
-          {/* Symbol picker */}
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {/* Top toolbar */}
+        <div className="bg-[#131722] rounded-lg p-4 mb-4 flex flex-wrap gap-4 items-center">
+          {/* Symbol selector */}
           <div className="relative">
             <button
-              onClick={() => setShowPanel((v) => !v)}
-              className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 rounded flex items-center gap-1 text-sm font-medium"
+              onClick={() => setShowSymbolPanel(!showSymbolPanel)}
+              className="flex items-center gap-2 px-4 py-2 bg-[#1e2328] text-white rounded-lg hover:bg-[#2a2e39] transition-colors"
             >
-              {symbol} <ChevronDown size={14} />
+              <span className="font-semibold text-lg">{symbol}</span>
+              <ChevronDown className="w-4 h-4" />
             </button>
-            {showPanel && (
-              <div className="absolute top-full mt-1 left-0 bg-gray-800 border border-gray-700 rounded shadow-xl p-2 w-64 z-20">
-                <input
-                  type="text"
-                  placeholder="\u641c\u5c0b..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full px-2 py-1 bg-gray-700 rounded text-sm mb-2 outline-none"
-                  autoFocus
-                />
-                <div className="grid grid-cols-2 gap-1 max-h-52 overflow-y-auto">
-                  {filtered.map((s) => (
+            {showSymbolPanel && (
+              <div className="absolute top-full left-0 mt-2 w-80 bg-[#1e2328] rounded-lg shadow-xl z-50 p-4">
+                <div className="relative mb-3">
+                  <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="搜尋交易對..."
+                    className="w-full pl-10 pr-4 py-2 bg-[#131722] text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+                <div className="max-h-64 overflow-y-auto space-y-1">
+                  {filteredSymbols.map(sym => (
                     <button
-                      key={s}
-                      onClick={() => handleSymbol(s)}
-                      className={`px-2 py-1 text-xs rounded text-left ${
-                        s === symbol
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
-                      }`}
+                      key={sym}
+                      onClick={() => handleSymbolClick(sym)}
+                      className="w-full text-left px-3 py-2 text-white hover:bg-[#2a2e39] rounded transition-colors"
                     >
-                      {s}
+                      {sym}
                     </button>
                   ))}
                 </div>
@@ -253,70 +188,63 @@ export default function ChartPage() {
             )}
           </div>
 
+          {/* Current price */}
+          {currentPrice && (
+            <div className="text-white">
+              <div className="text-sm text-gray-400">當前價格</div>
+              <div className="text-xl font-bold">${currentPrice.toFixed(2)}</div>
+            </div>
+          )}
+
           {/* Timeframe buttons */}
-          <div className="flex gap-1">
-            {INTERVALS.map((iv) => (
+          <div className="flex gap-1 ml-auto">
+            {INTERVALS.map(tf => (
               <button
-                key={iv}
-                onClick={() => handleTf(iv)}
-                className={`px-2 py-1 text-xs rounded font-medium ${
-                  iv === tf
+                key={tf}
+                onClick={() => setTimeframe(tf)}
+                className={`px-3 py-1.5 rounded transition-colors ${
+                  timeframe === tf
                     ? 'bg-blue-600 text-white'
-                    : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+                    : 'bg-[#1e2328] text-gray-400 hover:bg-[#2a2e39]'
                 }`}
               >
-                {INTERVAL_LABELS[iv]}
+                {INTERVAL_LABELS[tf]}
               </button>
             ))}
           </div>
-
-          {/* Refresh button */}
-          <button
-            onClick={handleRefresh}
-            disabled={loading}
-            className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 rounded flex items-center gap-1 text-sm"
-          >
-            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
-            \u5237\u65b0
-          </button>
-
-          {/* Price */}
-          {currentPrice && (
-            <span className="ml-2 text-lg font-bold text-green-400">
-              ${currentPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            </span>
-          )}
-
-          {/* Last updated clock - updates every second */}
-          {lastUpdatedLabel && (
-            <span className="ml-auto text-xs text-gray-400">
-              {lastUpdatedLabel}
-            </span>
-          )}
         </div>
 
-        {/* \u2500\u2500 Error \u2500\u2500 */}
+        {/* Error message */}
         {error && (
-          <div className="bg-red-900/60 border border-red-700 text-red-200 px-3 py-2 rounded text-sm">
+          <div className="bg-red-900/20 border border-red-500 rounded-lg p-4 mb-4 text-red-400">
             {error}
           </div>
         )}
 
-        {/* \u2500\u2500 Chart \u2500\u2500 */}
-        <div className="relative flex-1 rounded border border-gray-700 overflow-hidden">
-          {loading && (
-            <div className="absolute inset-0 flex items-center justify-center bg-gray-900/60 z-10">
-              <LoadingSpinner />
+        {/* Chart */}
+        <div className="bg-[#131722] rounded-lg p-4">
+          <div className="flex justify-between items-center mb-2">
+            <div className="text-white text-sm">
+              {selectedStrategy && (
+                <span className="text-gray-400">
+                  策略: <span className="text-blue-400">{selectedStrategy.name}</span>
+                </span>
+              )}
             </div>
-          )}
-          <div ref={chartContainerRef} className="w-full h-full" />
+            {lastUpdated && (
+              <div className="text-gray-400 text-xs">
+                更新時間: {lastUpdated.toLocaleTimeString('zh-TW')}
+              </div>
+            )}
+          </div>
+          <div ref={chartContainerRef} className="relative">
+            {loading && (
+              <div className="absolute inset-0 bg-[#131722]/80 flex items-center justify-center z-10">
+                <LoadingSpinner />
+              </div>
+            )}
+          </div>
         </div>
-
-        {/* \u2500\u2500 Data source label \u2500\u2500 */}
-        <div className="text-center text-xs text-gray-600">
-          \u8cc7\u6599\u4f86\u6e90: Binance (SQLite \u5feb\u53d6) \u00b7 \u6bcf 60 \u79d2\u81ea\u52d5\u540c\u6b65
-        </div>
-
       </div>
     </div>
   )
