@@ -1,7 +1,6 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 import httpx
 import asyncio
-import json
 
 router = APIRouter()
 
@@ -9,64 +8,78 @@ router = APIRouter()
 async def get_symbols():
     return {
         "symbols": [
-            {"symbol": "BTCUSDT", "name": "Bitcoin / USDT"},
-            {"symbol": "ETHUSDT", "name": "Ethereum / USDT"},
-            {"symbol": "BNBUSDT", "name": "BNB / USDT"},
-            {"symbol": "SOLUSDT", "name": "Solana / USDT"},
-            {"symbol": "ADAUSDT", "name": "Cardano / USDT"},
-            {"symbol": "XRPUSDT", "name": "XRP / USDT"},
-            {"symbol": "DOGEUSDT", "name": "Dogecoin / USDT"},
-            {"symbol": "AVAXUSDT", "name": "Avalanche / USDT"},
+            {"symbol": "BTCUSDT", "name": "Bitcoin/USDT"},
+            {"symbol": "ETHUSDT", "name": "Ethereum/USDT"},
+            {"symbol": "BNBUSDT", "name": "BNB/USDT"},
+            {"symbol": "SOLUSDT", "name": "Solana/USDT"},
+            {"symbol": "XRPUSDT", "name": "XRP/USDT"},
+            {"symbol": "ADAUSDT", "name": "Cardano/USDT"},
+            {"symbol": "DOGEUSDT", "name": "Dogecoin/USDT"},
+            {"symbol": "AVAXUSDT", "name": "Avalanche/USDT"},
         ]
     }
 
 @router.get("/klines")
-async def get_klines(symbol: str = "BTCUSDT", interval: str = "1d", source: str = "binance", limit: int = 100):
-    import httpx
+async def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", source: str = "binance", limit: int = 1000):
     url = f"https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, params=params)
-        data = resp.json()
-    return {
-        "symbol": symbol,
+    params = {
+        "symbol": symbol.upper(),
         "interval": interval,
-        "klines": [
-            {
-                "time": k[0],
-                "open": float(k[1]),
-                "high": float(k[2]),
-                "low": float(k[3]),
-                "close": float(k[4]),
-                "volume": float(k[5]),
-            }
-            for k in data
-        ],
+        "limit": min(limit, 1000)
     }
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        raw = response.json()
+
+    # Binance klines format:
+    # [openTime, open, high, low, close, volume, closeTime, quoteVolume, trades, takerBuyBase, takerBuyQuote, ignore]
+    candles = []
+    for k in raw:
+        candles.append({
+            "time": int(k[0]) // 1000,  # convert ms to seconds
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5]),
+        })
+
+    return {"candles": candles}
 
 @router.websocket("/ws/{symbol}/{interval}")
 async def websocket_klines(websocket: WebSocket, symbol: str, interval: str):
     await websocket.accept()
     try:
         while True:
+            url = "https://api.binance.com/api/v3/klines"
+            params = {
+                "symbol": symbol.upper(),
+                "interval": interval,
+                "limit": 1
+            }
             async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    "https://api.binance.com/api/v3/klines",
-                    params={"symbol": symbol.upper(), "interval": interval, "limit": 1000}
-                )
-                data = resp.json()
-            klines = [
-                {
-                    "time": k[0],
+                response = await client.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                raw = response.json()
+
+            if raw:
+                k = raw[0]
+                candle = {
+                    "time": int(k[0]) // 1000,
                     "open": float(k[1]),
                     "high": float(k[2]),
                     "low": float(k[3]),
                     "close": float(k[4]),
                     "volume": float(k[5]),
                 }
-                for k in data
-            ]
-            await websocket.send_json({"symbol": symbol, "interval": interval, "klines": klines})
+                await websocket.send_json(candle)
+
             await asyncio.sleep(5)
     except WebSocketDisconnect:
         pass
+    except Exception as e:
+        try:
+            await websocket.close()
+        except:
+            pass
