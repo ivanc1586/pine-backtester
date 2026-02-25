@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { createChart, IChartApi, ISeriesApi, CandlestickData, Time, CrosshairMode } from 'lightweight-charts'
+import { createChart, IChartApi, ISeriesApi, Time, CrosshairMode } from 'lightweight-charts'
 import { Search, RefreshCw, ChevronDown } from 'lucide-react'
 import PageHeader from '../components/PageHeader'
 import LoadingSpinner from '../components/LoadingSpinner'
@@ -7,10 +7,13 @@ import { marketApi } from '../services/api'
 import { useStrategyStore } from '../store/strategyStore'
 
 const INTERVALS = ['1m','5m','15m','30m','1h','4h','1d','1w']
+const INTERVAL_LABELS: Record<string, string> = {
+  '1m':'1米','5m':'5米','15m':'15米','30m':'30米','1h':'1小時','4h':'4小時','1d':'1天','1w':'1週'
+}
 const SOURCES = [
   { value: 'coingecko', label: 'CoinGecko' },
-  { value: 'coincap', label: 'CoinCap' },
-  { value: 'binance', label: 'Binance' },
+  { value: 'coincap',   label: 'CoinCap' },
+  { value: 'binance',   label: 'Binance 幣安' },
 ]
 const POPULAR_SYMBOLS = [
   'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT',
@@ -22,10 +25,10 @@ const getSavedSymbol   = () => localStorage.getItem('chart_symbol')   || 'BTCUSD
 const getSavedInterval = () => localStorage.getItem('chart_interval')  || '1h'
 const getSavedSource   = () => localStorage.getItem('chart_source')    || 'coingecko'
 
-// Polling interval per source (ms)
+// CoinGecko free tier: max 30 req/min. Poll every 90s to stay safe.
 const POLL_MS: Record<string, number> = {
-  coingecko: 60_000,   // free tier: 1 req/min is safe
-  coincap:   15_000,
+  coingecko: 90_000,
+  coincap:   20_000,
   binance:   10_000,
 }
 
@@ -34,18 +37,20 @@ export default function ChartPage() {
   const chartRef          = useRef<IChartApi | null>(null)
   const candleSeriesRef   = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const pollTimerRef      = useRef<ReturnType<typeof setInterval> | null>(null)
+  const fetchingRef       = useRef(false)   // prevent concurrent fetches
 
   const [symbol,   setSymbol]   = useState(getSavedSymbol)
   const [interval, setInterval] = useState(getSavedInterval)
   const [source,   setSource]   = useState(getSavedSource)
   const [loading,  setLoading]  = useState(false)
+  const [error,    setError]    = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [searchQuery,     setSearchQuery]     = useState('')
   const [showSymbolPanel, setShowSymbolPanel] = useState(false)
   const [currentPrice,    setCurrentPrice]    = useState<number | null>(null)
   const { selectedStrategy } = useStrategyStore()
 
-  // ── Chart init ────────────────────────────────────────────────────────────
+  // ── Chart init (runs once) ───────────────────────────────────────────────
   useEffect(() => {
     if (!chartContainerRef.current) return
     const chart = createChart(chartContainerRef.current, {
@@ -57,19 +62,16 @@ export default function ChartPage() {
         borderColor: '#2a2e39',
         timeVisible: true,
         secondsVisible: false,
-        timezone: 'Asia/Taipei',
       },
       width:  chartContainerRef.current.clientWidth,
       height: chartContainerRef.current.clientHeight,
     })
     const candleSeries = chart.addCandlestickSeries({
-      upColor:      '#26a69a',
-      downColor:    '#ef5350',
+      upColor: '#26a69a', downColor: '#ef5350',
       borderVisible: false,
-      wickUpColor:   '#26a69a',
-      wickDownColor: '#ef5350',
+      wickUpColor: '#26a69a', wickDownColor: '#ef5350',
     })
-    chartRef.current        = chart
+    chartRef.current       = chart
     candleSeriesRef.current = candleSeries
 
     const handleResize = () => {
@@ -87,124 +89,123 @@ export default function ChartPage() {
     }
   }, [])
 
-  // ── Fetch & render ────────────────────────────────────────────────────────
-  const loadData = useCallback(async (isRefresh = false) => {
+  // ── Fetch data ───────────────────────────────────────────────────────────
+  // NOTE: symbol/interval/source are captured via closure; useCallback deps ensure
+  //       a new function reference is created whenever they change, which triggers
+  //       the poll useEffect to restart with the new values.
+  const fetchData = useCallback(async (sym: string, iv: string, src: string) => {
     if (!candleSeriesRef.current) return
-    if (!isRefresh) setLoading(true)
+    if (fetchingRef.current) return   // skip if already fetching
+    fetchingRef.current = true
+    setLoading(true)
+    setError(null)
     try {
-      const data = await marketApi.getKlines(symbol, interval, 500, source)
-      if (!Array.isArray(data) || data.length === 0) return
+      // Pass all three values explicitly — no closures, no stale reads
+      const data = await marketApi.getKlines(sym, iv, 500, src)
+      if (!Array.isArray(data) || data.length === 0) {
+        setError('No data returned from API')
+        return
+      }
+      // Deduplicate and sort by timestamp ascending
+      const seen = new Set<number>()
+      const candles = data
+        .filter((k: any) => {
+          const ts = Math.floor(k.timestamp / 1000)
+          if (seen.has(ts)) return false
+          seen.add(ts)
+          return true
+        })
+        .sort((a: any, b: any) => a.timestamp - b.timestamp)
+        .map((k: any) => ({
+          time:  Math.floor(k.timestamp / 1000) as Time,
+          open:  Number(k.open),
+          high:  Number(k.high),
+          low:   Number(k.low),
+          close: Number(k.close),
+        }))
 
-      const formatted: CandlestickData[] = data.map((c: any) => ({
-        time:  Math.floor(c.timestamp / 1000) as Time,
-        open:  c.open,
-        high:  c.high,
-        low:   c.low,
-        close: c.close,
-      }))
-
-      // Sort by time ascending (some APIs return unsorted)
-      formatted.sort((a, b) => (a.time as number) - (b.time as number))
-
-      // Remove duplicate timestamps (lightweight-charts throws on duplicates)
-      const deduped = formatted.filter(
-        (c, i, arr) => i === 0 || c.time !== arr[i - 1].time
-      )
-
-      candleSeriesRef.current.setData(deduped)
-      setCurrentPrice(deduped[deduped.length - 1].close)
+      candleSeriesRef.current.setData(candles)
+      if (candles.length > 0) {
+        setCurrentPrice((candles[candles.length - 1] as any).close)
+      }
       setLastUpdated(new Date())
-    } catch (err) {
-      console.error('Failed to load chart data:', err)
+    } catch (err: any) {
+      const msg = err?.response?.data?.detail || err?.message || 'Fetch failed'
+      setError(msg)
+      console.error('ChartPage fetch error:', err)
     } finally {
       setLoading(false)
+      fetchingRef.current = false
     }
-  }, [symbol, interval, source])
+  }, [])  // stable — params passed explicitly
 
-  // ── Polling setup ─────────────────────────────────────────────────────────
+  // ── Auto-fetch + poll whenever symbol/interval/source changes ────────────
   useEffect(() => {
-    // Clear previous poll
+    // Clear old timer
     if (pollTimerRef.current) {
       clearInterval(pollTimerRef.current)
       pollTimerRef.current = null
     }
-
-    // Initial load
-    loadData(false)
-
-    // Start polling
-    const ms = POLL_MS[source] ?? 30_000
-    pollTimerRef.current = setInterval(() => loadData(true), ms)
-
+    // Immediate fetch
+    fetchData(symbol, interval, source)
+    // Schedule polling
+    const ms = POLL_MS[source] ?? 60_000
+    pollTimerRef.current = setInterval(() => fetchData(symbol, interval, source), ms)
     return () => {
-      if (pollTimerRef.current) {
-        clearInterval(pollTimerRef.current)
-        pollTimerRef.current = null
-      }
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current)
     }
-  }, [symbol, interval, source, loadData])
+  }, [symbol, interval, source, fetchData])
 
-  // ── Handlers ──────────────────────────────────────────────────────────────
-  const handleSymbolChange = (s: string) => {
-    setSymbol(s)
-    localStorage.setItem('chart_symbol', s)
-    setShowSymbolPanel(false)
-  }
-  const handleIntervalChange = (i: string) => {
-    setInterval(i)
-    localStorage.setItem('chart_interval', i)
-  }
-  const handleSourceChange = (s: string) => {
-    setSource(s)
-    localStorage.setItem('chart_source', s)
-  }
+  // ── Persist preferences ──────────────────────────────────────────────────
+  useEffect(() => {
+    localStorage.setItem('chart_symbol',   symbol)
+    localStorage.setItem('chart_interval', interval)
+    localStorage.setItem('chart_source',   source)
+  }, [symbol, interval, source])
 
   const filteredSymbols = POPULAR_SYMBOLS.filter(s =>
     s.toLowerCase().includes(searchQuery.toLowerCase())
   )
 
-  // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <div className="flex flex-col h-screen bg-gray-900">
-      <PageHeader />
+    <div className="h-screen flex flex-col bg-[#0b0e11]">
+      <PageHeader title="Market Chart" />
 
       {/* Toolbar */}
-      <div className="flex items-center gap-4 px-6 py-3 bg-gray-800 border-b border-gray-700 flex-wrap">
+      <div className="flex flex-wrap items-center gap-2 px-4 py-2 bg-[#161a1e] border-b border-gray-800">
 
-        {/* Symbol Selector */}
+        {/* Symbol picker */}
         <div className="relative">
           <button
             onClick={() => setShowSymbolPanel(!showSymbolPanel)}
-            className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors"
+            className="flex items-center gap-2 px-3 py-1.5 bg-[#1e2329] text-white rounded hover:bg-[#2a2e39]"
           >
-            <span className="font-semibold text-white">{symbol}</span>
-            <ChevronDown className="w-4 h-4 text-gray-400" />
+            <span className="font-semibold text-sm">{symbol}</span>
+            <ChevronDown size={14} />
           </button>
-
           {showSymbolPanel && (
-            <div className="absolute top-full left-0 mt-2 w-64 bg-gray-800 rounded-lg shadow-xl border border-gray-700 z-50">
-              <div className="p-3 border-b border-gray-700">
+            <div className="absolute top-full left-0 mt-1 w-72 bg-[#1e2329] border border-gray-700 rounded-lg shadow-xl z-50">
+              <div className="p-2 border-b border-gray-700">
                 <div className="relative">
-                  <Search className="absolute left-3 top-2.5 w-4 h-4 text-gray-400" />
+                  <Search className="absolute left-2.5 top-2 text-gray-500" size={16} />
                   <input
                     type="text"
-                    placeholder="Search symbols..."
+                    placeholder="Search..."
                     value={searchQuery}
                     onChange={e => setSearchQuery(e.target.value)}
-                    className="w-full pl-10 pr-4 py-2 bg-gray-700 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="w-full pl-8 pr-3 py-1.5 text-sm bg-[#131722] text-white rounded border border-gray-600 focus:border-blue-500 focus:outline-none"
+                    autoFocus
                   />
                 </div>
               </div>
-              <div className="max-h-96 overflow-y-auto p-2">
-                {filteredSymbols.map(s => (
+              <div className="max-h-56 overflow-y-auto p-1">
+                {filteredSymbols.map(sym => (
                   <button
-                    key={s}
-                    onClick={() => handleSymbolChange(s)}
-                    className={`w-full text-left px-4 py-2 rounded-lg transition-colors ${
-                      s === symbol ? 'bg-blue-600 text-white' : 'text-gray-300 hover:bg-gray-700'
-                    }`}
+                    key={sym}
+                    onClick={() => { setSymbol(sym); setShowSymbolPanel(false); setSearchQuery('') }}
+                    className="w-full text-left px-3 py-1.5 text-sm text-white hover:bg-[#2a2e39] rounded"
                   >
-                    {s}
+                    {sym}
                   </button>
                 ))}
               </div>
@@ -212,33 +213,33 @@ export default function ChartPage() {
           )}
         </div>
 
-        {/* Interval Buttons */}
+        {/* Interval buttons */}
         <div className="flex gap-1">
-          {INTERVALS.map(int => (
+          {INTERVALS.map(iv => (
             <button
-              key={int}
-              onClick={() => handleIntervalChange(int)}
-              className={`px-3 py-2 rounded-lg transition-colors text-sm ${
-                interval === int
+              key={iv}
+              onClick={() => setInterval(iv)}
+              className={`px-2.5 py-1.5 text-xs rounded transition-colors ${
+                interval === iv
                   ? 'bg-blue-600 text-white'
-                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                  : 'bg-[#1e2329] text-gray-400 hover:bg-[#2a2e39] hover:text-white'
               }`}
             >
-              {int}
+              {iv} <span className="text-gray-500">{INTERVAL_LABELS[iv]}</span>
             </button>
           ))}
         </div>
 
-        {/* Source Buttons */}
-        <div className="flex gap-1">
+        {/* Source buttons */}
+        <div className="flex gap-1 ml-2">
           {SOURCES.map(src => (
             <button
               key={src.value}
-              onClick={() => handleSourceChange(src.value)}
-              className={`px-3 py-2 rounded-lg transition-colors text-sm ${
+              onClick={() => setSource(src.value)}
+              className={`px-3 py-1.5 text-xs rounded transition-colors ${
                 source === src.value
                   ? 'bg-blue-600 text-white'
-                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                  : 'bg-[#1e2329] text-gray-400 hover:bg-[#2a2e39] hover:text-white'
               }`}
             >
               {src.label}
@@ -248,52 +249,45 @@ export default function ChartPage() {
 
         {/* Refresh */}
         <button
-          onClick={() => loadData(false)}
+          onClick={() => fetchData(symbol, interval, source)}
           disabled={loading}
-          className="p-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors disabled:opacity-50"
+          className="p-1.5 bg-[#1e2329] text-white rounded hover:bg-[#2a2e39] disabled:opacity-50"
+          title="Refresh"
         >
-          <RefreshCw className={`w-5 h-5 text-gray-300 ${loading ? 'animate-spin' : ''}`} />
+          <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
         </button>
 
-        {/* Status */}
-        <div className="flex items-center gap-3 ml-auto">
+        {/* Price + timestamp */}
+        <div className="ml-auto flex items-center gap-4">
           {lastUpdated && (
-            <span className="text-xs text-gray-500">
-              Updated {lastUpdated.toLocaleTimeString()}
+            <span className="text-gray-500 text-xs">
+              Updated {lastUpdated.toLocaleTimeString()} 更新於{lastUpdated.toLocaleTimeString()}
             </span>
           )}
-          {currentPrice && (
-            <div className="text-white font-mono text-lg">
-              ${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            </div>
+          {currentPrice != null && (
+            <span className="text-white font-semibold text-lg">
+              ${currentPrice.toLocaleString()}
+            </span>
           )}
         </div>
       </div>
 
+      {/* Error banner */}
+      {error && (
+        <div className="px-4 py-2 bg-red-900/40 border-b border-red-700 text-red-300 text-xs">
+          {error}
+        </div>
+      )}
+
       {/* Chart */}
       <div className="flex-1 relative">
         {loading && (
-          <div className="absolute inset-0 flex items-center justify-center bg-gray-900 bg-opacity-50 z-10">
+          <div className="absolute inset-0 flex items-center justify-center z-10 pointer-events-none">
             <LoadingSpinner />
           </div>
         )}
         <div ref={chartContainerRef} className="w-full h-full" />
       </div>
-
-      {/* Strategy Info */}
-      {selectedStrategy && (
-        <div className="px-6 py-4 bg-gray-800 border-t border-gray-700">
-          <div className="flex items-center justify-between">
-            <div>
-              <h3 className="text-white font-semibold">{selectedStrategy.name}</h3>
-              <p className="text-gray-400 text-sm">{selectedStrategy.description}</p>
-            </div>
-            <button className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors">
-              Run Backtest
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   )
 }
