@@ -17,15 +17,15 @@ from typing import Optional
 import httpx
 import websockets
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["market"])
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Config
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 DB_PATH = Path("/tmp/market_cache.db")
 SYNC_INTERVAL_SEC = 60
 
@@ -59,15 +59,15 @@ KRAKEN_PAIR: dict[str, str] = {
 }
 
 WARMUP_PAIRS     = ["BTCUSDT", "ETHUSDT"]
-WARMUP_INTERVALS = ["1h", "4h", "1d"]
+WARMUP_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 
 _scheduler: Optional[AsyncIOScheduler] = None
 _ws_tasks:  list[asyncio.Task] = []
 _use_kraken = False   # flipped to True if Binance.US is also geo-blocked
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Database
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -75,7 +75,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS klines (
                 symbol   TEXT NOT NULL,
                 interval TEXT NOT NULL,
-                ts       INTEGER NOT NULL,   -- open-time in SECONDS
+                ts       INTEGER NOT NULL,  -- open-time in SECONDS
                 open     REAL NOT NULL,
                 high     REAL NOT NULL,
                 low      REAL NOT NULL,
@@ -91,241 +91,313 @@ def init_db() -> None:
 
 def upsert_candles(symbol: str, interval: str, rows: list[tuple]) -> None:
     """rows: list of (ts, o, h, l, c, v)"""
+    if not rows:
+        return
     with sqlite3.connect(DB_PATH) as conn:
         conn.executemany(
-            "INSERT OR REPLACE INTO klines (symbol, interval, ts, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [(symbol, interval, *r) for r in rows]
+            "INSERT OR REPLACE INTO klines VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(symbol, interval, ts, o, h, l, c, v) for ts, o, h, l, c, v in rows],
         )
         conn.commit()
 
 
-def read_candles(symbol: str, interval: str, start_ts: int, end_ts: int, limit: int) -> list[dict]:
-    """Return candles in [start_ts, end_ts], newest first, up to limit."""
+def fetch_candles(symbol: str, interval: str, limit: int) -> list[dict]:
+    """Return last <limit> rows sorted by ts asc."""
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            """
-            SELECT ts, open, high, low, close, volume
-            FROM klines
-            WHERE symbol = ? AND interval = ? AND ts >= ? AND ts <= ?
-            ORDER BY ts DESC
-            LIMIT ?
-            """,
-            (symbol, interval, start_ts, end_ts, limit)
+        cursor = conn.execute(
+            "SELECT ts, open, high, low, close, volume FROM klines WHERE symbol=? AND interval=? "
+            "ORDER BY ts DESC LIMIT ?",
+            (symbol, interval, limit),
         )
-        return [
-            {
-                "time": row[0],
-                "open": row[1],
-                "high": row[2],
-                "low": row[3],
-                "close": row[4],
-                "volume": row[5],
-            }
-            for row in cur.fetchall()
-        ]
+        rows = cursor.fetchall()
+    rows.reverse()
+    return [
+        {"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
+        for ts, o, h, l, c, v in rows
+    ]
 
-# ------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
 # Binance.US REST
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
-async def fetch_binance_klines(symbol: str, interval: str, limit: int = 1500) -> list[tuple]:
-    """Returns list of (ts_sec, o, h, l, c, v). Raises if fail."""
-    binance_interval, _ = INTERVAL_MAP[interval]
-    url = BINANCE_US_REST
-    params = {"symbol": symbol, "interval": binance_interval, "limit": limit}
-    
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(url, params=params)
-        if resp.status_code == 451:
-            raise HTTPException(status_code=451, detail="Binance.US geo-blocked")
-        resp.raise_for_status()
-        data = resp.json()
-    
-    # Binance returns: [open_time_ms, o, h, l, c, v, close_time_ms, quote_vol, ...]
-    return [(int(row[0]) // 1000, float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])) for row in data]
-
-
-# ------------------------------------------------------------------------------
-# Kraken REST fallback
-# ------------------------------------------------------------------------------
-
-async def fetch_kraken_klines(symbol: str, interval: str, limit: int = 720) -> list[tuple]:
-    """Returns list of (ts_sec, o, h, l, c, v). Raises if fail."""
-    pair = KRAKEN_PAIR.get(symbol)
-    if not pair:
-        raise HTTPException(status_code=400, detail=f"Kraken does not support {symbol}")
-    
-    _, kraken_interval_min = INTERVAL_MAP[interval]
-    url = KRAKEN_REST
-    params = {"pair": pair, "interval": kraken_interval_min}
-    
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        body = resp.json()
-    
-    if body.get("error"):
-        raise HTTPException(status_code=500, detail=f"Kraken error: {body['error']}")
-    
-    # Kraken returns: { "result": { "PAIR": [[ts, o, h, l, c, vwap, vol, count], ...] } }
-    result_key = list(body["result"].keys())[0]
-    candles = body["result"][result_key]
-    
-    # Return newest `limit` candles
-    return [(int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[6])) for row in candles[-limit:]]
-
-
-# ------------------------------------------------------------------------------
-# Unified fetch with fallback
-# ------------------------------------------------------------------------------
-
-async def fetch_klines(symbol: str, interval: str, limit: int = 1500) -> list[tuple]:
-    """Try Binance.US first, fallback to Kraken if geo-blocked."""
-    global _use_kraken
-    
-    if _use_kraken:
-        return await fetch_kraken_klines(symbol, interval, limit)
-    
+async def binance_us_klines(symbol: str, interval: str, limit: int = 500) -> list[tuple]:
+    """Fetch historical klines from Binance.US (same payload as Binance.com)."""
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
-        return await fetch_binance_klines(symbol, interval, limit)
-    except HTTPException as e:
-        if e.status_code == 451:
-            logger.warning("Binance.US blocked, switching to Kraken for %s/%s", symbol, interval)
-            _use_kraken = True
-            return await fetch_kraken_klines(symbol, interval, limit)
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(BINANCE_US_REST, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.error("Binance.US REST failed for %s/%s: %s", symbol, interval, e)
         raise
 
+    candles = []
+    for item in data:
+        ts_ms, o, h, l, c, v = item[0], item[1], item[2], item[3], item[4], item[5]
+        ts = int(ts_ms) // 1000
+        candles.append((ts, float(o), float(h), float(l), float(c), float(v)))
+    return candles
 
-# ------------------------------------------------------------------------------
-# Background sync (60s interval)
-# ------------------------------------------------------------------------------
 
-async def sync_warmup_data() -> None:
-    """Fetch & cache WARMUP_PAIRS x WARMUP_INTERVALS every 60s."""
+# -----------------------------------------------------------------------------
+# Kraken REST fallback
+# -----------------------------------------------------------------------------
+
+async def kraken_ohlc(symbol: str, interval: int, since: Optional[int] = None) -> list[tuple]:
+    """
+    Fetch from Kraken /0/public/OHLC.
+    interval: minutes (1, 5, 15, 30, 60, 240, 1440, 10080).
+    since: optional unix timestamp (seconds).
+    """
+    pair = KRAKEN_PAIR.get(symbol, symbol)
+    params = {"pair": pair, "interval": interval}
+    if since:
+        params["since"] = since
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(KRAKEN_REST, params=params)
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as e:
+        logger.error("Kraken REST failed for %s/%d: %s", symbol, interval, e)
+        raise
+
+    if payload.get("error"):
+        logger.error("Kraken error: %s", payload["error"])
+        raise HTTPException(500, f"Kraken error: {payload['error']}")
+
+    # result is { "XBTUSDT": [ [ts, o, h, l, c, vwap, volume, count], ... ], "last": ... }
+    result_key = list(payload.get("result", {}).keys())[0] if payload.get("result") else None
+    if not result_key or result_key == "last":
+        return []
+
+    raw = payload["result"][result_key]
+    candles = []
+    for row in raw:
+        ts = int(row[0])
+        o, h, l, c, vol = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[6])
+        candles.append((ts, o, h, l, c, vol))
+    return candles
+
+
+# -----------------------------------------------------------------------------
+# Combined fetch (fallback logic)
+# -----------------------------------------------------------------------------
+
+async def fetch_and_cache(symbol: str, interval: str, limit: int = 500) -> None:
+    """Fetch from Binance.US or fallback to Kraken, then upsert to DB."""
+    global _use_kraken
+
+    if not _use_kraken:
+        try:
+            candles = await binance_us_klines(symbol, interval, limit)
+            upsert_candles(symbol, interval, candles)
+            logger.info("Synced %s/%s via Binance.US (%d candles)", symbol, interval, len(candles))
+            return
+        except Exception as e:
+            logger.warning("Binance.US failed, switching to Kraken: %s", e)
+            _use_kraken = True
+
+    # Kraken fallback
+    interval_min = INTERVAL_MAP[interval][1]
+    try:
+        candles = await kraken_ohlc(symbol, interval_min)
+        upsert_candles(symbol, interval, candles)
+        logger.info("Synced %s/%s via Kraken (%d candles)", symbol, interval, len(candles))
+    except Exception as e:
+        logger.error("Kraken also failed for %s/%s: %s", symbol, interval, e)
+
+
+# -----------------------------------------------------------------------------
+# Scheduler
+# -----------------------------------------------------------------------------
+
+async def periodic_sync():
+    """Scheduled job: refresh all warmup pairs/intervals."""
+    logger.info("Running periodic sync...")
     for symbol in WARMUP_PAIRS:
         for interval in WARMUP_INTERVALS:
             try:
-                rows = await fetch_klines(symbol, interval, limit=1500)
-                upsert_candles(symbol, interval, rows)
-                logger.info("Synced %s/%s: %d candles", symbol, interval, len(rows))
+                await fetch_and_cache(symbol, interval, limit=500)
             except Exception as e:
-                logger.error("Failed to sync %s/%s: %s", symbol, interval, e)
+                logger.error("Periodic sync failed for %s/%s: %s", symbol, interval, e)
 
 
-# ------------------------------------------------------------------------------
-# WebSocket live updates (Binance.US)
-# ------------------------------------------------------------------------------
-
-async def ws_subscribe(symbol: str, interval: str) -> None:
-    """Subscribe to live kline updates for symbol/interval."""
-    binance_interval, _ = INTERVAL_MAP[interval]
-    stream = f"{symbol.lower()}@kline_{binance_interval}"
-    uri = f"{BINANCE_US_WS}/{stream}"
-    
-    while True:
-        try:
-            async with websockets.connect(uri) as ws:
-                logger.info("WS connected: %s", stream)
-                async for msg in ws:
-                    data = json.loads(msg)
-                    k = data["k"]
-                    if k["x"]:  # candle closed
-                        ts = int(k["t"]) // 1000
-                        row = (ts, float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"]))
-                        upsert_candles(symbol, interval, [row])
-                        logger.debug("WS update: %s/%s ts=%d", symbol, interval, ts)
-        except Exception as e:
-            logger.error("WS error %s: %s", stream, e)
-            await asyncio.sleep(5)
-
-
-# ------------------------------------------------------------------------------
-# Lifecycle
-# ------------------------------------------------------------------------------
-
-async def startup() -> None:
-    """Called by FastAPI lifespan on startup."""
-    global _scheduler, _ws_tasks
-    
+@router.on_event("startup")
+async def startup():
+    global _scheduler
     init_db()
-    
-    # Initial warmup
-    await sync_warmup_data()
-    
-    # Start 60s sync scheduler
+    logger.info("Warming up cache...")
+    for symbol in WARMUP_PAIRS:
+        for interval in WARMUP_INTERVALS:
+            try:
+                await fetch_and_cache(symbol, interval, limit=1000)
+            except Exception as e:
+                logger.warning("Warmup failed for %s/%s: %s", symbol, interval, e)
+
     _scheduler = AsyncIOScheduler()
-    _scheduler.add_job(sync_warmup_data, "interval", seconds=SYNC_INTERVAL_SEC)
+    _scheduler.add_job(periodic_sync, "interval", seconds=SYNC_INTERVAL_SEC)
     _scheduler.start()
-    logger.info("Scheduler started (60s interval)")
-    
-    # Start WS streams for warmup pairs
-    if not _use_kraken:
-        for symbol in WARMUP_PAIRS:
-            for interval in WARMUP_INTERVALS:
-                task = asyncio.create_task(ws_subscribe(symbol, interval))
-                _ws_tasks.append(task)
-        logger.info("Started %d WS streams", len(_ws_tasks))
+    logger.info("Scheduler started (sync every %ds)", SYNC_INTERVAL_SEC)
 
 
-async def shutdown() -> None:
-    """Called by FastAPI lifespan on shutdown."""
-    global _scheduler, _ws_tasks
-    
+@router.on_event("shutdown")
+async def shutdown():
     if _scheduler:
-        _scheduler.shutdown(wait=False)
-        logger.info("Scheduler stopped")
-    
+        _scheduler.shutdown()
     for task in _ws_tasks:
         task.cancel()
-    await asyncio.gather(*_ws_tasks, return_exceptions=True)
-    logger.info("WS tasks cancelled")
+    logger.info("Market router shutdown complete")
 
 
-# ------------------------------------------------------------------------------
-# REST API
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# REST API Endpoints
+# -----------------------------------------------------------------------------
 
 @router.get("/klines")
 async def get_klines(
-    symbol: str = Query(..., description="Trading pair, e.g. BTCUSDT"),
-    interval: str = Query(..., description="1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w"),
-    limit: int = Query(1500, ge=1, le=1500),
-) -> dict:
+    symbol: str = Query(..., description="e.g. BTCUSDT"),
+    interval: str = Query(..., description="e.g. 1h, 4h, 1d"),
+    limit: int = Query(500, ge=1, le=1000),
+):
     """
-    Get historical klines (candlesticks).
-    - Tries cache first (newest candles up to NOW)
-    - If cache empty or stale, fetches from exchange
-    - Returns newest `limit` candles, descending by time
+    Fetch cached klines (or trigger fallback if missing).
+    Returns: [{"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}, ...]
     """
     if interval not in INTERVAL_MAP:
-        raise HTTPException(status_code=400, detail=f"Invalid interval: {interval}")
-    
-    now = int(time.time())
-    
-    # Try cache
-    cached = read_candles(symbol, interval, 0, now, limit)
-    if cached:
-        logger.info("Cache hit: %s/%s (%d candles)", symbol, interval, len(cached))
-        return {"symbol": symbol, "interval": interval, "data": cached}
-    
-    # Fetch fresh data
-    logger.info("Cache miss: fetching %s/%s from exchange", symbol, interval)
-    rows = await fetch_klines(symbol, interval, limit)
-    upsert_candles(symbol, interval, rows)
-    
-    # Re-read from DB to return consistent format
-    cached = read_candles(symbol, interval, 0, now, limit)
-    return {"symbol": symbol, "interval": interval, "data": cached}
+        raise HTTPException(400, f"Invalid interval: {interval}")
+
+    # Try DB first
+    rows = fetch_candles(symbol, interval, limit)
+    if rows:
+        logger.info("Served %s/%s from cache (%d rows)", symbol, interval, len(rows))
+        return rows
+
+    # Cache miss => fetch now
+    logger.warning("Cache miss for %s/%s, fetching...", symbol, interval)
+    await fetch_and_cache(symbol, interval, limit)
+    rows = fetch_candles(symbol, interval, limit)
+    if not rows:
+        raise HTTPException(404, f"No data for {symbol}/{interval}")
+    return rows
 
 
-@router.get("/health")
-async def health() -> dict:
-    """Health check endpoint."""
+@router.get("/symbol_info")
+async def symbol_info(symbol: str = Query("BTCUSDT")):
+    """
+    Return symbol metadata. Minimal placeholder for now.
+    """
     return {
-        "status": "ok",
-        "db_path": str(DB_PATH),
-        "db_exists": DB_PATH.exists(),
-        "using_kraken": _use_kraken,
-        "warmup_pairs": WARMUP_PAIRS,
-        "warmup_intervals": WARMUP_INTERVALS,
+        "symbol": symbol,
+        "baseAsset": symbol[:-4],  # assume USDT suffix
+        "quoteAsset": "USDT",
+        "status": "TRADING",
     }
+
+
+@router.get("/ping")
+async def ping():
+    """Health check."""
+    return {"status": "ok", "source": "Kraken" if _use_kraken else "Binance.US"}
+
+
+# -----------------------------------------------------------------------------
+# WebSocket endpoint — proxies Binance.US kline stream to the browser
+# -----------------------------------------------------------------------------
+
+@router.websocket("/ws/klines/{symbol}/{interval}")
+async def ws_klines(websocket: WebSocket, symbol: str, interval: str):
+    """
+    Proxy Binance.US kline WebSocket stream to the frontend.
+
+    Binance stream message (kline event):
+    {
+      "e": "kline",
+      "E": 1234567890,   # event time ms
+      "s": "BTCUSDT",
+      "k": {
+        "t": 1234567800000,  # candle open time ms
+        "T": 1234567859999,  # candle close time ms
+        "s": "BTCUSDT",
+        "i": "1m",
+        "o": "42000.00",
+        "c": "42050.00",
+        "h": "42100.00",
+        "l": "41900.00",
+        "v": "100.5",
+        "x": false          # is this candle closed?
+      }
+    }
+
+    We forward a simplified payload to the frontend:
+    {
+      "time":   <open_time_seconds>,
+      "open":   <float>,
+      "high":   <float>,
+      "low":    <float>,
+      "close":  <float>,
+      "volume": <float>,
+      "closed": <bool>      # true = candle finalised, false = still forming
+    }
+    """
+    if interval not in INTERVAL_MAP:
+        await websocket.close(code=1008, reason=f"Invalid interval: {interval}")
+        return
+
+    await websocket.accept()
+    stream_name = f"{symbol.lower()}@kline_{interval}"
+    binance_ws_url = f"{BINANCE_US_WS}/{stream_name}"
+    logger.info("WS client connected: %s/%s -> %s", symbol, interval, binance_ws_url)
+
+    async def _send_candle(k: dict) -> None:
+        candle = {
+            "time":   int(k["t"]) // 1000,
+            "open":   float(k["o"]),
+            "high":   float(k["h"]),
+            "low":    float(k["l"]),
+            "close":  float(k["c"]),
+            "volume": float(k["v"]),
+            "closed": bool(k["x"]),
+        }
+        await websocket.send_json(candle)
+        # If candle just closed, upsert to cache so REST is also up-to-date
+        if candle["closed"]:
+            upsert_candles(
+                symbol, interval,
+                [(candle["time"], candle["open"], candle["high"],
+                  candle["low"], candle["close"], candle["volume"])]
+            )
+
+    try:
+        async with websockets.connect(binance_ws_url, ping_interval=20, ping_timeout=30) as binance_ws:
+            while True:
+                try:
+                    raw = await asyncio.wait_for(binance_ws.recv(), timeout=30)
+                except asyncio.TimeoutError:
+                    # Keep the frontend WS alive with a heartbeat
+                    await websocket.send_json({"type": "ping"})
+                    continue
+
+                msg = json.loads(raw)
+                if msg.get("e") == "kline":
+                    await _send_candle(msg["k"])
+
+    except WebSocketDisconnect:
+        logger.info("Frontend WS disconnected: %s/%s", symbol, interval)
+    except websockets.exceptions.ConnectionClosed as e:
+        logger.warning("Binance WS closed for %s/%s: %s", symbol, interval, e)
+        try:
+            await websocket.send_json({"type": "error", "message": "Upstream connection closed"})
+        except Exception:
+            pass
+        await websocket.close()
+    except Exception as e:
+        logger.error("WS proxy error for %s/%s: %s", symbol, interval, e)
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
+        await websocket.close()
