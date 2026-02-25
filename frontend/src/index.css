@@ -1,0 +1,147 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-primary: #131722;
+  --bg-secondary: #1e2328;
+  --bg-tertiary: #181c20;
+  --text-primary: #d1d4dc;
+  --text-secondary: #787b86;
+  --accent-green: #26a69a;
+  --accent-red: #ef5350;
+  --accent-blue: #2196f3;
+  --border-color: #2a2e39;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Inter', sans-serif;
+  overflow-x: hidden;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-secondary);
+}
+::-webkit-scrollbar-thumb {
+  background: #363a45;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #4a4f5e;
+}
+
+.tv-lightweight-charts {
+  border-radius: 4px;
+}
+
+.signal-buy {
+  color: var(--accent-green);
+}
+.signal-sell {
+  color: var(--accent-red);
+}
+
+.card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.btn-primary {
+  background: var(--accent-blue);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  transition: opacity 0.2s;
+}
+.btn-primary:hover {
+  opacity: 0.85;
+}
+.btn-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-success {
+  background: var(--accent-green);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  transition: opacity 0.2s;
+}
+.btn-danger {
+  background: var(--accent-red);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.input-field {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  padding: 8px 12px;
+  font-size: 14px;
+  width: 100%;
+  outline: none;
+  transition: border-color 0.2s;
+}
+.input-field:focus {
+  border-color: var(--accent-blue);
+}
+
+.select-field {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  padding: 8px 12px;
+  font-size: 14px;
+  outline: none;
+  cursor: pointer;
+}
+
+.tag-buy {
+  background: rgba(38, 166, 154, 0.15);
+  color: var(--accent-green);
+  border: 1px solid rgba(38, 166, 154, 0.3);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.tag-sell {
+  background: rgba(239, 83, 80, 0.15);
+  color: var(--accent-red);
+  border: 1px solid rgba(239, 83, 80, 0.3);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
