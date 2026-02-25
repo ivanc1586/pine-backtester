@@ -68,8 +68,8 @@ export default function ChartPage() {
     candleSeriesRef.current = candleSeries
 
     const handleResize = () => {
-      if (chartContainerRef.current && chart) {
-        chart.applyOptions({
+      if (chartContainerRef.current && chartRef.current) {
+        chartRef.current.applyOptions({
           width: chartContainerRef.current.clientWidth,
           height: chartContainerRef.current.clientHeight,
         })
@@ -82,87 +82,97 @@ export default function ChartPage() {
     }
   }, [])
 
+  const connectWebSocket = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.close()
+    }
+
+    const ws = new WebSocket(getWsUrl(symbol, interval))
+
+    ws.onopen = () => {
+      console.log('WebSocket connected')
+      setWsConnected(true)
+    }
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data)
+        if (data.type === 'kline' && data.data && candleSeriesRef.current) {
+          const kline = data.data
+          const candle: CandlestickData = {
+            time: (kline.timestamp / 1000) as Time,
+            open: kline.open,
+            high: kline.high,
+            low: kline.low,
+            close: kline.close,
+          }
+          candleSeriesRef.current.update(candle)
+          setCurrentPrice(kline.close)
+        }
+      } catch (error) {
+        console.error('Error parsing WebSocket message:', error)
+      }
+    }
+
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error)
+      setWsConnected(false)
+    }
+
+    ws.onclose = () => {
+      console.log('WebSocket disconnected')
+      setWsConnected(false)
+      setTimeout(() => {
+        if (wsRef.current === ws) {
+          connectWebSocket()
+        }
+      }, 5000)
+    }
+
+    wsRef.current = ws
+  }, [symbol, interval])
+
+  // FIX: 對應後端回傳格式 { klines: [{time(ms), open, high, low, close}] }
   const loadHistoricalData = useCallback(async () => {
     if (!candleSeriesRef.current) return
     setLoading(true)
     try {
-      const res = await marketApi.getHistoricalData(symbol, interval, source, 500)
-      // 後端回傳 { klines: [{time(ms), open, high, low, close}] }
-      const rawData = res.data ?? res
-      const list: any[] = rawData.klines ?? rawData.data ?? (Array.isArray(rawData) ? rawData : [])
+      const response = await marketApi.getHistoricalData({
+        symbol,
+        interval,
+        source,
+        limit: 1000,
+      })
 
-      const seen = new Set<number>()
-      const formattedData: CandlestickData<Time>[] = list
-        .map((candle: any) => ({
-          // time 是毫秒 → 秒
-          time: Math.floor((candle.time ?? candle.timestamp ?? candle.open_time) / 1000) as Time,
-          open: Number(candle.open),
-          high: Number(candle.high),
-          low: Number(candle.low),
-          close: Number(candle.close),
+      const raw = response.data
+      const list: any[] = raw?.klines ?? raw?.data ?? (Array.isArray(raw) ? raw : [])
+
+      const candles: CandlestickData[] = list
+        .map((k: any) => ({
+          time: Math.floor((k.time ?? k.timestamp ?? k.open_time) / 1000) as Time,
+          open: Number(k.open),
+          high: Number(k.high),
+          low: Number(k.low),
+          close: Number(k.close),
         }))
         .sort((a, b) => (a.time as number) - (b.time as number))
-        .filter((candle) => {
-          const t = candle.time as number
-          if (seen.has(t)) return false
-          seen.add(t)
-          return true
-        })
 
-      if (formattedData.length > 0) {
-        candleSeriesRef.current.setData(formattedData)
-        setCurrentPrice(formattedData[formattedData.length - 1].close as number)
+      if (candles.length > 0) {
+        candleSeriesRef.current.setData(candles)
+        setCurrentPrice(candles[candles.length - 1].close as number)
         chartRef.current?.timeScale().fitContent()
       }
     } catch (error) {
-      console.error('Failed to load historical data:', error)
+      console.error('Error loading historical data:', error)
     } finally {
       setLoading(false)
     }
   }, [symbol, interval, source])
 
-  const connectWebSocket = useCallback(() => {
-    if (wsRef.current) {
-      wsRef.current.close()
-    }
-    const ws = new WebSocket(getWsUrl(symbol, interval))
-    ws.onopen = () => {
-      console.log('WebSocket connected')
-      setWsConnected(true)
-    }
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data)
-        if (data.type === 'kline' && candleSeriesRef.current) {
-          const candle: CandlestickData<Time> = {
-            time: data.data.timestamp as Time,
-            open: data.data.open,
-            high: data.data.high,
-            low: data.data.low,
-            close: data.data.close,
-          }
-          candleSeriesRef.current.update(candle)
-          setCurrentPrice(candle.close as number)
-        }
-      } catch (error) {
-        console.error('WebSocket message error:', error)
-      }
-    }
-    ws.onerror = (error) => {
-      console.error('WebSocket error:', error)
-      setWsConnected(false)
-    }
-    ws.onclose = () => {
-      console.log('WebSocket disconnected')
-      setWsConnected(false)
-      setTimeout(() => connectWebSocket(), 3000)
-    }
-    wsRef.current = ws
-  }, [symbol, interval])
-
   useEffect(() => {
     loadHistoricalData()
     connectWebSocket()
+
     return () => {
       if (wsRef.current) {
         wsRef.current.close()
@@ -174,7 +184,6 @@ export default function ChartPage() {
     setSymbol(newSymbol)
     localStorage.setItem('chart_symbol', newSymbol)
     setShowSymbolPanel(false)
-    setSearchQuery('')
   }
 
   const handleIntervalChange = (newInterval: string) => {
@@ -187,65 +196,56 @@ export default function ChartPage() {
     localStorage.setItem('chart_source', newSource)
   }
 
-  const handleRefresh = () => {
-    loadHistoricalData()
-  }
-
-  const filteredSymbols = symbols.filter((s) =>
+  const filteredSymbols = symbols.filter(s =>
     s.toLowerCase().includes(searchQuery.toLowerCase())
   )
 
-  const priceChangePercent = currentPrice && selectedStrategy?.lastSignal
-    ? ((currentPrice - selectedStrategy.lastSignal.price) / selectedStrategy.lastSignal.price * 100)
-    : null
-
   return (
     <div className="flex flex-col h-screen bg-gray-900">
-      <PageHeader 
-        title="Market Chart" 
-        subtitle={`Live ${symbol} price chart with ${interval} interval`}
-      />
-      
-      <div className="flex-none px-6 py-3 bg-gray-800 border-b border-gray-700">
-        <div className="flex items-center gap-4">
+      <PageHeader title="Market Chart" />
+
+      <div className="flex-1 flex flex-col p-4 space-y-4 overflow-hidden">
+        {/* Controls */}
+        <div className="flex flex-wrap items-center gap-3 bg-gray-800 p-3 rounded-lg">
+          {/* Symbol Selector */}
           <div className="relative">
             <button
               onClick={() => setShowSymbolPanel(!showSymbolPanel)}
-              className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors"
+              className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-white font-semibold transition-colors"
             >
-              <span className="text-lg font-semibold text-white">{symbol}</span>
-              <ChevronDown className="w-4 h-4 text-gray-400" />
+              {symbol}
+              <ChevronDown size={16} />
             </button>
 
             {showSymbolPanel && (
-              <div className="absolute top-full left-0 mt-2 w-80 bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-50">
-                <div className="p-3 border-b border-gray-700">
+              <div className="absolute top-full mt-2 left-0 w-64 bg-gray-800 rounded-lg shadow-xl z-50 border border-gray-700">
+                <div className="p-2">
                   <div className="relative">
-                    <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
+                    <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" size={18} />
                     <input
                       type="text"
                       value={searchQuery}
                       onChange={(e) => setSearchQuery(e.target.value)}
-                      placeholder="Search symbols..."
+                      placeholder="Search symbol..."
                       className="w-full pl-10 pr-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
                       autoFocus
                     />
                   </div>
                 </div>
-                <div className="max-h-96 overflow-y-auto p-2">
+                <div className="max-h-64 overflow-y-auto">
                   {filteredSymbols.map((s) => (
                     <button
                       key={s}
                       onClick={() => handleSymbolChange(s)}
-                      className={`w-full text-left px-3 py-2 rounded hover:bg-gray-700 transition-colors ${
-                        s === symbol ? 'bg-gray-700 text-blue-400' : 'text-gray-300'
+                      className={`w-full text-left px-4 py-2 hover:bg-gray-700 transition-colors ${
+                        s === symbol ? 'bg-gray-700 text-blue-400' : 'text-white'
                       }`}
                     >
                       {s}
                     </button>
                   ))}
                   {filteredSymbols.length === 0 && (
-                    <div className="text-center py-4 text-gray-400">
+                    <div className="px-4 py-2 text-gray-400 text-center">
                       No symbols found
                     </div>
                   )}
@@ -254,86 +254,90 @@ export default function ChartPage() {
             )}
           </div>
 
-          <div className="flex gap-2">
-            {INTERVALS.map((i) => (
+          {/* Interval Buttons */}
+          <div className="flex gap-1 bg-gray-700 rounded-lg p-1">
+            {INTERVALS.map((int) => (
               <button
-                key={i}
-                onClick={() => handleIntervalChange(i)}
-                className={`px-3 py-1.5 rounded transition-colors ${
-                  interval === i
+                key={int}
+                onClick={() => handleIntervalChange(int)}
+                className={`px-3 py-1 rounded transition-colors ${
+                  interval === int
                     ? 'bg-blue-500 text-white'
-                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                    : 'text-gray-300 hover:bg-gray-600'
                 }`}
               >
-                {i}
+                {int}
               </button>
             ))}
           </div>
 
-          <div className="flex gap-2">
-            {SOURCES.map((s) => (
-              <button
-                key={s.value}
-                onClick={() => handleSourceChange(s.value)}
-                className={`px-3 py-1.5 rounded transition-colors ${
-                  source === s.value
-                    ? 'bg-blue-500 text-white'
-                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                }`}
-              >
-                {s.label}
-              </button>
-            ))}
-          </div>
-
-          <button
-            onClick={handleRefresh}
-            className="ml-auto p-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors"
-            disabled={loading}
+          {/* Source Dropdown */}
+          <select
+            value={source}
+            onChange={(e) => handleSourceChange(e.target.value)}
+            className="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
           >
-            <RefreshCw className={`w-5 h-5 text-gray-300 ${loading ? 'animate-spin' : ''}`} />
+            {SOURCES.map((src) => (
+              <option key={src.value} value={src.value}>
+                {src.label}
+              </option>
+            ))}
+          </select>
+
+          {/* Refresh Button */}
+          <button
+            onClick={loadHistoricalData}
+            disabled={loading}
+            className="p-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors disabled:opacity-50"
+          >
+            <RefreshCw size={20} className={`text-white ${loading ? 'animate-spin' : ''}`} />
           </button>
 
-          <div className="flex items-center gap-2 px-3 py-2 bg-gray-700 rounded-lg">
+          {/* WebSocket Status */}
+          <div className="flex items-center gap-2 ml-auto">
             {wsConnected ? (
-              <Wifi className="w-4 h-4 text-green-400" />
+              <>
+                <Wifi size={20} className="text-green-500" />
+                <span className="text-green-500 text-sm font-medium">Live</span>
+              </>
             ) : (
-              <WifiOff className="w-4 h-4 text-red-400" />
+              <>
+                <WifiOff size={20} className="text-red-500" />
+                <span className="text-red-500 text-sm font-medium">Disconnected</span>
+              </>
             )}
-            <span className={`text-sm ${wsConnected ? 'text-green-400' : 'text-red-400'}`}>
-              {wsConnected ? 'Live' : 'Disconnected'}
-            </span>
           </div>
+
+          {/* Current Price */}
+          {currentPrice && (
+            <div className="px-4 py-2 bg-gray-700 rounded-lg">
+              <span className="text-gray-400 text-sm mr-2">Price:</span>
+              <span className="text-white font-semibold">
+                ${currentPrice.toFixed(2)}
+              </span>
+            </div>
+          )}
         </div>
 
-        {currentPrice && (
-          <div className="flex items-center gap-4 mt-3">
-            <div className="text-2xl font-bold text-white">
-              ${currentPrice.toFixed(2)}
+        {/* Strategy Info */}
+        {selectedStrategy && (
+          <div className="bg-blue-900/20 border border-blue-500/30 rounded-lg p-3">
+            <div className="flex items-center gap-2">
+              <span className="text-blue-400 text-sm font-medium">Selected Strategy:</span>
+              <span className="text-white font-semibold">{selectedStrategy.name}</span>
             </div>
-            {priceChangePercent !== null && (
-              <div className={`px-2 py-1 rounded text-sm font-medium ${
-                priceChangePercent >= 0 ? 'bg-green-900 text-green-300' : 'bg-red-900 text-red-300'
-              }`}>
-                {priceChangePercent >= 0 ? '+' : ''}{priceChangePercent.toFixed(2)}%
-              </div>
-            )}
-            {selectedStrategy && (
-              <div className="text-sm text-gray-400">
-                vs last signal: ${selectedStrategy.lastSignal?.price.toFixed(2)}
-              </div>
-            )}
           </div>
         )}
-      </div>
 
-      <div className="flex-1 relative">
-        {loading && (
-          <div className="absolute inset-0 flex items-center justify-center bg-gray-900/50 z-10">
-            <LoadingSpinner size="lg" />
-          </div>
-        )}
-        <div ref={chartContainerRef} className="w-full h-full" />
+        {/* Chart */}
+        <div className="flex-1 bg-gray-800 rounded-lg overflow-hidden relative">
+          {loading && (
+            <div className="absolute inset-0 flex items-center justify-center bg-gray-900/50 z-10">
+              <LoadingSpinner />
+            </div>
+          )}
+          <div ref={chartContainerRef} className="w-full h-full" />
+        </div>
       </div>
     </div>
   )
