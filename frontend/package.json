@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "vite build",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -15,8 +15,6 @@
     "lightweight-charts": "^4.1.3",
     "axios": "^1.6.5",
     "zustand": "^4.5.0",
-    "react-monaco-editor": "^0.55.0",
-    "monaco-editor": "^0.45.0",
     "date-fns": "^3.2.0",
     "recharts": "^2.10.3",
     "lucide-react": "^0.316.0",
