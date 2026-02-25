@@ -29,6 +29,9 @@ export const backtestApi = {
 export const marketApi = {
   getHistoricalData: (params: MarketDataRequest) =>
     api.get('/api/market/klines', { params }),
+  getKlines: (symbol: string, interval: string, limit: number = 500, source: string = 'binance') =>
+    api.get('/api/market/klines', { params: { symbol, interval, limit, source } })
+      .then(res => res.data),
   getSymbols: () => api.get('/api/market/symbols'),
   getPrice: (symbol: string) => api.get(`/api/market/price/${symbol}`),
 }
