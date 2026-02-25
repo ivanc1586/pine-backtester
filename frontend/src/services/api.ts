@@ -21,7 +21,7 @@ export interface BacktestResult {
 }
 
 export interface Candle {
-  timestamp: number
+  time: number
   open: number
   high: number
   low: number
@@ -37,10 +37,10 @@ export const backtestApi = {
 export const marketApi = {
   getKlines: (symbol: string, interval: string, limit = 500) =>
     api
-      .get<Candle[]>('/api/market/klines', {
+      .get<{ symbol: string; interval: string; data: Candle[] }>('/api/market/klines', {
         params: { symbol, interval, limit },
       })
-      .then(r => r.data),
+      .then(r => r.data.data),
 
   getSymbols: () =>
     api.get('/api/market/symbols').then(r => r.data),
