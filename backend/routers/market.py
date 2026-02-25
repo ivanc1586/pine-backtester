@@ -1,4 +1,7 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+import httpx
+import asyncio
+import json
 
 router = APIRouter()
 
@@ -18,7 +21,7 @@ async def get_symbols():
     }
 
 @router.get("/klines")
-async def get_klines(symbol: str = "BTCUSDT", interval: str = "1d", limit: int = 100):
+async def get_klines(symbol: str = "BTCUSDT", interval: str = "1d", source: str = "binance", limit: int = 100):
     import httpx
     url = f"https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -40,3 +43,30 @@ async def get_klines(symbol: str = "BTCUSDT", interval: str = "1d", limit: int =
             for k in data
         ],
     }
+
+@router.websocket("/ws/{symbol}/{interval}")
+async def websocket_klines(websocket: WebSocket, symbol: str, interval: str):
+    await websocket.accept()
+    try:
+        while True:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://api.binance.com/api/v3/klines",
+                    params={"symbol": symbol.upper(), "interval": interval, "limit": 1000}
+                )
+                data = resp.json()
+            klines = [
+                {
+                    "time": k[0],
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "volume": float(k[5]),
+                }
+                for k in data
+            ]
+            await websocket.send_json({"symbol": symbol, "interval": interval, "klines": klines})
+            await asyncio.sleep(5)
+    except WebSocketDisconnect:
+        pass
