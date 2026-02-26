@@ -17,13 +17,12 @@ const POPULAR_SYMBOLS = [
 
 type MarketType = 'spot' | 'futures'
 
-// Binance REST/WS endpoints
-const SPOT_REST    = 'https://api.binance.com/api/v3/klines'
-const FUTURES_REST = 'https://fapi.binance.com/fapi/v1/klines'
+const SPOT_REST      = 'https://api.binance.com/api/v3/klines'
+const FUTURES_REST   = 'https://fapi.binance.com/fapi/v1/klines'
 const SPOT_TICKER    = 'https://api.binance.com/api/v3/ticker/24hr'
 const FUTURES_TICKER = 'https://fapi.binance.com/fapi/v1/ticker/24hr'
-const SPOT_WS_BASE    = 'wss://stream.binance.com:9443/ws'
-const FUTURES_WS_BASE = 'wss://fstream.binance.com/ws'
+const SPOT_WS_BASE   = 'wss://stream.binance.com:9443/ws'
+const FUTURES_WS_BASE= 'wss://fstream.binance.com/ws'
 
 const getSavedSymbol     = () => localStorage.getItem('chart_symbol')   || 'BTCUSDT'
 const getSavedInterval   = () => localStorage.getItem('chart_interval') || '1h'
@@ -32,49 +31,34 @@ const getSavedMarketType = () => (localStorage.getItem('chart_market') as Market
 // ── Types ────────────────────────────────────────────────────────────────────
 interface RawKline {
   timestamp: number
-  open: number
-  high: number
-  low: number
-  close: number
-  volume: number
-  turnover: number
+  open: number; high: number; low: number; close: number
+  volume: number; turnover: number
 }
 
 interface TickerInfo {
-  priceChange: number       // 24h 絕對變動
-  priceChangePct: number    // 24h 百分比變動
+  priceChange: number
+  priceChangePct: number
   high24h: number
   low24h: number
-  volume24h: number         // base asset volume
+  volume24h: number
 }
 
-// ── Fetch: klines ─────────────────────────────────────────────────────────────
+// ── Fetch helpers ─────────────────────────────────────────────────────────────
 async function fetchBatch(
-  marketType: MarketType,
-  symbol: string,
-  interval: string,
-  limit: number,
-  endTime?: number
+  marketType: MarketType, symbol: string, interval: string,
+  limit: number, endTime?: number
 ): Promise<RawKline[]> {
   const base = marketType === 'futures' ? FUTURES_REST : SPOT_REST
-  const maxLimit = marketType === 'futures' ? 1500 : 1000
-  const actualLimit = Math.min(limit, maxLimit)
-
-  const params = new URLSearchParams({ symbol, interval, limit: String(actualLimit) })
+  const max  = marketType === 'futures' ? 1500 : 1000
+  const params = new URLSearchParams({ symbol, interval, limit: String(Math.min(limit, max)) })
   if (endTime) params.set('endTime', String(endTime))
-
   const res = await fetch(`${base}?${params}`)
   if (!res.ok) throw new Error(`Binance ${res.status}: ${await res.text()}`)
   const raw: any[][] = await res.json()
-
   return raw.map(k => ({
-    timestamp: k[0],
-    open:      parseFloat(k[1]),
-    high:      parseFloat(k[2]),
-    low:       parseFloat(k[3]),
-    close:     parseFloat(k[4]),
-    volume:    parseFloat(k[5]),
-    turnover:  parseFloat(k[7]),
+    timestamp: k[0], open: parseFloat(k[1]), high: parseFloat(k[2]),
+    low: parseFloat(k[3]), close: parseFloat(k[4]),
+    volume: parseFloat(k[5]), turnover: parseFloat(k[7]),
   }))
 }
 
@@ -84,7 +68,7 @@ async function fetchKlines(
   const batchSize = marketType === 'futures' ? 1500 : 1000
   const batches   = Math.ceil(targetCount / batchSize)
   let all: RawKline[] = []
-  let endTime: number | undefined = undefined
+  let endTime: number | undefined
 
   for (let i = 0; i < batches; i++) {
     const batch = await fetchBatch(marketType, symbol, interval, batchSize, endTime)
@@ -99,10 +83,9 @@ async function fetchKlines(
     .sort((a, b) => a.timestamp - b.timestamp)
 }
 
-// ── Fetch: 24h ticker ─────────────────────────────────────────────────────────
 async function fetchTicker(marketType: MarketType, symbol: string): Promise<TickerInfo> {
   const base = marketType === 'futures' ? FUTURES_TICKER : SPOT_TICKER
-  const res = await fetch(`${base}?symbol=${symbol}`)
+  const res  = await fetch(`${base}?symbol=${symbol}`)
   if (!res.ok) throw new Error(`Ticker ${res.status}`)
   const d = await res.json()
   return {
@@ -116,8 +99,8 @@ async function fetchTicker(marketType: MarketType, symbol: string): Promise<Tick
 
 // ── Format helpers ────────────────────────────────────────────────────────────
 function formatPrice(p: number): string {
-  if (p >= 1000)   return p.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-  if (p >= 1)      return p.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 4 })
+  if (p >= 1000) return p.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  if (p >= 1)    return p.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 4 })
   return p.toLocaleString(undefined, { minimumFractionDigits: 6, maximumFractionDigits: 8 })
 }
 
@@ -139,8 +122,8 @@ function formatTimestamp(ts: number): string {
 
 function timeAgo(ts: number): string {
   const diff = Math.floor((Date.now() - ts) / 1000)
-  if (diff < 5)  return '剛剛'
-  if (diff < 60) return `${diff} 秒前`
+  if (diff < 5)    return '剛剛'
+  if (diff < 60)   return `${diff} 秒前`
   if (diff < 3600) return `${Math.floor(diff / 60)} 分前`
   return `${Math.floor(diff / 3600)} 時前`
 }
@@ -148,14 +131,14 @@ function timeAgo(ts: number): string {
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function ChartPage() {
   const chartContainerId = 'kline-chart-container'
-  const chartRef       = useRef<Chart | null>(null)
-  const wsRef          = useRef<WebSocket | null>(null)
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const tickIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const chartRef         = useRef<Chart | null>(null)
+  const wsRef            = useRef<WebSocket | null>(null)
+  const reconnectTimer   = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const tickIntervalRef  = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  const symbolRef     = useRef(getSavedSymbol())
-  const intervalRef   = useRef(getSavedInterval())
-  const marketTypeRef = useRef<MarketType>(getSavedMarketType())
+  const symbolRef      = useRef(getSavedSymbol())
+  const intervalRef    = useRef(getSavedInterval())
+  const marketTypeRef  = useRef<MarketType>(getSavedMarketType())
 
   const [symbol,          setSymbol]          = useState(symbolRef.current)
   const [interval,        setInterval]        = useState(intervalRef.current)
@@ -164,7 +147,6 @@ export default function ChartPage() {
   const [error,           setError]           = useState<string | null>(null)
   const [wsStatus,        setWsStatus]        = useState<'connecting'|'live'|'disconnected'>('disconnected')
 
-  // Price info bar states
   const [currentPrice,    setCurrentPrice]    = useState<number | null>(null)
   const [ticker,          setTicker]          = useState<TickerInfo | null>(null)
   const [lastUpdateTs,    setLastUpdateTs]    = useState<number | null>(null)
@@ -174,28 +156,20 @@ export default function ChartPage() {
   const [searchQuery,     setSearchQuery]     = useState('')
   const [showSymbolPanel, setShowSymbolPanel] = useState(false)
 
-  // ── Chart init (once) ──────────────────────────────────────────────────────
+  // ── Chart init ──────────────────────────────────────────────────────────────
   useEffect(() => {
     const chart = init(chartContainerId, {
       layout: [
-        { type: 'candle', options: { gap: { bottom: 2 } } },
-        { type: 'indicator', content: ['VOL'], options: { gap: { top: 4 }, height: 80 } },
+        { type: 'candle',    options: { gap: { bottom: 2 } } },
+        { type: 'indicator', content: ['VOL'],  options: { gap: { top: 4 }, height: 80 } },
       ],
-      customApi: {
-        formatDate: (dateTimeFormat: Intl.DateTimeFormat, timestamp: number) =>
-          dateTimeFormat.format(new Date(timestamp))
-      },
       styles: {
         grid: {
           horizontal: { color: '#1e2328' },
           vertical:   { color: '#1e2328' },
         },
         candle: {
-          bar: {
-            upColor:       '#26a69a',
-            downColor:     '#ef5350',
-            noChangeColor: '#888888',
-          },
+          bar: { upColor: '#26a69a', downColor: '#ef5350', noChangeColor: '#888888' },
           tooltip: { labels: ['時間', '開', '高', '低', '收', '量'] },
         },
         indicator: { ohlc: { upColor: '#26a69a', downColor: '#ef5350' } },
@@ -212,7 +186,7 @@ export default function ChartPage() {
     })
 
     if (chart) {
-      chart.createIndicator('MA', false, { id: 'candle_pane' })
+      chart.createIndicator('MA',   false, { id: 'candle_pane' })
       chart.createIndicator('MACD', false, { height: 80 })
       chartRef.current = chart
     }
@@ -220,87 +194,60 @@ export default function ChartPage() {
     return () => { dispose(chartContainerId) }
   }, [])
 
-  // ── "X 秒前" ticker (re-render every second) ───────────────────────────────
+  // ── 更新「X 秒前」每秒 ─────────────────────────────────────────────────────
   useEffect(() => {
     tickIntervalRef.current = setInterval(() => {
-      if (lastUpdateTs !== null) {
-        setTimeAgoStr(timeAgo(lastUpdateTs))
-      }
+      if (lastUpdateTs !== null) setTimeAgoStr(timeAgo(lastUpdateTs))
     }, 1000)
-    return () => {
-      if (tickIntervalRef.current) clearInterval(tickIntervalRef.current)
-    }
+    return () => { if (tickIntervalRef.current) clearInterval(tickIntervalRef.current) }
   }, [lastUpdateTs])
 
   // ── WebSocket ──────────────────────────────────────────────────────────────
   const connectWS = useCallback((sym: string, tf: string, mt: MarketType) => {
-    if (wsRef.current) {
-      wsRef.current.onclose = null
-      wsRef.current.close()
-      wsRef.current = null
-    }
-    if (reconnectTimer.current) {
-      clearTimeout(reconnectTimer.current)
-      reconnectTimer.current = null
-    }
+    if (wsRef.current) { wsRef.current.onclose = null; wsRef.current.close(); wsRef.current = null }
+    if (reconnectTimer.current) { clearTimeout(reconnectTimer.current); reconnectTimer.current = null }
 
     setWsStatus('connecting')
-    const streamName = `${sym.toLowerCase()}@kline_${tf}`
     const wsBase = mt === 'futures' ? FUTURES_WS_BASE : SPOT_WS_BASE
-    const ws = new WebSocket(`${wsBase}/${streamName}`)
+    const ws     = new WebSocket(`${wsBase}/${sym.toLowerCase()}@kline_${tf}`)
     wsRef.current = ws
 
     ws.onopen = () => setWsStatus('live')
-
     ws.onmessage = (event) => {
       try {
-        const msg = JSON.parse(event.data)
-        const k = msg.k
+        const k = JSON.parse(event.data)?.k
         if (!k) return
-
         const candle: RawKline = {
-          timestamp: k.t,
-          open:      parseFloat(k.o),
-          high:      parseFloat(k.h),
-          low:       parseFloat(k.l),
-          close:     parseFloat(k.c),
-          volume:    parseFloat(k.v),
-          turnover:  parseFloat(k.q),
+          timestamp: k.t, open: parseFloat(k.o), high: parseFloat(k.h),
+          low: parseFloat(k.l), close: parseFloat(k.c),
+          volume: parseFloat(k.v), turnover: parseFloat(k.q),
         }
         chartRef.current?.updateData(candle)
         setCurrentPrice(candle.close)
         setBarTimestamp(k.t)
         setLastUpdateTs(Date.now())
-      } catch (e) {
-        console.warn('WS parse error', e)
-      }
+      } catch (e) { console.warn('WS parse', e) }
     }
-
-    ws.onerror  = () => setWsStatus('disconnected')
-    ws.onclose  = (e) => {
+    ws.onerror = () => setWsStatus('disconnected')
+    ws.onclose = (e) => {
       setWsStatus('disconnected')
       if (e.code !== 1000) {
-        reconnectTimer.current = setTimeout(() => {
-          connectWS(symbolRef.current, intervalRef.current, marketTypeRef.current)
-        }, 3000)
+        reconnectTimer.current = setTimeout(() =>
+          connectWS(symbolRef.current, intervalRef.current, marketTypeRef.current), 3000)
       }
     }
   }, [])
 
-  // ── Load history + ticker + connect WS ────────────────────────────────────
+  // ── Load history + ticker ─────────────────────────────────────────────────
   const loadChart = useCallback(async (sym: string, tf: string, mt: MarketType) => {
     if (!chartRef.current) return
-    setLoading(true)
-    setError(null)
-    setTicker(null)
+    setLoading(true); setError(null); setTicker(null)
 
     try {
-      // fetch klines & 24h ticker in parallel
       const [candles, tickerInfo] = await Promise.all([
         fetchKlines(mt, sym, tf, 5000),
         fetchTicker(mt, sym),
       ])
-
       if (!candles.length) throw new Error('Binance 回傳空資料')
       chartRef.current.applyNewData(candles)
 
@@ -322,41 +269,31 @@ export default function ChartPage() {
 
   // ── Initial load ──────────────────────────────────────────────────────────
   useEffect(() => {
-    const t = setTimeout(() => {
-      loadChart(symbolRef.current, intervalRef.current, marketTypeRef.current)
-    }, 100)
+    const t = setTimeout(() => loadChart(symbolRef.current, intervalRef.current, marketTypeRef.current), 100)
     return () => clearTimeout(t)
   }, [loadChart])
 
   // ── Handlers ──────────────────────────────────────────────────────────────
   const changeSymbol = (sym: string) => {
-    symbolRef.current = sym
-    localStorage.setItem('chart_symbol', sym)
-    setSymbol(sym)
-    setShowSymbolPanel(false)
-    setSearchQuery('')
+    symbolRef.current = sym; localStorage.setItem('chart_symbol', sym)
+    setSymbol(sym); setShowSymbolPanel(false); setSearchQuery('')
     loadChart(sym, intervalRef.current, marketTypeRef.current)
   }
-
   const changeInterval = (tf: string) => {
-    intervalRef.current = tf
-    localStorage.setItem('chart_interval', tf)
-    setInterval(tf)
-    loadChart(symbolRef.current, tf, marketTypeRef.current)
+    intervalRef.current = tf; localStorage.setItem('chart_interval', tf)
+    setInterval(tf); loadChart(symbolRef.current, tf, marketTypeRef.current)
   }
-
   const changeMarketType = (mt: MarketType) => {
-    marketTypeRef.current = mt
-    localStorage.setItem('chart_market', mt)
-    setMarketType(mt)
-    loadChart(symbolRef.current, intervalRef.current, mt)
+    marketTypeRef.current = mt; localStorage.setItem('chart_market', mt)
+    setMarketType(mt); loadChart(symbolRef.current, intervalRef.current, mt)
   }
 
   const filteredSymbols = POPULAR_SYMBOLS.filter(s =>
     s.toLowerCase().includes(searchQuery.toLowerCase())
   )
 
-  const priceColor = (ticker?.priceChange ?? 0) >= 0 ? 'text-[#26a69a]' : 'text-[#ef5350]'
+  const priceUp    = (ticker?.priceChange ?? 0) >= 0
+  const priceColor = priceUp ? '#26a69a' : '#ef5350'
 
   const wsStatusColor = wsStatus === 'live'
     ? 'bg-green-500'
@@ -364,27 +301,30 @@ export default function ChartPage() {
     ? 'bg-yellow-400 animate-pulse'
     : 'bg-red-500'
 
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
-    <div className="flex flex-col h-screen bg-[#131722] text-gray-200">
+    <div className="flex flex-col h-screen overflow-hidden bg-[#131722] text-gray-200">
       <PageHeader title="K 線圖表" />
 
-      {/* ── Top toolbar ── */}
-      <div className="flex flex-wrap items-center gap-2 px-4 py-2 bg-[#1e222d] border-b border-[#2b2b43]">
+      {/* ══════════════════════════════════════════════════════
+          ROW 1 — Symbol picker + Spot/Futures + WS status
+         ══════════════════════════════════════════════════════ */}
+      <div className="flex items-center gap-2 px-3 py-1.5 bg-[#1e222d] border-b border-[#2b2b43]">
 
         {/* Symbol picker */}
         <div className="relative">
           <button
             onClick={() => setShowSymbolPanel(v => !v)}
-            className="flex items-center gap-1 px-3 py-1.5 bg-[#2b2b43] rounded text-sm font-bold hover:bg-[#363a4e]"
+            className="flex items-center gap-1 px-3 py-1 bg-[#2b2b43] rounded text-sm font-bold hover:bg-[#363a4e]"
           >
             {symbol}
-            <ChevronDown size={14} />
+            <ChevronDown size={13} />
           </button>
           {showSymbolPanel && (
-            <div className="absolute top-9 left-0 z-50 w-56 bg-[#1e222d] border border-[#2b2b43] rounded shadow-xl">
+            <div className="absolute top-8 left-0 z-50 w-52 bg-[#1e222d] border border-[#2b2b43] rounded shadow-xl">
               <div className="p-2 border-b border-[#2b2b43]">
                 <div className="flex items-center gap-2 bg-[#131722] rounded px-2 py-1">
-                  <Search size={14} className="text-gray-400" />
+                  <Search size={12} className="text-gray-400" />
                   <input
                     autoFocus
                     value={searchQuery}
@@ -394,12 +334,13 @@ export default function ChartPage() {
                   />
                 </div>
               </div>
-              <div className="max-h-60 overflow-y-auto">
+              <div className="max-h-56 overflow-y-auto">
                 {filteredSymbols.map(s => (
                   <button
                     key={s}
                     onClick={() => changeSymbol(s)}
-                    className={`w-full text-left px-3 py-2 text-sm hover:bg-[#2b2b43] ${s === symbol ? 'text-yellow-400 font-bold' : ''}`}
+                    className="w-full text-left px-3 py-1.5 text-sm hover:bg-[#2b2b43]"
+                    style={{ color: s === symbol ? '#f0b90b' : undefined, fontWeight: s === symbol ? 700 : undefined }}
                   >
                     {s}
                   </button>
@@ -409,16 +350,18 @@ export default function ChartPage() {
           )}
         </div>
 
-        {/* Spot / Futures toggle */}
+        {/* Spot / Futures */}
         <div className="flex rounded overflow-hidden border border-[#2b2b43]">
           {(['spot', 'futures'] as MarketType[]).map(mt => (
             <button
               key={mt}
               onClick={() => changeMarketType(mt)}
-              className={`px-3 py-1.5 text-xs font-semibold transition-colors ${
-                marketType === mt
-                  ? 'bg-yellow-500 text-black'
-                  : 'bg-[#2b2b43] text-gray-400 hover:bg-[#363a4e]'
+              style={marketType === mt
+                ? { backgroundColor: '#f0b90b', color: '#000', fontWeight: 700 }
+                : undefined
+              }
+              className={`px-3 py-1 text-xs font-semibold transition-colors ${
+                marketType === mt ? '' : 'bg-[#2b2b43] text-gray-400 hover:bg-[#363a4e]'
               }`}
             >
               {mt === 'spot' ? '現貨' : '合約'}
@@ -426,24 +369,6 @@ export default function ChartPage() {
           ))}
         </div>
 
-        {/* Interval buttons */}
-        <div className="flex gap-1 flex-wrap">
-          {INTERVALS.map(tf => (
-            <button
-              key={tf}
-              onClick={() => changeInterval(tf)}
-              className={`px-2 py-1 text-xs rounded transition-colors ${
-                interval === tf
-                  ? 'bg-yellow-500 text-black font-bold'
-                  : 'bg-[#2b2b43] text-gray-400 hover:bg-[#363a4e]'
-              }`}
-            >
-              {INTERVAL_LABELS[tf]}
-            </button>
-          ))}
-        </div>
-
-        {/* Spacer */}
         <div className="flex-1" />
 
         {/* WS status + reload */}
@@ -456,76 +381,96 @@ export default function ChartPage() {
           </div>
           <button
             onClick={() => loadChart(symbolRef.current, intervalRef.current, marketTypeRef.current)}
-            className="p-1.5 rounded hover:bg-[#2b2b43] text-gray-400 hover:text-white"
+            className="p-1 rounded hover:bg-[#2b2b43] text-gray-400 hover:text-white"
             title="重新載入"
           >
-            <RefreshCw size={14} />
+            <RefreshCw size={13} />
           </button>
         </div>
       </div>
 
-      {/* ── Price Info Bar (Binance-style) ── */}
-      <div className="flex flex-wrap items-center gap-x-6 gap-y-1 px-4 py-2 bg-[#161a25] border-b border-[#2b2b43] text-xs">
+      {/* ══════════════════════════════════════════════════════
+          ROW 2 — Price info bar (Binance-style)
+         ══════════════════════════════════════════════════════ */}
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-0.5 px-3 py-1.5 bg-[#161a25] border-b border-[#2b2b43]">
 
-        {/* 大價格 */}
-        {currentPrice !== null && (
-          <div className="flex flex-col">
-            <span className={`text-2xl font-bold font-mono leading-tight ${priceColor}`}>
-              {formatPrice(currentPrice)}
+        {/* 即時成交價 */}
+        <div className="flex flex-col leading-tight">
+          <span className="text-xl font-bold font-mono" style={{ color: priceColor }}>
+            {currentPrice !== null ? formatPrice(currentPrice) : '—'}
+          </span>
+          {ticker && (
+            <span className="text-xs font-mono" style={{ color: priceColor }}>
+              {ticker.priceChange >= 0 ? '+' : ''}{formatPrice(Math.abs(ticker.priceChange))}
+              &nbsp;({ticker.priceChange >= 0 ? '+' : ''}{ticker.priceChangePct.toFixed(2)}%)
             </span>
-            {/* 24h 漲跌（絕對值 + %） */}
-            {ticker && (
-              <div className={`flex items-center gap-1 mt-0.5 font-mono ${priceColor}`}>
-                <span>{ticker.priceChange >= 0 ? '+' : ''}{formatPrice(Math.abs(ticker.priceChange))}</span>
-                <span>({ticker.priceChange >= 0 ? '+' : ''}{ticker.priceChangePct.toFixed(2)}%)</span>
-              </div>
-            )}
-          </div>
-        )}
+          )}
+        </div>
 
         {/* 分隔線 */}
-        {ticker && <div className="h-8 w-px bg-[#2b2b43]" />}
+        {ticker && <div className="h-7 w-px bg-[#2b2b43] mx-1" />}
 
         {/* 24h 高/低/量 */}
         {ticker && (
-          <div className="flex gap-5 text-gray-400">
+          <div className="flex gap-4 text-xs">
             <div className="flex flex-col">
-              <span className="text-[10px] text-gray-600">24h 高</span>
-              <span className="text-gray-200 font-mono">{formatPrice(ticker.high24h)}</span>
+              <span className="text-gray-600">24h 高</span>
+              <span className="text-gray-300 font-mono">{formatPrice(ticker.high24h)}</span>
             </div>
             <div className="flex flex-col">
-              <span className="text-[10px] text-gray-600">24h 低</span>
-              <span className="text-gray-200 font-mono">{formatPrice(ticker.low24h)}</span>
+              <span className="text-gray-600">24h 低</span>
+              <span className="text-gray-300 font-mono">{formatPrice(ticker.low24h)}</span>
             </div>
             <div className="flex flex-col">
-              <span className="text-[10px] text-gray-600">24h 量</span>
-              <span className="text-gray-200 font-mono">{formatVolume(ticker.volume24h)}</span>
+              <span className="text-gray-600">24h 量</span>
+              <span className="text-gray-300 font-mono">{formatVolume(ticker.volume24h)}</span>
             </div>
           </div>
         )}
 
-        {/* Spacer */}
         <div className="flex-1" />
 
-        {/* 當前 Bar 日期 + 更新時間 */}
-        <div className="flex flex-col items-end text-gray-500">
+        {/* 當前 Bar 時間 + 更新時間 */}
+        <div className="flex flex-col items-end text-xs text-gray-500 leading-tight">
           {barTimestamp !== null && (
-            <span>{formatTimestamp(barTimestamp)}&nbsp;
-              <span className="text-gray-600">({INTERVAL_LABELS[interval] ?? interval})</span>
+            <span>
+              {formatTimestamp(barTimestamp)}
+              <span className="text-gray-600 ml-1">({INTERVAL_LABELS[interval] ?? interval})</span>
             </span>
           )}
-          {timeAgoStr && (
-            <span className="text-[10px] text-gray-600">更新 {timeAgoStr}</span>
-          )}
+          {timeAgoStr && <span className="text-gray-600 text-[10px]">更新 {timeAgoStr}</span>}
         </div>
       </div>
 
-      {/* ── Chart area ── */}
-      <div className="relative flex-1 min-h-0">
+      {/* ══════════════════════════════════════════════════════
+          ROW 3 — Interval buttons (獨立一行)
+         ══════════════════════════════════════════════════════ */}
+      <div className="flex items-center gap-1 px-3 py-1 bg-[#1e222d] border-b border-[#2b2b43]">
+        {INTERVALS.map(tf => (
+          <button
+            key={tf}
+            onClick={() => changeInterval(tf)}
+            style={interval === tf
+              ? { backgroundColor: '#f0b90b', color: '#000', fontWeight: 700 }
+              : undefined
+            }
+            className={`px-2.5 py-0.5 text-xs rounded transition-colors ${
+              interval === tf ? '' : 'text-gray-400 hover:text-white hover:bg-[#2b2b43]'
+            }`}
+          >
+            {INTERVAL_LABELS[tf]}
+          </button>
+        ))}
+      </div>
+
+      {/* ══════════════════════════════════════════════════════
+          ROW 4 — K-line chart (flex-1, takes all remaining height)
+         ══════════════════════════════════════════════════════ */}
+      <div className="relative flex-1 min-h-0 overflow-hidden">
         {loading && (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[#131722]/80">
-            <div className="w-8 h-8 border-2 border-yellow-400 border-t-transparent rounded-full animate-spin mb-3" />
-            <span className="text-sm text-gray-400">載入歷史 K 線（~5000 根）...</span>
+            <div className="w-7 h-7 border-2 border-yellow-400 border-t-transparent rounded-full animate-spin mb-2" />
+            <span className="text-xs text-gray-400">載入歷史 K 線（~5000 根）...</span>
           </div>
         )}
         {error && !loading && (
@@ -533,17 +478,13 @@ export default function ChartPage() {
             <span className="text-red-400 text-sm">{error}</span>
             <button
               onClick={() => loadChart(symbolRef.current, intervalRef.current, marketTypeRef.current)}
-              className="px-4 py-2 bg-yellow-500 text-black text-sm rounded hover:bg-yellow-400"
+              className="px-4 py-1.5 bg-yellow-500 text-black text-sm rounded hover:bg-yellow-400"
             >
               重試
             </button>
           </div>
         )}
-        <div
-          id={chartContainerId}
-          className="w-full h-full"
-          style={{ background: '#131722' }}
-        />
+        <div id={chartContainerId} className="w-full h-full" style={{ background: '#131722' }} />
       </div>
     </div>
   )
