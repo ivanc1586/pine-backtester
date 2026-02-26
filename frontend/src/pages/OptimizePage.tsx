@@ -1,28 +1,9 @@
-// =============================================================================
-// 修改歷程記錄
-// -----------------------------------------------------------------------------
-// v2.0.0 - 2026-02-26 - 策略優化頁面（全新重寫）
-//   - 頁面標題改為「策略優化」
-//   - 新增 Pine Script 貼入區塊，支援 AI 自動解析 input 參數
-//   - 動態參數偵測 UI：自動顯示參數列表，可勾選/設定優化範圍
-//   - Gemini AI 轉譯 + Optuna 優化後端串接
-//   - 前 10 名結果列表：顯示總盈虧、MDD、盈虧比、勝率等
-//   - 點擊結果連動：Lightweight Charts 顯示對應回測圖表
-//   - 每月績效柱狀圖
-//   - 一鍵複製優化代碼功能
-// =============================================================================
+// OptimizePage v2.1 — dark theme aligned with ChartPage
+// Changes: removed lightweight-charts, inline dark style, removed capital/commission/quantity fields
 
-import { useState, useRef, useEffect, useCallback } from 'react'
-import {
-  Play, Sparkles, ChevronDown, ChevronUp, Settings2,
-  Copy, Check, TrendingUp, TrendingDown, BarChart2,
-  Zap, AlertCircle, RefreshCw, Target
-} from 'lucide-react'
+import { useState, useRef, useCallback } from 'react'
 import PageHeader from '../components/PageHeader'
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+import { Target } from 'lucide-react'
 
 interface DetectedParam {
   name: string
@@ -85,48 +66,30 @@ const INTERVALS = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w']
 const SOURCES = ['binance', 'coingecko', 'coincap']
 const POPULAR_SYMBOLS = [
   'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
-  'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT'
+  'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT',
 ]
-
-// ---------------------------------------------------------------------------
-// Sub-components
-// ---------------------------------------------------------------------------
-
-function MetricBadge({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {
-  return (
-    <div className={`text-center px-3 py-2 rounded-lg ${highlight ? 'bg-emerald-500/20' : 'bg-white/5'}`}>
-      <div className={`text-xs font-medium ${highlight ? 'text-emerald-400' : 'text-gray-400'}`}>{label}</div>
-      <div className={`text-sm font-bold mt-0.5 ${highlight ? 'text-emerald-300' : 'text-white'}`}>{value}</div>
-    </div>
-  )
-}
 
 function MonthlyBarChart({ data }: { data: Record<string, number> }) {
   const entries = Object.entries(data).sort(([a], [b]) => a.localeCompare(b))
   if (!entries.length) return null
-
   const vals = entries.map(([, v]) => v)
   const maxAbs = Math.max(...vals.map(Math.abs), 1)
-
   return (
-    <div className="mt-4">
-      <div className="text-xs text-gray-400 mb-2 font-medium">每月績效</div>
-      <div className="flex items-end gap-1 h-24 overflow-x-auto pb-1">
+    <div style={{ marginTop: 16 }}>
+      <div style={{ fontSize: 11, color: '#848e9c', marginBottom: 8, fontWeight: 600 }}>每月績效</div>
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 4, height: 80, overflowX: 'auto', paddingBottom: 4 }}>
         {entries.map(([month, pnl]) => {
-          const pct = (pnl / maxAbs) * 100
+          const pct = (Math.abs(pnl) / maxAbs) * 56
           const isPos = pnl >= 0
           return (
-            <div key={month} className="flex flex-col items-center min-w-[32px]">
-              <div className="relative w-full flex items-end justify-center" style={{ height: '64px' }}>
+            <div key={month} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: 28 }}>
+              <div style={{ height: 64, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
                 <div
-                  className={`w-6 rounded-sm transition-all ${isPos ? 'bg-emerald-500' : 'bg-rose-500'}`}
-                  style={{ height: `${Math.max(4, Math.abs(pct) * 0.64)}px` }}
+                  style={{ width: 20, height: Math.max(3, pct), background: isPos ? '#26a69a' : '#ef5350', borderRadius: 2 }}
                   title={`${month}: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`}
                 />
               </div>
-              <div className="text-gray-500 mt-1" style={{ fontSize: '9px' }}>
-                {month.slice(5)}
-              </div>
+              <div style={{ fontSize: 9, color: '#848e9c', marginTop: 2 }}>{month.slice(5)}</div>
             </div>
           )
         })}
@@ -135,31 +98,74 @@ function MonthlyBarChart({ data }: { data: Record<string, number> }) {
   )
 }
 
-// ---------------------------------------------------------------------------
-// Main Component
-// ---------------------------------------------------------------------------
+function EquityCanvas({ curve }: { curve: number[] }) {
+  const draw = useCallback((el: HTMLCanvasElement | null) => {
+    if (!el || curve.length < 2) return
+    const dpr = window.devicePixelRatio || 1
+    const W = el.clientWidth, H = el.clientHeight
+    el.width = W * dpr; el.height = H * dpr
+    const ctx = el.getContext('2d')!
+    ctx.scale(dpr, dpr)
+    const min = Math.min(...curve), max = Math.max(...curve)
+    const range = max - min || 1
+    const pad = { top: 12, right: 12, bottom: 24, left: 56 }
+    const cw = W - pad.left - pad.right, ch = H - pad.top - pad.bottom
+    ctx.strokeStyle = '#1e2328'; ctx.lineWidth = 1
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.top + (ch / 4) * i
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke()
+      const val = max - (range / 4) * i
+      ctx.fillStyle = '#848e9c'; ctx.font = '10px Helvetica Neue'; ctx.textAlign = 'right'
+      ctx.fillText(val >= 1000 ? `${(val / 1000).toFixed(1)}K` : val.toFixed(0), pad.left - 4, y + 4)
+    }
+    const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + ch)
+    grad.addColorStop(0, 'rgba(139,92,246,0.35)'); grad.addColorStop(1, 'rgba(139,92,246,0.02)')
+    ctx.beginPath()
+    curve.forEach((v, i) => {
+      const x = pad.left + (i / (curve.length - 1)) * cw
+      const y = pad.top + ch - ((v - min) / range) * ch
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
+    })
+    ctx.lineTo(pad.left + cw, pad.top + ch); ctx.lineTo(pad.left, pad.top + ch)
+    ctx.closePath(); ctx.fillStyle = grad; ctx.fill()
+    ctx.beginPath(); ctx.strokeStyle = '#8b5cf6'; ctx.lineWidth = 2
+    curve.forEach((v, i) => {
+      const x = pad.left + (i / (curve.length - 1)) * cw
+      const y = pad.top + ch - ((v - min) / range) * ch
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
+    })
+    ctx.stroke()
+  }, [curve])
+  return <canvas ref={draw} style={{ width: '100%', height: 180, display: 'block', borderRadius: 4 }} />
+}
+
+const inputStyle: React.CSSProperties = {
+  width: '100%', padding: '4px 8px', background: '#131722',
+  border: '1px solid #2b2b43', borderRadius: 4,
+  color: '#d1d4dc', fontSize: 12, outline: 'none', boxSizing: 'border-box',
+}
+const sectionStyle: React.CSSProperties = {
+  background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 6, marginBottom: 12, overflow: 'hidden',
+}
+const sectionHeaderStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+  padding: '8px 14px', borderBottom: '1px solid #2b2b43', cursor: 'pointer', userSelect: 'none',
+}
+const labelStyle: React.CSSProperties = { fontSize: 11, color: '#848e9c', marginBottom: 4, display: 'block' }
 
 export default function OptimizePage() {
-  // Pine Script
   const [pineScript, setPineScript] = useState('')
   const [isParsing, setIsParsing] = useState(false)
   const [detectedParams, setDetectedParams] = useState<DetectedParam[]>([])
   const [paramRanges, setParamRanges] = useState<ParamRange[]>([])
   const [parseError, setParseError] = useState('')
-
-  // Market settings
   const [symbol, setSymbol] = useState('BTCUSDT')
   const [interval, setIntervalVal] = useState('1h')
   const [source, setSource] = useState('binance')
   const [startDate, setStartDate] = useState('2023-01-01')
   const [endDate, setEndDate] = useState(new Date().toISOString().split('T')[0])
-  const [initialCapital, setInitialCapital] = useState(10000)
-  const [commission, setCommission] = useState(0.001)
-  const [quantity, setQuantity] = useState(1)
   const [sortBy, setSortBy] = useState('profit_pct')
   const [nTrials, setNTrials] = useState(100)
-
-  // Optimization state
   const [isRunning, setIsRunning] = useState(false)
   const [progress, setProgress] = useState(0)
   const [progressText, setProgressText] = useState('')
@@ -167,61 +173,38 @@ export default function OptimizePage() {
   const [selectedResult, setSelectedResult] = useState<OptimizeResult | null>(null)
   const [copiedCode, setCopiedCode] = useState(false)
   const [errorMsg, setErrorMsg] = useState('')
-
-  // UI state
-  const [showSettings, setShowSettings] = useState(true)
   const [showScript, setShowScript] = useState(true)
-
-  // Chart refs
-  const equityChartRef = useRef<HTMLCanvasElement>(null)
-
-  // ---------------------------------------------------------------------------
-  // Parse Pine Script inputs
-  // ---------------------------------------------------------------------------
+  const [showSettings, setShowSettings] = useState(true)
 
   const parsePineScript = useCallback(async () => {
-    if (!pineScript.trim()) {
-      setParseError('請先貼入 Pine Script 代碼')
-      return
-    }
-
-    setIsParsing(true)
-    setParseError('')
-
+    if (!pineScript.trim()) { setParseError('請先貼入 Pine Script 代碼'); return }
+    setIsParsing(true); setParseError('')
     try {
       const res = await fetch('/api/optimize/parse', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pine_script: pineScript }),
       })
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok) {
+        const text = await res.text()
+        throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`)
+      }
       const data = await res.json()
-
       setDetectedParams(data.params)
-
-      // Build param ranges from detected params (only int/float)
       const ranges: ParamRange[] = data.params
         .filter((p: DetectedParam) => p.type === 'int' || p.type === 'float')
         .map((p: DetectedParam) => {
           const defVal = typeof p.default === 'number' ? p.default : 1
           return {
-            name: p.name,
-            title: p.title,
-            enabled: true,
+            name: p.name, title: p.title, enabled: true,
             min_val: p.min_val ?? Math.max(1, Math.floor(defVal * 0.5)),
             max_val: p.max_val ?? Math.ceil(defVal * 2),
             step: p.step ?? (p.type === 'int' ? 1 : 0.1),
-            is_int: p.type === 'int',
-            default_val: defVal,
+            is_int: p.type === 'int', default_val: defVal,
           }
         })
-
       setParamRanges(ranges)
-
-      if (data.params.length === 0) {
-        setParseError('未偵測到任何 input 參數，請確認 Pine Script 包含 input.int / input.float 等宣告')
-      }
+      if (data.params.length === 0) setParseError('未偵測到 input 參數，請確認含有 input.int / input.float 宣告')
     } catch (err: any) {
       setParseError(`解析失敗：${err.message}`)
     } finally {
@@ -229,101 +212,42 @@ export default function OptimizePage() {
     }
   }, [pineScript])
 
-  // ---------------------------------------------------------------------------
-  // Update param range
-  // ---------------------------------------------------------------------------
-
-  const updateRange = (name: string, field: keyof ParamRange, value: any) => {
+  const updateRange = (name: string, field: keyof ParamRange, value: any) =>
     setParamRanges(prev => prev.map(p => p.name === name ? { ...p, [field]: value } : p))
-  }
-
-  // ---------------------------------------------------------------------------
-  // Run optimization
-  // ---------------------------------------------------------------------------
 
   const runOptimization = async () => {
-    if (!pineScript.trim()) {
-      setErrorMsg('請先貼入 Pine Script 代碼並解析參數')
-      return
-    }
-
+    if (!pineScript.trim()) { setErrorMsg('請先貼入 Pine Script 代碼並解析參數'); return }
     const enabledRanges = paramRanges.filter(p => p.enabled)
-    if (enabledRanges.length === 0) {
-      setErrorMsg('請至少勾選一個參數進行優化')
-      return
-    }
-
-    setIsRunning(true)
-    setProgress(0)
-    setProgressText('正在初始化...')
-    setResults([])
-    setSelectedResult(null)
-    setErrorMsg('')
-
+    if (enabledRanges.length === 0) { setErrorMsg('請至少勾選一個參數進行優化'); return }
+    setIsRunning(true); setProgress(0); setProgressText('正在初始化...'); setResults([]); setSelectedResult(null); setErrorMsg('')
     try {
       const res = await fetch('/api/optimize/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          pine_script: pineScript,
-          symbol, interval, source,
-          start_date: startDate,
-          end_date: endDate,
-          initial_capital: initialCapital,
-          commission,
-          quantity,
-          param_ranges: enabledRanges.map(p => ({
-            name: p.name,
-            min_val: p.min_val,
-            max_val: p.max_val,
-            step: p.step,
-            is_int: p.is_int,
-          })),
-          sort_by: sortBy,
-          n_trials: nTrials,
-          top_n: 10,
+          pine_script: pineScript, symbol, interval, source,
+          start_date: startDate, end_date: endDate,
+          param_ranges: enabledRanges.map(p => ({ name: p.name, min_val: p.min_val, max_val: p.max_val, step: p.step, is_int: p.is_int })),
+          sort_by: sortBy, n_trials: nTrials, top_n: 10,
         }),
       })
-
-      if (!res.ok) {
-        const err = await res.json()
-        throw new Error(err.detail || '優化請求失敗')
-      }
-
+      if (!res.ok) { const e = await res.json(); throw new Error(e.detail || '優化請求失敗') }
       const reader = res.body?.getReader()
       if (!reader) throw new Error('無法讀取串流回應')
-
-      const decoder = new TextDecoder()
-      let buffer = ''
-
+      const decoder = new TextDecoder(); let buffer = ''
       while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-
+        const { done, value } = await reader.read(); if (done) break
         buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-
+        const lines = buffer.split('\n'); buffer = lines.pop() || ''
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue
-          const payload = line.slice(6).trim()
-          if (!payload) continue
-
+          const payload = line.slice(6).trim(); if (!payload) continue
           try {
             const data = JSON.parse(payload)
-            if (data.type === 'progress') {
-              setProgress(data.progress)
-              setProgressText(`已完成 ${data.completed} / ${data.total} 次試驗`)
-            } else if (data.type === 'result') {
-              setResults(data.results)
-              setProgress(100)
-              setProgressText(`優化完成！共 ${data.results.length} 個最佳組合`)
-            } else if (data.type === 'error') {
-              throw new Error(data.message)
-            }
-          } catch (parseErr) {
-            // ignore malformed SSE lines
-          }
+            if (data.type === 'progress') { setProgress(data.progress); setProgressText(`已完成 ${data.completed} / ${data.total} 次試驗`) }
+            else if (data.type === 'result') { setResults(data.results); setProgress(100); setProgressText(`優化完成！共 ${data.results.length} 個最佳組合`) }
+            else if (data.type === 'error') throw new Error(data.message)
+          } catch (_) {}
         }
       }
     } catch (err: any) {
@@ -333,225 +257,89 @@ export default function OptimizePage() {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Equity curve chart
-  // ---------------------------------------------------------------------------
-
-  useEffect(() => {
-    const canvas = equityChartRef.current
-    if (!canvas || !selectedResult) return
-    const eq = selectedResult.equity_curve
-    if (!eq || eq.length === 0) return
-
-    const dpr = window.devicePixelRatio || 1
-    const W = canvas.offsetWidth || 600
-    const H = 220
-    canvas.width = W * dpr
-    canvas.height = H * dpr
-    canvas.style.width = W + 'px'
-    canvas.style.height = H + 'px'
-
-    const ctx = canvas.getContext('2d')!
-    ctx.scale(dpr, dpr)
-    ctx.clearRect(0, 0, W, H)
-
-    const pad = { top: 16, right: 16, bottom: 28, left: 64 }
-    const chartW = W - pad.left - pad.right
-    const chartH = H - pad.top - pad.bottom
-
-    const minVal = Math.min(...eq)
-    const maxVal = Math.max(...eq)
-    const range = maxVal - minVal || 1
-
-    // Grid lines
-    ctx.strokeStyle = 'rgba(255,255,255,0.06)'
-    ctx.lineWidth = 1
-    for (let i = 0; i <= 4; i++) {
-      const y = pad.top + (chartH / 4) * i
-      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + chartW, y); ctx.stroke()
-    }
-
-    // Y axis labels
-    ctx.fillStyle = '#6b7280'
-    ctx.font = '11px monospace'
-    ctx.textAlign = 'right'
-    for (let i = 0; i <= 4; i++) {
-      const val = maxVal - (range / 4) * i
-      const y = pad.top + (chartH / 4) * i
-      ctx.fillText('$' + val.toFixed(0), pad.left - 6, y + 4)
-    }
-
-    // Line path
-    const toX = (i: number) => pad.left + (i / (eq.length - 1)) * chartW
-    const toY = (v: number) => pad.top + chartH - ((v - minVal) / range) * chartH
-
-    // Gradient fill
-    const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + chartH)
-    grad.addColorStop(0, 'rgba(139,92,246,0.25)')
-    grad.addColorStop(1, 'rgba(139,92,246,0)')
-    ctx.beginPath()
-    ctx.moveTo(toX(0), toY(eq[0]))
-    eq.forEach((v, i) => { if (i > 0) ctx.lineTo(toX(i), toY(v)) })
-    ctx.lineTo(toX(eq.length - 1), pad.top + chartH)
-    ctx.lineTo(toX(0), pad.top + chartH)
-    ctx.closePath()
-    ctx.fillStyle = grad
-    ctx.fill()
-
-    // Line stroke
-    ctx.beginPath()
-    ctx.strokeStyle = '#8b5cf6'
-    ctx.lineWidth = 2
-    ctx.lineJoin = 'round'
-    ctx.moveTo(toX(0), toY(eq[0]))
-    eq.forEach((v, i) => { if (i > 0) ctx.lineTo(toX(i), toY(v)) })
-    ctx.stroke()
-  }, [selectedResult])
-
-  // ---------------------------------------------------------------------------
-  // Copy optimized code
-  // ---------------------------------------------------------------------------
-
   const copyOptimizedCode = useCallback(() => {
     if (!selectedResult) return
     let code = pineScript
     Object.entries(selectedResult.params).forEach(([name, val]) => {
-      // Replace input.int/float default value for this param
       const pattern = new RegExp(`(${name}\\s*=\\s*input\\.(?:int|float)\\s*\\()[^)]*\\)`, 'g')
-      code = code.replace(pattern, (match) => {
-        return match.replace(/defval\s*=\s*[\d.]+|^(\s*\()[\d.]+/, (m) => {
-          if (m.includes('defval')) return `defval = ${val}`
-          return m.replace(/[\d.]+/, String(val))
-        })
-      })
+      code = code.replace(pattern, (match) =>
+        match.replace(/defval\s*=\s*[\d.]+|^(\s*\()[\d.]+/, (m) =>
+          m.includes('defval') ? `defval = ${val}` : m.replace(/[\d.]+/, String(val))
+        )
+      )
     })
-    navigator.clipboard.writeText(code).then(() => {
-      setCopiedCode(true)
-      setTimeout(() => setCopiedCode(false), 2500)
-    })
+    navigator.clipboard.writeText(code).then(() => { setCopiedCode(true); setTimeout(() => setCopiedCode(false), 2500) })
   }, [selectedResult, pineScript])
 
-  // ---------------------------------------------------------------------------
-  // Render
-  // ---------------------------------------------------------------------------
-
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 p-4 md:p-8">
-      <PageHeader
-        title="策略優化"
-        subtitle="AI 自動解析 Pine Script 參數，Optuna 智能搜尋最佳組合"
-        icon={<Target className="w-8 h-8" />}
-      />
+    <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh', background: '#131722', color: '#d1d4dc' }}>
+      <PageHeader title="策略優化" subtitle="AI 解析 Pine Script 參數 · Optuna 搜尋最佳組合" icon={<Target style={{ width: 20, height: 20 }} />} />
+      <div style={{ flex: 1, padding: '16px', maxWidth: 960, margin: '0 auto', width: '100%' }}>
 
-      <div className="max-w-7xl mx-auto mt-6 space-y-5">
-
-        {/* ── Pine Script Input ── */}
-        <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 overflow-hidden">
-          <button
-            onClick={() => setShowScript(!showScript)}
-            className="w-full px-6 py-4 flex items-center justify-between hover:bg-white/5 transition-colors"
-          >
-            <div className="flex items-center gap-3">
-              <Zap className="w-5 h-5 text-yellow-400" />
-              <span className="text-white font-medium">貼入 Pine Script</span>
-              {detectedParams.length > 0 && (
-                <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400">
-                  已偵測 {detectedParams.filter(p => p.type === 'int' || p.type === 'float').length} 個可優化參數
+        <div style={sectionStyle}>
+          <div style={sectionHeaderStyle} onClick={() => setShowScript(v => !v)}>
+            <span style={{ fontSize: 13, fontWeight: 700, color: '#d1d4dc' }}>
+              貼入 Pine Script
+              {detectedParams.filter(p => p.type === 'int' || p.type === 'float').length > 0 &&
+                <span style={{ marginLeft: 8, fontSize: 11, color: '#26a69a' }}>
+                  ✓ 已偵測 {detectedParams.filter(p => p.type === 'int' || p.type === 'float').length} 個可優化參數
                 </span>
-              )}
-            </div>
-            {showScript ? <ChevronUp className="w-5 h-5 text-white" /> : <ChevronDown className="w-5 h-5 text-white" />}
-          </button>
-
+              }
+            </span>
+            <span style={{ color: '#848e9c', fontSize: 12 }}>{showScript ? '▲' : '▼'}</span>
+          </div>
           {showScript && (
-            <div className="p-6 border-t border-white/10 space-y-4">
+            <div style={{ padding: '12px 14px' }}>
               <textarea
                 value={pineScript}
                 onChange={(e) => { setPineScript(e.target.value); setDetectedParams([]); setParamRanges([]) }}
-                placeholder={`//@version=5\nstrategy("My Strategy", overlay=true)\nfastLength = input.int(9, title="Fast EMA", minval=2, maxval=50)\nslowLength = input.int(21, title="Slow EMA", minval=5, maxval=100)\n// ... 策略邏輯`}
-                className="w-full h-48 px-4 py-3 bg-black/30 border border-white/10 rounded-xl text-green-300 font-mono text-sm focus:ring-2 focus:ring-purple-500 focus:border-transparent resize-y placeholder-gray-600"
+                placeholder={'//@version=5\nstrategy("My Strategy", overlay=true)\nfastLength = input.int(9, title="Fast EMA", minval=2, maxval=50)\n// ...'}
+                style={{ ...inputStyle, height: 180, resize: 'vertical', fontFamily: 'monospace', color: '#26a69a', fontSize: 12 }}
               />
-
-              {parseError && (
-                <div className="flex items-center gap-2 text-rose-400 text-sm">
-                  <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                  {parseError}
-                </div>
-              )}
-
+              {parseError && <div style={{ marginTop: 8, fontSize: 12, color: '#ef5350' }}>⚠ {parseError}</div>}
               <button
                 onClick={parsePineScript}
                 disabled={isParsing || !pineScript.trim()}
-                className="flex items-center gap-2 px-5 py-2.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-xl font-medium transition-colors"
+                style={{
+                  marginTop: 10, padding: '6px 16px', fontSize: 12, fontWeight: 700,
+                  background: isParsing || !pineScript.trim() ? '#2b2b43' : '#8b5cf6',
+                  color: isParsing || !pineScript.trim() ? '#848e9c' : '#fff',
+                  border: 'none', borderRadius: 4, cursor: isParsing || !pineScript.trim() ? 'not-allowed' : 'pointer',
+                }}
               >
-                {isParsing ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-                {isParsing ? '解析中...' : 'AI 自動解析參數'}
+                {isParsing ? '解析中...' : '✦ AI 自動解析參數'}
               </button>
             </div>
           )}
         </div>
 
-        {/* ── Detected Params ── */}
         {paramRanges.length > 0 && (
-          <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 p-6">
-            <h3 className="text-white font-semibold mb-4 flex items-center gap-2">
-              <Settings2 className="w-5 h-5 text-purple-400" />
-              參數優化設定
-              <span className="text-xs text-gray-400 font-normal">（勾選要優化的參數並設定範圍）</span>
-            </h3>
-
-            <div className="space-y-3">
+          <div style={sectionStyle}>
+            <div style={{ ...sectionHeaderStyle, cursor: 'default' }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: '#d1d4dc' }}>參數優化設定</span>
+              <span style={{ fontSize: 11, color: '#848e9c' }}>勾選要優化的參數並設定範圍</span>
+            </div>
+            <div style={{ padding: '8px 14px 14px' }}>
               {paramRanges.map((p) => (
-                <div key={p.name} className={`p-4 rounded-xl border transition-colors ${p.enabled ? 'bg-purple-500/10 border-purple-500/30' : 'bg-white/5 border-white/10'}`}>
-                  <div className="flex items-center gap-3 mb-3">
-                    <input
-                      type="checkbox"
-                      checked={p.enabled}
-                      onChange={(e) => updateRange(p.name, 'enabled', e.target.checked)}
-                      className="w-4 h-4 rounded accent-purple-500"
-                    />
-                    <div>
-                      <span className="text-white font-medium">{p.title}</span>
-                      <span className="text-gray-500 text-xs ml-2">({p.name})</span>
-                    </div>
-                    <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-white/10 text-gray-300">
-                      預設: {p.default_val}
-                    </span>
+                <div key={p.name} style={{
+                  padding: '10px 12px', borderRadius: 4, marginBottom: 8,
+                  background: p.enabled ? 'rgba(139,92,246,0.08)' : '#131722',
+                  border: `1px solid ${p.enabled ? 'rgba(139,92,246,0.3)' : '#2b2b43'}`,
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: p.enabled ? 10 : 0 }}>
+                    <input type="checkbox" checked={p.enabled} onChange={(e) => updateRange(p.name, 'enabled', e.target.checked)} style={{ accentColor: '#8b5cf6', width: 14, height: 14 }} />
+                    <span style={{ fontSize: 13, color: '#d1d4dc', fontWeight: 600 }}>{p.title}</span>
+                    <span style={{ fontSize: 11, color: '#848e9c' }}>({p.name})</span>
+                    <span style={{ marginLeft: 'auto', fontSize: 11, color: '#848e9c' }}>預設: {p.default_val}</span>
                   </div>
-
                   {p.enabled && (
-                    <div className="grid grid-cols-3 gap-3 mt-2">
-                      <div>
-                        <label className="block text-xs text-gray-400 mb-1">最小值</label>
-                        <input
-                          type="number"
-                          value={p.min_val}
-                          step={p.is_int ? 1 : 0.01}
-                          onChange={(e) => updateRange(p.name, 'min_val', parseFloat(e.target.value))}
-                          className="w-full px-3 py-2 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:ring-1 focus:ring-purple-500"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-gray-400 mb-1">最大值</label>
-                        <input
-                          type="number"
-                          value={p.max_val}
-                          step={p.is_int ? 1 : 0.01}
-                          onChange={(e) => updateRange(p.name, 'max_val', parseFloat(e.target.value))}
-                          className="w-full px-3 py-2 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:ring-1 focus:ring-purple-500"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-gray-400 mb-1">步長</label>
-                        <input
-                          type="number"
-                          value={p.step}
-                          step={p.is_int ? 1 : 0.01}
-                          min={p.is_int ? 1 : 0.01}
-                          onChange={(e) => updateRange(p.name, 'step', parseFloat(e.target.value))}
-                          className="w-full px-3 py-2 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:ring-1 focus:ring-purple-500"
-                        />
-                      </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+                      {(['min_val', 'max_val', 'step'] as const).map((field) => (
+                        <div key={field}>
+                          <label style={labelStyle}>{{ min_val: '最小值', max_val: '最大值', step: '步長' }[field]}</label>
+                          <input type="number" value={p[field]} step={p.is_int ? 1 : 0.01} onChange={(e) => updateRange(p.name, field, parseFloat(e.target.value))} style={inputStyle} />
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
@@ -560,198 +348,137 @@ export default function OptimizePage() {
           </div>
         )}
 
-        {/* ── Market & Optimize Settings ── */}
-        <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 overflow-hidden">
-          <button
-            onClick={() => setShowSettings(!showSettings)}
-            className="w-full px-6 py-4 flex items-center justify-between hover:bg-white/5 transition-colors"
-          >
-            <div className="flex items-center gap-3">
-              <Settings2 className="w-5 h-5 text-purple-400" />
-              <span className="text-white font-medium">市場與優化設定</span>
-            </div>
-            {showSettings ? <ChevronUp className="w-5 h-5 text-white" /> : <ChevronDown className="w-5 h-5 text-white" />}
-          </button>
-
+        <div style={sectionStyle}>
+          <div style={sectionHeaderStyle} onClick={() => setShowSettings(v => !v)}>
+            <span style={{ fontSize: 13, fontWeight: 700, color: '#d1d4dc' }}>市場與優化設定</span>
+            <span style={{ color: '#848e9c', fontSize: 12 }}>{showSettings ? '▲' : '▼'}</span>
+          </div>
           {showSettings && (
-            <div className="p-6 border-t border-white/10 space-y-5">
-              {/* Symbol / Interval / Source */}
-              <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+            <div style={{ padding: '12px 14px 16px' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">交易對</label>
-                  <select value={symbol} onChange={(e) => setSymbol(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500">
+                  <label style={labelStyle}>交易對</label>
+                  <select value={symbol} onChange={(e) => setSymbol(e.target.value)} style={inputStyle}>
                     {POPULAR_SYMBOLS.map(s => <option key={s} value={s}>{s}</option>)}
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">時間框架</label>
-                  <select value={interval} onChange={(e) => setIntervalVal(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500">
+                  <label style={labelStyle}>時間框架</label>
+                  <select value={interval} onChange={(e) => setIntervalVal(e.target.value)} style={inputStyle}>
                     {INTERVALS.map(i => <option key={i} value={i}>{i}</option>)}
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">資料來源</label>
-                  <select value={source} onChange={(e) => setSource(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500">
+                  <label style={labelStyle}>資料來源</label>
+                  <select value={source} onChange={(e) => setSource(e.target.value)} style={inputStyle}>
                     {SOURCES.map(s => <option key={s} value={s}>{s}</option>)}
                   </select>
                 </div>
               </div>
-
-              {/* Date range */}
-              <div className="grid grid-cols-2 gap-4">
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">開始日期</label>
-                  <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
+                  <label style={labelStyle}>開始日期</label>
+                  <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} style={inputStyle} />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">結束日期</label>
-                  <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
+                  <label style={labelStyle}>結束日期</label>
+                  <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} style={inputStyle} />
                 </div>
               </div>
-
-              {/* Capital / Commission / Quantity */}
-              <div className="grid grid-cols-3 gap-4">
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">初始資金</label>
-                  <input type="number" value={initialCapital} min={100} onChange={(e) => setInitialCapital(Number(e.target.value))}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">手續費率</label>
-                  <input type="number" value={commission} step={0.0001} min={0} onChange={(e) => setCommission(Number(e.target.value))}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">倉位數量</label>
-                  <input type="number" value={quantity} min={0.01} step={0.01} onChange={(e) => setQuantity(Number(e.target.value))}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
-                </div>
-              </div>
-
-              {/* Sort / Trials */}
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">優化目標</label>
-                  <select value={sortBy} onChange={(e) => setSortBy(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500">
+                  <label style={labelStyle}>優化目標</label>
+                  <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} style={inputStyle}>
                     {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">試驗次數 (Trials)</label>
-                  <input type="number" value={nTrials} min={10} max={2000} step={10} onChange={(e) => setNTrials(Number(e.target.value))}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
+                  <label style={labelStyle}>試驗次數 (Trials)</label>
+                  <input type="number" value={nTrials} min={10} max={2000} step={10} onChange={(e) => setNTrials(Number(e.target.value))} style={inputStyle} />
                 </div>
               </div>
             </div>
           )}
         </div>
 
-        {/* ── Run Button ── */}
         {errorMsg && (
-          <div className="flex items-center gap-2 px-4 py-3 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-400 text-sm">
-            <AlertCircle className="w-4 h-4 flex-shrink-0" />
-            {errorMsg}
+          <div style={{ padding: '8px 12px', background: 'rgba(239,83,80,0.1)', border: '1px solid rgba(239,83,80,0.3)', borderRadius: 4, marginBottom: 12, fontSize: 12, color: '#ef5350' }}>
+            ⚠ {errorMsg}
           </div>
         )}
 
         <button
           onClick={runOptimization}
           disabled={isRunning}
-          className="w-full py-4 bg-gradient-to-r from-purple-600 to-violet-600 hover:from-purple-700 hover:to-violet-700 disabled:opacity-50 text-white rounded-2xl font-semibold text-lg flex items-center justify-center gap-3 transition-all shadow-lg shadow-purple-900/30"
+          style={{
+            width: '100%', padding: '10px 0', marginBottom: 16,
+            background: isRunning ? '#2b2b43' : '#8b5cf6',
+            color: isRunning ? '#848e9c' : '#fff',
+            border: 'none', borderRadius: 4, fontSize: 14, fontWeight: 700,
+            cursor: isRunning ? 'not-allowed' : 'pointer',
+          }}
         >
-          {isRunning ? (
-            <>
-              <RefreshCw className="w-5 h-5 animate-spin" />
-              優化中... {progress}%
-            </>
-          ) : (
-            <>
-              <Play className="w-5 h-5" />
-              開始策略優化
-            </>
-          )}
+          {isRunning ? `優化中... ${progress}%` : '▶ 開始策略優化'}
         </button>
 
-        {/* ── Progress Bar ── */}
         {isRunning && (
-          <div className="space-y-2">
-            <div className="w-full bg-white/10 rounded-full h-2 overflow-hidden">
-              <div
-                className="h-full bg-gradient-to-r from-purple-500 to-violet-500 transition-all duration-300 rounded-full"
-                style={{ width: `${progress}%` }}
-              />
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ height: 4, background: '#2b2b43', borderRadius: 2, overflow: 'hidden', marginBottom: 6 }}>
+              <div style={{ height: '100%', width: `${progress}%`, background: '#8b5cf6', transition: 'width 0.3s', borderRadius: 2 }} />
             </div>
-            <p className="text-center text-sm text-gray-400">{progressText}</p>
+            <div style={{ textAlign: 'center', fontSize: 11, color: '#848e9c' }}>{progressText}</div>
           </div>
         )}
 
-        {/* ── Results Table ── */}
         {results.length > 0 && (
-          <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 overflow-hidden">
-            <div className="px-6 py-4 border-b border-white/10 flex items-center justify-between">
-              <h3 className="text-white font-semibold flex items-center gap-2">
-                <BarChart2 className="w-5 h-5 text-purple-400" />
-                前 {results.length} 名最佳參數組合
-              </h3>
-              <span className="text-xs text-gray-400">點擊任一列查看詳細圖表</span>
+          <div style={sectionStyle}>
+            <div style={{ ...sectionHeaderStyle, cursor: 'default' }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: '#d1d4dc' }}>前 {results.length} 名最佳參數組合</span>
+              <span style={{ fontSize: 11, color: '#848e9c' }}>點擊列查看詳細圖表</span>
             </div>
-
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
-                  <tr className="border-b border-white/10">
-                    <th className="px-4 py-3 text-left text-gray-400 font-medium">排名</th>
-                    <th className="px-4 py-3 text-left text-gray-400 font-medium">參數</th>
-                    <th className="px-4 py-3 text-right text-gray-400 font-medium">總盈利%</th>
-                    <th className="px-4 py-3 text-right text-gray-400 font-medium">MDD%</th>
-                    <th className="px-4 py-3 text-right text-gray-400 font-medium">盈虧比</th>
-                    <th className="px-4 py-3 text-right text-gray-400 font-medium">勝率%</th>
-                    <th className="px-4 py-3 text-right text-gray-400 font-medium">交易數</th>
-                    <th className="px-4 py-3 text-right text-gray-400 font-medium">夏普</th>
+                  <tr style={{ borderBottom: '1px solid #2b2b43' }}>
+                    {['排名', '參數', '盈利%', 'MDD%', '盈虧比', '勝率%', '交易數', '夏普'].map(h => (
+                      <th key={h} style={{ padding: '8px 10px', textAlign: h === '排名' || h === '參數' ? 'left' : 'right', color: '#848e9c', fontWeight: 600 }}>{h}</th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
                   {results.map((r) => {
                     const isSelected = selectedResult?.rank === r.rank
                     return (
-                      <tr
-                        key={r.rank}
-                        onClick={() => setSelectedResult(r)}
-                        className={`border-b border-white/5 cursor-pointer transition-colors ${
-                          isSelected ? 'bg-purple-500/20' : 'hover:bg-white/5'
-                        }`}
+                      <tr key={r.rank} onClick={() => setSelectedResult(r)}
+                        style={{ borderBottom: '1px solid #1e2328', cursor: 'pointer', background: isSelected ? 'rgba(139,92,246,0.15)' : 'transparent' }}
+                        onMouseEnter={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.background = '#2b2b43' }}
+                        onMouseLeave={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'transparent' }}
                       >
-                        <td className="px-4 py-3">
-                          <span className={`inline-flex items-center justify-center w-7 h-7 rounded-full text-xs font-bold ${
-                            r.rank === 1 ? 'bg-yellow-500 text-black' :
-                            r.rank === 2 ? 'bg-gray-400 text-black' :
-                            r.rank === 3 ? 'bg-amber-700 text-white' :
-                            'bg-white/10 text-gray-300'
-                          }`}>{r.rank}</span>
+                        <td style={{ padding: '7px 10px' }}>
+                          <span style={{
+                            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                            width: 22, height: 22, borderRadius: '50%', fontSize: 11, fontWeight: 700,
+                            background: r.rank === 1 ? '#f0b90b' : r.rank === 2 ? '#9e9e9e' : r.rank === 3 ? '#cd7f32' : '#2b2b43',
+                            color: r.rank <= 3 ? '#000' : '#d1d4dc',
+                          }}>{r.rank}</span>
                         </td>
-                        <td className="px-4 py-3">
-                          <div className="flex flex-wrap gap-1">
+                        <td style={{ padding: '7px 10px' }}>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                             {Object.entries(r.params).filter(([k]) => !k.startsWith('_') && k !== 'quantity').map(([k, v]) => (
-                              <span key={k} className="text-xs px-2 py-0.5 rounded-md bg-white/10 text-gray-300">
+                              <span key={k} style={{ fontSize: 11, padding: '2px 6px', background: '#131722', border: '1px solid #2b2b43', borderRadius: 3, color: '#d1d4dc' }}>
                                 {k}: {typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(3)) : v}
                               </span>
                             ))}
                           </div>
                         </td>
-                        <td className={`px-4 py-3 text-right font-semibold ${r.profit_pct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        <td style={{ padding: '7px 10px', textAlign: 'right', fontWeight: 700, color: r.profit_pct >= 0 ? '#26a69a' : '#ef5350' }}>
                           {r.profit_pct >= 0 ? '+' : ''}{r.profit_pct.toFixed(2)}%
                         </td>
-                        <td className="px-4 py-3 text-right text-rose-400">{r.max_drawdown.toFixed(2)}%</td>
-                        <td className="px-4 py-3 text-right text-white">{r.profit_factor.toFixed(2)}</td>
-                        <td className="px-4 py-3 text-right text-white">{r.win_rate.toFixed(1)}%</td>
-                        <td className="px-4 py-3 text-right text-gray-300">{r.total_trades}</td>
-                        <td className="px-4 py-3 text-right text-gray-300">{r.sharpe_ratio.toFixed(2)}</td>
+                        <td style={{ padding: '7px 10px', textAlign: 'right', color: '#ef5350' }}>{r.max_drawdown.toFixed(2)}%</td>
+                        <td style={{ padding: '7px 10px', textAlign: 'right', color: '#d1d4dc' }}>{r.profit_factor.toFixed(2)}</td>
+                        <td style={{ padding: '7px 10px', textAlign: 'right', color: '#d1d4dc' }}>{r.win_rate.toFixed(1)}%</td>
+                        <td style={{ padding: '7px 10px', textAlign: 'right', color: '#848e9c' }}>{r.total_trades}</td>
+                        <td style={{ padding: '7px 10px', textAlign: 'right', color: '#848e9c' }}>{r.sharpe_ratio.toFixed(2)}</td>
                       </tr>
                     )
                   })}
@@ -761,58 +488,59 @@ export default function OptimizePage() {
           </div>
         )}
 
-        {/* ── Selected Result Detail ── */}
         {selectedResult && (
-          <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 p-6 space-y-5">
-            <div className="flex items-center justify-between">
-              <h3 className="text-white font-semibold flex items-center gap-2">
-                <TrendingUp className="w-5 h-5 text-purple-400" />
-                第 {selectedResult.rank} 名詳細分析
-              </h3>
-              <button
-                onClick={copyOptimizedCode}
-                className="flex items-center gap-2 px-4 py-2 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/30 rounded-xl text-emerald-400 text-sm font-medium transition-colors"
-              >
-                {copiedCode ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-                {copiedCode ? '已複製！' : '一鍵複製優化代碼'}
+          <div style={sectionStyle}>
+            <div style={{ ...sectionHeaderStyle, cursor: 'default' }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: '#d1d4dc' }}>第 {selectedResult.rank} 名詳細分析</span>
+              <button onClick={copyOptimizedCode} style={{
+                padding: '4px 12px', fontSize: 11, fontWeight: 700,
+                background: copiedCode ? 'rgba(38,166,154,0.2)' : 'rgba(139,92,246,0.2)',
+                color: copiedCode ? '#26a69a' : '#8b5cf6',
+                border: `1px solid ${copiedCode ? 'rgba(38,166,154,0.4)' : 'rgba(139,92,246,0.4)'}`,
+                borderRadius: 4, cursor: 'pointer',
+              }}>
+                {copiedCode ? '✓ 已複製' : '複製優化代碼'}
               </button>
             </div>
-
-            {/* Metrics grid */}
-            <div className="grid grid-cols-4 md:grid-cols-8 gap-2">
-              <MetricBadge label="總盈利" value={`${selectedResult.profit_pct >= 0 ? '+' : ''}${selectedResult.profit_pct.toFixed(2)}%`} highlight={selectedResult.profit_pct > 0} />
-              <MetricBadge label="最終資產" value={`$${selectedResult.final_equity.toFixed(0)}`} />
-              <MetricBadge label="MDD" value={`${selectedResult.max_drawdown.toFixed(2)}%`} />
-              <MetricBadge label="盈虧比" value={selectedResult.profit_factor.toFixed(2)} highlight={selectedResult.profit_factor > 1.5} />
-              <MetricBadge label="勝率" value={`${selectedResult.win_rate.toFixed(1)}%`} highlight={selectedResult.win_rate > 50} />
-              <MetricBadge label="交易數" value={String(selectedResult.total_trades)} />
-              <MetricBadge label="夏普" value={selectedResult.sharpe_ratio.toFixed(2)} highlight={selectedResult.sharpe_ratio > 1} />
-              <MetricBadge label="毛利/毛損" value={`${selectedResult.gross_profit.toFixed(0)}/${selectedResult.gross_loss.toFixed(0)}`} />
-            </div>
-
-            {/* Equity curve */}
-            <div>
-              <div className="text-xs text-gray-400 mb-2 font-medium">資產曲線</div>
-              <canvas ref={equityChartRef} className="w-full rounded-xl" style={{ height: '220px', display: 'block' }} />
-            </div>
-
-            {/* Monthly PnL */}
-            <MonthlyBarChart data={selectedResult.monthly_pnl} />
-
-            {/* Optimized params */}
-            <div>
-              <div className="text-xs text-gray-400 mb-2 font-medium">最佳參數值</div>
-              <div className="flex flex-wrap gap-2">
-                {Object.entries(selectedResult.params)
-                  .filter(([k]) => !k.startsWith('_') && k !== 'quantity')
-                  .map(([k, v]) => (
-                    <div key={k} className="px-3 py-2 bg-purple-500/20 border border-purple-500/30 rounded-lg">
-                      <span className="text-gray-400 text-xs">{k}: </span>
-                      <span className="text-white font-semibold text-sm">
-                        {typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(4)) : String(v)}
-                      </span>
-                    </div>
-                  ))}
+            <div style={{ padding: '12px 14px' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 16 }}>
+                {[
+                  { label: '總盈利', value: `${selectedResult.profit_pct >= 0 ? '+' : ''}${selectedResult.profit_pct.toFixed(2)}%`, color: selectedResult.profit_pct >= 0 ? '#26a69a' : '#ef5350' },
+                  { label: '最終資產', value: `$${selectedResult.final_equity.toFixed(0)}`, color: '#d1d4dc' },
+                  { label: 'MDD', value: `${selectedResult.max_drawdown.toFixed(2)}%`, color: '#ef5350' },
+                  { label: '盈虧比', value: selectedResult.profit_factor.toFixed(2), color: selectedResult.profit_factor >= 1.5 ? '#26a69a' : '#d1d4dc' },
+                  { label: '勝率', value: `${selectedResult.win_rate.toFixed(1)}%`, color: selectedResult.win_rate >= 50 ? '#26a69a' : '#d1d4dc' },
+                  { label: '交易數', value: String(selectedResult.total_trades), color: '#d1d4dc' },
+                  { label: '夏普', value: selectedResult.sharpe_ratio.toFixed(2), color: selectedResult.sharpe_ratio >= 1 ? '#26a69a' : '#d1d4dc' },
+                  { label: '毛利/毛損', value: `${selectedResult.gross_profit.toFixed(0)}/${selectedResult.gross_loss.toFixed(0)}`, color: '#848e9c' },
+                ].map(({ label, value, color }) => (
+                  <div key={label} style={{ background: '#131722', border: '1px solid #2b2b43', borderRadius: 4, padding: '8px 10px', textAlign: 'center' }}>
+                    <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 2 }}>{label}</div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color }}>{value}</div>
+                  </div>
+                ))}
+              </div>
+              {selectedResult.equity_curve.length > 1 && (
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 11, color: '#848e9c', marginBottom: 6, fontWeight: 600 }}>資產曲線</div>
+                  <EquityCanvas curve={selectedResult.equity_curve} />
+                </div>
+              )}
+              <MonthlyBarChart data={selectedResult.monthly_pnl} />
+              <div style={{ marginTop: 16 }}>
+                <div style={{ fontSize: 11, color: '#848e9c', marginBottom: 8, fontWeight: 600 }}>最佳參數值</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                  {Object.entries(selectedResult.params)
+                    .filter(([k]) => !k.startsWith('_') && k !== 'quantity')
+                    .map(([k, v]) => (
+                      <div key={k} style={{ padding: '6px 12px', background: 'rgba(139,92,246,0.15)', border: '1px solid rgba(139,92,246,0.3)', borderRadius: 4 }}>
+                        <span style={{ fontSize: 11, color: '#848e9c' }}>{k}: </span>
+                        <span style={{ fontSize: 13, fontWeight: 700, color: '#d1d4dc' }}>
+                          {typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(4)) : String(v)}
+                        </span>
+                      </div>
+                    ))}
+                </div>
               </div>
             </div>
           </div>
