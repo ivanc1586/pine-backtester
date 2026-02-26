@@ -467,10 +467,6 @@ export default function ChartPage() {
   // ── Chart init ─────────────────────────────────────────────────────────────
   useEffect(() => {
     const chart = init(CHART_ID, {
-      layout: [
-        { type: 'candle', options: { gap: { bottom: 2 } } },
-        { type: 'xAxis' },
-      ],
       styles: {
         grid: {
           horizontal: { color: '#1e2328', size: 1, style: 'dashed', show: true },
