@@ -187,13 +187,15 @@ Output ONLY the Python function, no markdown."""
 
 async def translate_with_gemini(pine_script: str) -> str:
     """Use Gemini Flash (free tier) to translate Pine Script to Python."""
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="GEMINI_API_KEY is not configured. Please set the environment variable before running optimization."
+        )
+
     try:
         import google.generativeai as genai
-
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-        if not api_key:
-            logger.warning("GEMINI_API_KEY not set, using fallback strategy")
-            return _get_fallback_strategy()
 
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
@@ -212,75 +214,14 @@ async def translate_with_gemini(pine_script: str) -> str:
 
         return code.strip()
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning(f"Gemini translation failed: {e}, using fallback")
-        return _get_fallback_strategy()
-
-
-def _get_fallback_strategy() -> str:
-    return '''def run_strategy(df: pd.DataFrame, **params) -> dict:
-    fast = int(params.get("fastLength", params.get("fast_length", 9)))
-    slow = int(params.get("slowLength", params.get("slow_length", 21)))
-    qty = float(params.get("quantity", 1.0))
-    commission = float(params.get("_commission", 0.001))
-    capital = float(params.get("_capital", 10000.0))
-
-    close = df["close"]
-    fast_ema = close.ewm(span=fast, adjust=False).mean()
-    slow_ema = close.ewm(span=slow, adjust=False).mean()
-
-    position = 0
-    entry_price = 0.0
-    entry_time = None
-    trades = []
-    equity = capital
-    equity_curve = []
-
-    for i in range(len(df)):
-        if i < slow:
-            equity_curve.append(equity)
-            continue
-
-        prev_f = fast_ema.iloc[i - 1]
-        prev_s = slow_ema.iloc[i - 1]
-        curr_f = fast_ema.iloc[i]
-        curr_s = slow_ema.iloc[i]
-        price = close.iloc[i]
-        ts = str(df.index[i])
-
-        if prev_f <= prev_s and curr_f > curr_s and position == 0:
-            position = 1
-            entry_price = price
-            entry_time = ts
-
-        elif prev_f >= prev_s and curr_f < curr_s and position == 1:
-            pnl = (price - entry_price) * qty - (entry_price + price) * qty * commission
-            equity += pnl
-            trades.append({
-                "entry_time": entry_time, "exit_time": ts,
-                "entry_price": round(entry_price, 4), "exit_price": round(price, 4),
-                "side": "long", "pnl": round(pnl, 4),
-                "pnl_pct": round((price - entry_price) / entry_price * 100, 4)
-            })
-            position = 0
-
-        equity_curve.append(equity)
-
-    if position != 0 and entry_price > 0:
-        price = close.iloc[-1]
-        ts = str(df.index[-1])
-        mult = 1 if position == 1 else -1
-        pnl = (price - entry_price) * qty * mult - (entry_price + price) * qty * commission
-        equity += pnl
-        trades.append({
-            "entry_time": entry_time, "exit_time": ts,
-            "entry_price": round(entry_price, 4), "exit_price": round(price, 4),
-            "side": "long" if position == 1 else "short", "pnl": round(pnl, 4),
-            "pnl_pct": round((price - entry_price) / entry_price * 100 * mult, 4)
-        })
-
-    return {"trades": trades, "equity_curve": equity_curve}
-'''
+        logger.error(f"Gemini translation failed: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini translation failed: {e}. Please check your GEMINI_API_KEY and try again."
+        )
 
 # ---------------------------------------------------------------------------
 # Metrics calculator
@@ -387,9 +328,9 @@ async def fetch_candles(symbol: str, interval: str, source: str, start_date: str
     if not all_candles:
         raise HTTPException(status_code=404, detail="No candle data found")
 
-    df = pd.DataFrame(all_candles, columns=[
-        "timestamp", "open", "high", "low", "close", "volume",
-        "close_time", "quote_vol", "trades", "taker_base", "taker_quote", "ignore"
+    df = pd.DataFrame(all_candles, columns=[\
+        "timestamp", "open", "high", "low", "close", "volume",\
+        "close_time", "quote_vol", "trades", "taker_base", "taker_quote", "ignore"\
     ])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     df = df.set_index("timestamp")
@@ -491,7 +432,6 @@ async def parse_inputs(req: ParseRequest):
     """Auto-detect all input parameters from Pine Script."""
     params = parse_pine_inputs(req.pine_script)
     return {"params": params, "count": len(params)}
-
 
 @router.post("/run")
 async def run_optimization(req: OptimizeRequest):
