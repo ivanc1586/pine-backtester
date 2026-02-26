@@ -20,7 +20,7 @@ import PageHeader from '../components/PageHeader'
 // ---------------------------------------------------------------------------
 // API base URL — 從環境變數取得，production 打後端，dev 走 vite proxy
 // ---------------------------------------------------------------------------
-const API_BASE = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/,  '')
+const API_BASE = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '')
 
 // ---------------------------------------------------------------------------
 // Types
@@ -273,8 +273,9 @@ export default function OptimizePage() {
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
+      // data.ranges: Array of { name, min_val, max_val, step, is_int }
       setParamRanges(prev => prev.map(p => {
-        const suggestion = data.ranges?.find((r: any) => r.name === p.name)
+        const suggestion = (data.ranges ?? data.suggestions)?.find((r: any) => r.name === p.name)
         if (!suggestion) return p
         return {
           ...p,
@@ -436,6 +437,7 @@ export default function OptimizePage() {
               <Settings2 size={14} color="#f0b90b" />
               <span style={{ fontWeight: 700, fontSize: 13 }}>參數優化設定</span>
               <span style={{ fontSize: 11, color: '#848e9c' }}>勾選要優化的參數並設定範圍</span>
+              {/* AI 建議參數範圍按鈕 */}
               <button
                 onClick={suggestParamRanges}
                 disabled={isSuggesting}
@@ -513,12 +515,14 @@ export default function OptimizePage() {
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12, marginBottom: 12 }}>
+            {/* Symbol */}
             <div>
               <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>交易對（幣安）</div>
               <select value={symbol} onChange={(e) => setSymbol(e.target.value)} style={selectStyle}>
                 {POPULAR_SYMBOLS.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
             </div>
+            {/* Interval */}
             <div>
               <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>時間框架</div>
               <select value={intervalVal} onChange={(e) => setIntervalVal(e.target.value)} style={selectStyle}>
@@ -593,6 +597,7 @@ export default function OptimizePage() {
               </div>
               <span style={{ fontSize: 11, color: '#848e9c' }}>點擊列查看詳細</span>
             </div>
+
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
