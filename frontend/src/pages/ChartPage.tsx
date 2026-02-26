@@ -1,39 +1,35 @@
 /**
- * ChartPage v10
+ * ChartPage v10 — Full KLineChart-style UI
  *
- * Fix vs v9:
- * - IndicatorTag: COMPLETELY rewritten hover logic.
- *   Root cause: React onMouseLeave fires when mouse moves FROM parent TO child
- *   (even though child is inside parent). stopPropagation() does NOT fix this
- *   because onMouseLeave doesn't bubble — it fires on the element itself.
- *   Solution: keep all icon buttons always in DOM (opacity:0), toggle opacity
- *   via direct DOM ref (no React re-render). Use relatedTarget check on the
- *   parent's onMouseLeave to only hide when mouse truly left the group.
- * - IndicatorRow: same approach for gear icon — always in DOM when isOn,
- *   opacity toggled via ref + relatedTarget check.
+ * Layout (mirrors preview.klinecharts.com):
+ *   ┌─────────────────────────────────────────────┐
+ *   │  TOP BAR: symbol | intervals | indicators   │
+ *   │           screenshot | fullscreen           │
+ *   ├──┬──────────────────────────────────────────┤
+ *   │L │                                          │
+ *   │E │         KLineChart canvas                │
+ *   │F │    (OHLCV + indicator tooltips built-in) │
+ *   │T │                                          │
+ *   │  │                                          │
+ *   └──┴──────────────────────────────────────────┘
  *
- * Key changes vs v8:
- * 1. MA/EMA now support multiple periods (like Binance/TradingView).
- *    One createIndicator('MA') call with calcParams:[5,10,20,60].
- *    Settings modal shows each period on its own row with toggle + input.
+ * Left sidebar: drawing tools (line, hline, vline, rect, circle,
+ *   parallelogram, fibonacciLine, arrow, text, …)
  *
- * 2. Indicator tags in the interval row use KLineChart's native tooltip
- *    (showRule:'always') for the text inside the canvas.
- *    The React IndicatorTag in the toolbar row is REMOVED for main-pane
- *    indicators. Instead we render a thin overlay div on top of the chart
- *    canvas that shows 👁 ⚙ ✕ when the mouse enters the top-left legend area.
- *    This way the controls appear exactly where the KLineChart legend text is.
+ * All indicator labels + values are rendered by KLineChart's own
+ * canvas tooltip (showRule:'always'). Zero React DOM hover hacks.
  *
- * 3. OHLCV row always visible (candle.tooltip.showRule:'always').
- *
- * 4. IndicatorPanel gear icon restored.
- *
- * 5. Sub-pane direction: add → time axis moves DOWN; remove → moves UP.
+ * Drawing overlays are pure KLineChart createOverlay() calls.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { init, dispose, Chart } from 'klinecharts'
-import { Search, X, Settings, BarChart2, RefreshCw, ChevronDown, Eye, EyeOff, Plus, Minus } from 'lucide-react'
+import { init, dispose, Chart, registerOverlay } from 'klinecharts'
+import {
+  Search, X, Settings, BarChart2, RefreshCw, ChevronDown,
+  Eye, EyeOff, Plus, Minus, Camera, Maximize2, Minimize2,
+  Minus as HLine, AlignJustify, TrendingUp, Triangle,
+  Square, Circle, Sliders, Type, ArrowRight, Trash2,
+} from 'lucide-react'
 import PageHeader from '../components/PageHeader'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -41,17 +37,49 @@ import PageHeader from '../components/PageHeader'
 // ─────────────────────────────────────────────────────────────────────────────
 const INTERVALS = ['1m','3m','5m','15m','30m','1h','2h','4h','6h','12h','1d','1w']
 const INTERVAL_LABELS: Record<string,string> = {
-  '1m':'1分','3m':'3分','5m':'5分','15m':'15分','30m':'30分',
-  '1h':'1時','2h':'2時','4h':'4時','6h':'6時','12h':'12時','1d':'日','1w':'週',
+  '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m',
+  '1h':'1H','2h':'2H','4h':'4H','6h':'6H','12h':'12H','1d':'1D','1w':'1W',
 }
 const POPULAR_SYMBOLS = [
   'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT',
   'ADAUSDT','DOGEUSDT','AVAXUSDT','DOTUSDT','MATICUSDT',
   'LINKUSDT','UNIUSDT','LTCUSDT','ATOMUSDT','NEARUSDT',
 ]
-
-// MA/EMA line colours (one per period slot, max 8)
 const LINE_COLORS = ['#f0b90b','#2196f3','#e040fb','#00e5ff','#ff5252','#69f0ae','#ff6d00','#40c4ff']
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Drawing tool definitions
+// ─────────────────────────────────────────────────────────────────────────────
+interface DrawTool {
+  id: string        // KLineChart overlay name
+  label: string
+  icon: React.ReactNode
+  group: string
+}
+
+const DRAW_TOOLS: DrawTool[] = [
+  // Lines
+  { id: 'straightLine',      label: '直線',       icon: <TrendingUp size={16}/>,   group: 'line' },
+  { id: 'horizontalStraightLine', label: '水平線', icon: <HLine size={16}/>,       group: 'line' },
+  { id: 'verticalStraightLine',   label: '垂直線', icon: <AlignJustify size={16}/>, group: 'line' },
+  { id: 'rayLine',           label: '射線',       icon: <ArrowRight size={16}/>,   group: 'line' },
+  { id: 'segment',           label: '線段',       icon: <Minus size={16}/>,        group: 'line' },
+  // Channels
+  { id: 'parallelStraightLine', label: '平行線',  icon: <AlignJustify size={16}/>, group: 'channel' },
+  // Fibonacci
+  { id: 'fibonacciLine',     label: 'Fib 回撤',   icon: <Sliders size={16}/>,      group: 'fib' },
+  { id: 'fibonacciSegment',  label: 'Fib 線段',   icon: <Sliders size={16}/>,      group: 'fib' },
+  // Shapes
+  { id: 'rect',              label: '矩形',       icon: <Square size={16}/>,       group: 'shape' },
+  { id: 'circle',            label: '圓形',       icon: <Circle size={16}/>,       group: 'shape' },
+  { id: 'triangle',          label: '三角形',     icon: <Triangle size={16}/>,     group: 'shape' },
+  // Annotations
+  { id: 'arrow',             label: '箭頭',       icon: <ArrowRight size={16}/>,   group: 'annotation' },
+  { id: 'text',              label: '文字',       icon: <Type size={16}/>,         group: 'annotation' },
+]
+
+// Group separators
+const TOOL_GROUPS = ['line','channel','fib','shape','annotation']
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -67,17 +95,12 @@ interface TickerInfo {
   high24h: number; low24h: number; volume24h: number
 }
 
-// For MA/EMA: periods is an array of {value, visible}
-// For BOLL: params = {period, multiplier}
-// For sub-pane indicators: params = {shortPeriod?, longPeriod?, signalPeriod?, period?}
 interface PeriodEntry { value: number; visible: boolean }
 
 interface ActiveIndicator {
   defName: string
   paneId: string
-  // Multi-period indicators (MA, EMA): periods array
   periods?: PeriodEntry[]
-  // Single/fixed param indicators (BOLL, MACD, RSI, KDJ): flat params
   params: Record<string, number>
   visible: boolean
 }
@@ -86,66 +109,34 @@ interface ActiveIndicator {
 // Indicator catalogue
 // ─────────────────────────────────────────────────────────────────────────────
 interface IndicatorDef {
-  name: string
-  label: string
-  pane: 'main' | 'sub'
-  multiPeriod?: boolean          // true → MA/EMA style (calcParams array)
-  defaultPeriods?: number[]      // initial periods for multiPeriod indicators
+  name: string; label: string; pane: 'main' | 'sub'
+  multiPeriod?: boolean; defaultPeriods?: number[]
   defaultParams: Record<string, number>
   paramLabels: Record<string, string>
 }
 
 const INDICATOR_DEFS: IndicatorDef[] = [
-  {
-    name: 'MA', label: 'MA 均線', pane: 'main',
-    multiPeriod: true,
-    defaultPeriods: [5, 10, 20, 60],
-    defaultParams: {},
-    paramLabels: {},
-  },
-  {
-    name: 'EMA', label: 'EMA 指數均線', pane: 'main',
-    multiPeriod: true,
-    defaultPeriods: [5, 10, 20, 60],
-    defaultParams: {},
-    paramLabels: {},
-  },
-  {
-    name: 'BOLL', label: 'BOLL 布林帶', pane: 'main',
-    defaultParams: { period: 20, multiplier: 2 },
-    paramLabels: { period: '週期', multiplier: '倍數' },
-  },
-  {
-    name: 'VOL',  label: 'VOL 成交量', pane: 'sub',
-    defaultParams: {},
-    paramLabels: {},
-  },
-  {
-    name: 'MACD', label: 'MACD', pane: 'sub',
-    defaultParams: { shortPeriod: 12, longPeriod: 26, signalPeriod: 9 },
-    paramLabels: { shortPeriod: '短期', longPeriod: '長期', signalPeriod: '訊號' },
-  },
-  {
-    name: 'RSI', label: 'RSI', pane: 'sub',
-    defaultParams: { period: 14 },
-    paramLabels: { period: '週期' },
-  },
-  {
-    name: 'KDJ', label: 'KDJ', pane: 'sub',
-    defaultParams: { period: 9, signalPeriod: 3 },
-    paramLabels: { period: '週期', signalPeriod: '訊號' },
-  },
+  { name:'MA',   label:'MA 移動均線',   pane:'main', multiPeriod:true, defaultPeriods:[5,10,20,60], defaultParams:{}, paramLabels:{} },
+  { name:'EMA',  label:'EMA 指數均線',  pane:'main', multiPeriod:true, defaultPeriods:[5,10,20,60], defaultParams:{}, paramLabels:{} },
+  { name:'BOLL', label:'BOLL 布林帶',   pane:'main', defaultParams:{ period:20, multiplier:2 }, paramLabels:{ period:'週期', multiplier:'倍數' } },
+  { name:'SAR',  label:'SAR 拋物線',    pane:'main', defaultParams:{ step:0.02, max:0.2 },      paramLabels:{ step:'步長', max:'最大值' } },
+  { name:'VOL',  label:'VOL 成交量',    pane:'sub',  defaultParams:{}, paramLabels:{} },
+  { name:'MACD', label:'MACD',          pane:'sub',  defaultParams:{ shortPeriod:12, longPeriod:26, signalPeriod:9 }, paramLabels:{ shortPeriod:'短期', longPeriod:'長期', signalPeriod:'訊號' } },
+  { name:'RSI',  label:'RSI',           pane:'sub',  defaultParams:{ period:14 }, paramLabels:{ period:'週期' } },
+  { name:'KDJ',  label:'KDJ',           pane:'sub',  defaultParams:{ period:9, signalPeriod:3 }, paramLabels:{ period:'週期', signalPeriod:'訊號' } },
+  { name:'OBV',  label:'OBV 能量潮',    pane:'sub',  defaultParams:{}, paramLabels:{} },
+  { name:'DMI',  label:'DMI 趨向指標',  pane:'sub',  defaultParams:{ period:14, adxPeriod:6 }, paramLabels:{ period:'週期', adxPeriod:'ADX週期' } },
 ]
 
 // ─────────────────────────────────────────────────────────────────────────────
 // API helpers
 // ─────────────────────────────────────────────────────────────────────────────
-const SPOT_REST       = 'https://api.binance.com/api/v3/klines'
-const FUTURES_REST    = 'https://fapi.binance.com/fapi/v1/klines'
-const SPOT_TICKER     = 'https://api.binance.com/api/v3/ticker/24hr'
-const FUTURES_TICKER  = 'https://fapi.binance.com/fapi/v1/ticker/24hr'
-const SPOT_WS_BASE    = 'wss://stream.binance.com:9443/ws'
-const FUTURES_WS_BASE = 'wss://fstream.binance.com/ws'
+const SPOT_REST      = 'https://api.binance.com/api/v3/klines'
+const FUTURES_REST   = 'https://fapi.binance.com/fapi/v1/klines'
+const SPOT_TICKER    = 'https://api.binance.com/api/v3/ticker/24hr'
+const FUTURES_TICKER = 'https://fapi.binance.com/fapi/v1/ticker/24hr'
+const SPOT_WS_BASE   = 'wss://stream.binance.com:9443/ws'
+const FUTURES_WS_BASE= 'wss://fstream.binance.com/ws'
 
 const getSaved = (k: string, def: string) => localStorage.getItem(k) ?? def
 
@@ -199,260 +190,88 @@ function fmtVol(v: number): string {
   if (v >= 1e3) return (v / 1e3).toFixed(2) + 'K'
   return v.toFixed(2)
 }
-function fmtTs(ts: number): string {
-  return new Date(ts).toLocaleString('zh-TW', {
-    timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hour12: false,
-  })
-}
-function timeAgo(ts: number): string {
-  const s = Math.floor((Date.now() - ts) / 1000)
-  if (s < 5)    return '剛剛'
-  if (s < 60)   return `${s} 秒前`
-  if (s < 3600) return `${Math.floor(s / 60)} 分前`
-  return `${Math.floor(s / 3600)} 時前`
-}
-
-// Build calcParams array from PeriodEntry[]
 function buildCalcParams(periods: PeriodEntry[]): number[] {
   return periods.filter(p => p.visible).map(p => p.value)
 }
 
-// Build label string shown in interval row, e.g. "MA(5,10,20,60)"
-function mainIndLabel(ind: ActiveIndicator): string {
-  if (ind.periods) {
-    const vis = ind.periods.filter(p => p.visible).map(p => p.value)
-    return vis.length ? `${ind.defName}(${vis.join(',')})` : ind.defName
-  }
-  const vals = Object.values(ind.params)
-  return vals.length ? `${ind.defName}(${vals.join(',')})` : ind.defName
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// IndicatorTag — shown in the interval toolbar row (above chart).
-// Plain text always visible. 👁 ⚙ ✕ always rendered but hidden via opacity=0
-// until the parent is hovered. We use a group ref + CSS class trick:
-// the parent sets data-hov="true" on mouseenter/leave via direct DOM mutation
-// (no React re-render) and child buttons read it via CSS sibling selector.
-// Because we can't use CSS classes with inline styles, we use a simpler trick:
-// render all buttons always, but set their opacity via a ref on the parent.
-// ─────────────────────────────────────────────────────────────────────────────
-function IndicatorTag({
-  label, visible, onToggleVisible, onSettings, onRemove,
-}: {
-  label: string; visible: boolean
-  onToggleVisible: () => void; onSettings: () => void; onRemove: () => void
-}) {
-  const groupRef = useRef<HTMLSpanElement>(null)
-  const iconsRef = useRef<HTMLSpanElement>(null)
-
-  const showIcons  = () => { if (iconsRef.current) iconsRef.current.style.opacity = '1' }
-  const hideIcons  = () => { if (iconsRef.current) iconsRef.current.style.opacity = '0' }
-
-  return (
-    <span
-      ref={groupRef}
-      onMouseEnter={showIcons}
-      onMouseLeave={e => {
-        // Only hide if the mouse truly left the whole group (not just moved to a child)
-        if (!groupRef.current?.contains(e.relatedTarget as Node)) hideIcons()
-      }}
-      style={{
-        display: 'inline-flex', alignItems: 'center', gap: 2,
-        fontSize: 11, lineHeight: '18px',
-        color: visible ? '#848e9c' : '#444',
-        cursor: 'default', userSelect: 'none',
-        padding: '0 3px', borderRadius: 3,
-      }}
-    >
-      <span style={{ fontWeight: 500 }}>{label}</span>
-
-      {/* Icons always in DOM, opacity toggled via ref — no re-render flicker */}
-      <span ref={iconsRef} style={{ display: 'inline-flex', alignItems: 'center', gap: 1, opacity: 0, transition: 'opacity 0.1s' }}>
-        <span
-          role="button" title={visible ? '隱藏' : '顯示'}
-          onClick={e => { e.stopPropagation(); onToggleVisible() }}
-          style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: '0 1px' }}
-          onMouseEnter={e => (e.currentTarget.style.color = '#d1d4dc')}
-          onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
-        >
-          {visible ? <Eye size={10} /> : <EyeOff size={10} />}
-        </span>
-        <span
-          role="button" title="設定"
-          onClick={e => { e.stopPropagation(); onSettings() }}
-          style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: '0 1px' }}
-          onMouseEnter={e => (e.currentTarget.style.color = '#d1d4dc')}
-          onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
-        >
-          <Settings size={10} />
-        </span>
-        <span
-          role="button" title="移除"
-          onClick={e => { e.stopPropagation(); onRemove() }}
-          style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: '0 1px' }}
-          onMouseEnter={e => (e.currentTarget.style.color = '#ef5350')}
-          onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
-        >
-          <X size={10} />
-        </span>
-      </span>
-    </span>
-  )
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Settings Modal
-//
-// For multi-period indicators (MA/EMA):
-//   Shows a list of periods. Each row: colour swatch | toggle checkbox | period input.
-//   User can add/remove period rows (up to 8).
-//
-// For other indicators (BOLL/MACD/RSI/KDJ/VOL):
-//   Shows flat key-value inputs as before.
 // ─────────────────────────────────────────────────────────────────────────────
 function SettingsModal({ indicator, def, onClose, onApply }: {
-  indicator: ActiveIndicator
-  def: IndicatorDef
-  onClose: () => void
+  indicator: ActiveIndicator; def: IndicatorDef; onClose: () => void
   onApply: (defName: string, periods?: PeriodEntry[], params?: Record<string, number>) => void
 }) {
-  const [periods, setPeriods] = useState<PeriodEntry[]>(
-    indicator.periods ? [...indicator.periods] : []
-  )
-  const [params, setParams] = useState({ ...indicator.params })
+  const [periods, setPeriods] = useState<PeriodEntry[]>(indicator.periods ? [...indicator.periods] : [])
+  const [params,  setParams]  = useState({ ...indicator.params })
 
-  const togglePeriod = (i: number) =>
-    setPeriods(prev => prev.map((p, idx) => idx === i ? { ...p, visible: !p.visible } : p))
-
-  const setPeriodValue = (i: number, v: number) =>
-    setPeriods(prev => prev.map((p, idx) => idx === i ? { ...p, value: v } : p))
-
-  const addPeriod = () => {
-    if (periods.length >= 8) return
-    const last = periods[periods.length - 1]?.value ?? 20
-    setPeriods(prev => [...prev, { value: last + 10, visible: true }])
-  }
-
-  const removePeriod = (i: number) => {
-    if (periods.length <= 1) return
-    setPeriods(prev => prev.filter((_, idx) => idx !== i))
-  }
+  const togglePeriod   = (i: number) => setPeriods(prev => prev.map((p, idx) => idx === i ? { ...p, visible: !p.visible } : p))
+  const setPeriodValue = (i: number, v: number) => setPeriods(prev => prev.map((p, idx) => idx === i ? { ...p, value: v } : p))
+  const addPeriod      = () => { if (periods.length >= 8) return; const last = periods[periods.length-1]?.value ?? 20; setPeriods(prev => [...prev, { value: last+10, visible: true }]) }
+  const removePeriod   = (i: number) => { if (periods.length <= 1) return; setPeriods(prev => prev.filter((_, idx) => idx !== i)) }
 
   return (
-    <div
-      style={{ position: 'fixed', inset: 0, zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,.6)' }}
-      onClick={onClose}
-    >
-      <div
-        style={{ background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 8, padding: 0, width: 300, boxShadow: '0 8px 32px rgba(0,0,0,.6)', overflow: 'hidden' }}
-        onClick={e => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', borderBottom: '1px solid #2b2b43' }}>
-          <span style={{ fontWeight: 700, color: '#fff', fontSize: 13 }}>{def.label}</span>
-          <span role="button" onClick={onClose} style={{ cursor: 'pointer', color: '#848e9c', display: 'flex' }}><X size={15} /></span>
+    <div style={{ position:'fixed', inset:0, zIndex:200, display:'flex', alignItems:'center', justifyContent:'center', background:'rgba(0,0,0,.6)' }} onClick={onClose}>
+      <div style={{ background:'#1e222d', border:'1px solid #2b2b43', borderRadius:8, width:300, overflow:'hidden', boxShadow:'0 8px 32px rgba(0,0,0,.6)' }} onClick={e => e.stopPropagation()}>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'10px 14px', borderBottom:'1px solid #2b2b43' }}>
+          <span style={{ fontWeight:700, color:'#fff', fontSize:13 }}>{def.label} 設定</span>
+          <span role="button" onClick={onClose} style={{ cursor:'pointer', color:'#848e9c', display:'flex' }}><X size={14}/></span>
         </div>
-
-        <div style={{ padding: '12px 14px' }}>
-          {/* ── Multi-period mode (MA / EMA) ── */}
-          {def.multiPeriod && periods.length > 0 && (
+        <div style={{ padding:'12px 14px' }}>
+          {def.multiPeriod && (
             <>
-              <div style={{ fontSize: 10, color: '#848e9c', letterSpacing: 1, marginBottom: 8, textTransform: 'uppercase' }}>均線週期</div>
               {periods.map((p, i) => (
-                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                  {/* Colour swatch */}
-                  <div style={{ width: 12, height: 12, borderRadius: 2, background: LINE_COLORS[i % LINE_COLORS.length], flexShrink: 0 }} />
-
-                  {/* Toggle visibility */}
-                  <span
-                    role="button"
+                <div key={i} style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8 }}>
+                  <div style={{ width:12, height:12, borderRadius:'50%', background: LINE_COLORS[i % LINE_COLORS.length], flexShrink:0 }} />
+                  <div
                     onClick={() => togglePeriod(i)}
-                    title={p.visible ? '隱藏此均線' : '顯示此均線'}
-                    style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: p.visible ? '#d1d4dc' : '#444', flexShrink: 0 }}
+                    style={{ width:14, height:14, borderRadius:3, border:`1px solid ${p.visible ? '#f0b90b' : '#555'}`, background: p.visible ? '#f0b90b' : 'transparent', display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', flexShrink:0 }}
                   >
-                    {p.visible ? <Eye size={13} /> : <EyeOff size={13} />}
-                  </span>
-
-                  {/* Label */}
-                  <span style={{ fontSize: 12, color: p.visible ? '#d1d4dc' : '#555', flex: 1 }}>
-                    MA{p.value}
-                  </span>
-
-                  {/* Period input */}
+                    {p.visible && <span style={{ fontSize:9, fontWeight:900, color:'#000', lineHeight:1 }}>✓</span>}
+                  </div>
                   <input
-                    type="number" min={1} max={999} value={p.value}
-                    onChange={e => setPeriodValue(i, Math.max(1, +e.target.value))}
-                    style={{
-                      width: 64, background: '#131722', border: '1px solid #2b2b43',
-                      borderRadius: 4, padding: '3px 8px', fontSize: 12, color: '#fff',
-                      textAlign: 'right', outline: 'none',
-                    }}
+                    type="number" value={p.value}
+                    onChange={e => setPeriodValue(i, +e.target.value)}
+                    style={{ width:60, background:'#131722', border:'1px solid #2b2b43', borderRadius:4, padding:'3px 7px', fontSize:12, color:'#fff', outline:'none' }}
                   />
-
-                  {/* Remove row */}
                   <span
-                    role="button"
-                    onClick={() => removePeriod(i)}
-                    title="移除此週期"
-                    style={{ display: 'flex', alignItems: 'center', cursor: periods.length > 1 ? 'pointer' : 'not-allowed', color: periods.length > 1 ? '#848e9c' : '#333', flexShrink: 0 }}
-                    onMouseEnter={e => { if (periods.length > 1) (e.currentTarget as HTMLElement).style.color = '#ef5350' }}
-                    onMouseLeave={e => { if (periods.length > 1) (e.currentTarget as HTMLElement).style.color = '#848e9c' }}
+                    role="button" onClick={() => removePeriod(i)}
+                    style={{ cursor: periods.length > 1 ? 'pointer' : 'not-allowed', color: periods.length > 1 ? '#848e9c' : '#333', display:'flex', marginLeft:'auto' }}
                   >
-                    <Minus size={13} />
+                    <Minus size={13}/>
                   </span>
                 </div>
               ))}
-
-              {/* Add period row */}
               {periods.length < 8 && (
-                <div
-                  role="button"
-                  onClick={addPeriod}
-                  style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 0', cursor: 'pointer', color: '#848e9c', fontSize: 12 }}
+                <div role="button" onClick={addPeriod} style={{ display:'flex', alignItems:'center', gap:6, padding:'4px 0', cursor:'pointer', color:'#848e9c', fontSize:12 }}
                   onMouseEnter={e => ((e.currentTarget as HTMLElement).style.color = '#d1d4dc')}
                   onMouseLeave={e => ((e.currentTarget as HTMLElement).style.color = '#848e9c')}
                 >
-                  <Plus size={13} /> 新增均線
+                  <Plus size={13}/> 新增均線
                 </div>
               )}
             </>
           )}
-
-          {/* ── Flat params mode (BOLL / MACD / RSI / KDJ) ── */}
           {!def.multiPeriod && (
             Object.keys(params).length === 0
-              ? <p style={{ color: '#848e9c', fontSize: 13, textAlign: 'center', padding: '8px 0' }}>此指標無可調參數</p>
+              ? <p style={{ color:'#848e9c', fontSize:13, textAlign:'center', padding:'8px 0' }}>此指標無可調參數</p>
               : Object.keys(params).map(k => (
-                <div key={k} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-                  <label style={{ fontSize: 13, color: '#d1d4dc' }}>{def.paramLabels[k] ?? k}</label>
+                <div key={k} style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:12 }}>
+                  <label style={{ fontSize:13, color:'#d1d4dc' }}>{def.paramLabels[k] ?? k}</label>
                   <input
                     type="number" value={params[k]}
                     onChange={e => setParams(p => ({ ...p, [k]: +e.target.value }))}
-                    style={{ width: 90, background: '#131722', border: '1px solid #2b2b43', borderRadius: 4, padding: '4px 8px', fontSize: 13, color: '#fff', textAlign: 'right', outline: 'none' }}
+                    style={{ width:90, background:'#131722', border:'1px solid #2b2b43', borderRadius:4, padding:'4px 8px', fontSize:13, color:'#fff', textAlign:'right', outline:'none' }}
                   />
                 </div>
               ))
           )}
         </div>
-
-        {/* Footer */}
-        <div style={{ display: 'flex', gap: 8, padding: '8px 14px 14px' }}>
+        <div style={{ display:'flex', gap:8, padding:'8px 14px 14px' }}>
+          <button onClick={onClose} style={{ flex:1, padding:'6px 0', borderRadius:4, fontSize:13, border:'1px solid #2b2b43', background:'transparent', color:'#d1d4dc', cursor:'pointer' }}>取消</button>
           <button
-            onClick={onClose}
-            style={{ flex: 1, padding: '6px 0', borderRadius: 4, fontSize: 13, border: '1px solid #2b2b43', background: 'transparent', color: '#d1d4dc', cursor: 'pointer' }}
-          >
-            取消
-          </button>
-          <button
-            onClick={() => {
-              onApply(indicator.defName, def.multiPeriod ? periods : undefined, def.multiPeriod ? undefined : params)
-              onClose()
-            }}
-            style={{ flex: 1, padding: '6px 0', borderRadius: 4, fontSize: 13, fontWeight: 700, border: 'none', background: '#f0b90b', color: '#000', cursor: 'pointer' }}
-          >
-            套用
-          </button>
+            onClick={() => { onApply(indicator.defName, def.multiPeriod ? periods : undefined, def.multiPeriod ? undefined : params); onClose() }}
+            style={{ flex:1, padding:'6px 0', borderRadius:4, fontSize:13, fontWeight:700, border:'none', background:'#f0b90b', color:'#000', cursor:'pointer' }}
+          >套用</button>
         </div>
       </div>
     </div>
@@ -460,54 +279,37 @@ function SettingsModal({ indicator, def, onClose, onApply }: {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Indicator Row (inside the dropdown panel)
+// Indicator Row (inside dropdown)
 // ─────────────────────────────────────────────────────────────────────────────
 function IndicatorRow({ def, isOn, onToggle, onSettings }: {
   def: IndicatorDef; isOn: boolean; onToggle: () => void; onSettings: () => void
 }) {
-  const rowRef     = useRef<HTMLDivElement>(null)
-  const gearRef    = useRef<HTMLSpanElement>(null)
-
-  const showGear = () => { if (isOn && gearRef.current) gearRef.current.style.opacity = '1' }
-  const hideGear = (e: React.MouseEvent) => {
-    if (!rowRef.current?.contains(e.relatedTarget as Node) && gearRef.current) {
-      gearRef.current.style.opacity = '0'
-    }
-  }
-
   return (
     <div
-      ref={rowRef}
-      onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = '#2b2b43'; showGear() }}
-      onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'transparent'; hideGear(e) }}
-      style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', cursor: 'pointer', background: 'transparent' }}
+      style={{ display:'flex', alignItems:'center', gap:8, padding:'7px 12px', cursor:'pointer' }}
+      onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = '#2b2b43' }}
+      onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}
+      onClick={onToggle}
     >
-      <div
-        onClick={onToggle}
-        style={{
-          width: 14, height: 14, borderRadius: 3, flexShrink: 0,
-          border: `1px solid ${isOn ? '#f0b90b' : '#555'}`,
-          background: isOn ? '#f0b90b' : 'transparent',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}
-      >
-        {isOn && <span style={{ fontSize: 9, fontWeight: 900, color: '#000', lineHeight: 1 }}>✓</span>}
+      <div style={{
+        width:14, height:14, borderRadius:3, flexShrink:0,
+        border:`1px solid ${isOn ? '#f0b90b' : '#555'}`,
+        background: isOn ? '#f0b90b' : 'transparent',
+        display:'flex', alignItems:'center', justifyContent:'center',
+      }}>
+        {isOn && <span style={{ fontSize:9, fontWeight:900, color:'#000', lineHeight:1 }}>✓</span>}
       </div>
-
-      <span onClick={onToggle} style={{ fontSize: 12, color: '#d1d4dc', flex: 1 }}>{def.label}</span>
-
-      {/* Gear icon: always in DOM when isOn, opacity toggled via ref */}
+      <span style={{ fontSize:12, color:'#d1d4dc', flex:1 }}>{def.label}</span>
       {isOn && (
         <span
-          ref={gearRef}
           role="button"
           onClick={e => { e.stopPropagation(); onSettings() }}
           title="設定"
-          style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: 1, flexShrink: 0, opacity: 0, transition: 'opacity 0.1s' }}
-          onMouseEnter={e => (e.currentTarget.style.color = '#d1d4dc')}
-          onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
+          style={{ display:'flex', alignItems:'center', cursor:'pointer', color:'#848e9c', padding:1, flexShrink:0 }}
+          onMouseEnter={e => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.color = '#d1d4dc' }}
+          onMouseLeave={e => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.color = '#848e9c' }}
         >
-          <Settings size={12} />
+          <Settings size={12}/>
         </span>
       )}
     </div>
@@ -517,45 +319,110 @@ function IndicatorRow({ def, isOn, onToggle, onSettings }: {
 // ─────────────────────────────────────────────────────────────────────────────
 // Indicator Dropdown Panel
 // ─────────────────────────────────────────────────────────────────────────────
-function IndicatorPanel({
-  activeInds, onToggle, onOpenSettings, onClose,
-}: {
-  activeInds: ActiveIndicator[]
-  onToggle: (defName: string) => void
-  onOpenSettings: (defName: string) => void
-  onClose: () => void
+function IndicatorPanel({ activeInds, onToggle, onOpenSettings, onClose }: {
+  activeInds: ActiveIndicator[]; onToggle: (n: string) => void
+  onOpenSettings: (n: string) => void; onClose: () => void
 }) {
   const activeNames = new Set(activeInds.map(a => a.defName))
+  const mainDefs = INDICATOR_DEFS.filter(d => d.pane === 'main')
+  const subDefs  = INDICATOR_DEFS.filter(d => d.pane === 'sub')
+  return (
+    <div style={{ position:'absolute', top:'100%', right:0, marginTop:4, zIndex:100, width:230, background:'#1e222d', border:'1px solid #2b2b43', borderRadius:8, boxShadow:'0 8px 24px rgba(0,0,0,.5)', overflow:'hidden' }}>
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'8px 12px', borderBottom:'1px solid #2b2b43' }}>
+        <span style={{ fontSize:12, fontWeight:700, color:'#d1d4dc' }}>技術指標</span>
+        <span role="button" onClick={onClose} style={{ cursor:'pointer', color:'#848e9c', display:'flex' }}><X size={13}/></span>
+      </div>
+      <div style={{ padding:'4px 12px 2px', fontSize:10, color:'#848e9c', fontWeight:600, letterSpacing:1, marginTop:4 }}>主圖</div>
+      {mainDefs.map(def => (
+        <IndicatorRow key={def.name} def={def} isOn={activeNames.has(def.name)} onToggle={() => onToggle(def.name)} onSettings={() => onOpenSettings(def.name)} />
+      ))}
+      <div style={{ padding:'6px 12px 2px', fontSize:10, color:'#848e9c', fontWeight:600, letterSpacing:1, borderTop:'1px solid #1e2328', marginTop:4 }}>副圖</div>
+      {subDefs.map(def => (
+        <IndicatorRow key={def.name} def={def} isOn={activeNames.has(def.name)} onToggle={() => onToggle(def.name)} onSettings={() => onOpenSettings(def.name)} />
+      ))}
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Left Drawing Toolbar
+// ─────────────────────────────────────────────────────────────────────────────
+function DrawToolbar({ activeTool, onSelect, onClear }: {
+  activeTool: string | null
+  onSelect: (id: string) => void
+  onClear: () => void
+}) {
+  const [tooltip, setTooltip] = useState<{ label: string; y: number } | null>(null)
+
+  let lastGroup = ''
   return (
     <div style={{
-      position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 100,
-      width: 230, background: '#1e222d', border: '1px solid #2b2b43',
-      borderRadius: 8, boxShadow: '0 8px 24px rgba(0,0,0,.5)', overflow: 'hidden',
+      width: 36, flexShrink: 0, background: '#1e222d',
+      borderRight: '1px solid #2b2b43',
+      display: 'flex', flexDirection: 'column', alignItems: 'center',
+      paddingTop: 6, paddingBottom: 6, gap: 2, position: 'relative', overflowY: 'auto',
     }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: '1px solid #2b2b43' }}>
-        <span style={{ fontSize: 12, fontWeight: 700, color: '#d1d4dc' }}>技術指標</span>
-        <span role="button" onClick={onClose} style={{ cursor: 'pointer', color: '#848e9c', display: 'flex' }}><X size={13} /></span>
+      {DRAW_TOOLS.map(tool => {
+        const showSep = tool.group !== lastGroup
+        if (showSep) lastGroup = tool.group
+        const isActive = activeTool === tool.id
+        return (
+          <div key={tool.id}>
+            {showSep && lastGroup !== DRAW_TOOLS[0].group && (
+              <div style={{ width: 24, height: 1, background: '#2b2b43', margin: '3px auto' }} />
+            )}
+            <div
+              role="button"
+              title={tool.label}
+              onClick={() => onSelect(tool.id)}
+              style={{
+                width: 28, height: 28, borderRadius: 4, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                cursor: 'pointer',
+                background: isActive ? '#f0b90b22' : 'transparent',
+                color: isActive ? '#f0b90b' : '#848e9c',
+                border: isActive ? '1px solid #f0b90b66' : '1px solid transparent',
+              }}
+              onMouseEnter={e => {
+                if (!isActive) (e.currentTarget as HTMLElement).style.color = '#d1d4dc'
+                const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+                const parentRect = (e.currentTarget as HTMLElement).closest('[data-sidebar]')?.getBoundingClientRect()
+                setTooltip({ label: tool.label, y: rect.top - (parentRect?.top ?? 0) + 4 })
+              }}
+              onMouseLeave={e => {
+                if (!isActive) (e.currentTarget as HTMLElement).style.color = '#848e9c'
+                setTooltip(null)
+              }}
+            >
+              {tool.icon}
+            </div>
+          </div>
+        )
+      })}
+
+      {/* Divider */}
+      <div style={{ width:24, height:1, background:'#2b2b43', margin:'3px auto' }} />
+
+      {/* Clear all overlays */}
+      <div
+        role="button" title="清除所有繪圖" onClick={onClear}
+        style={{ width:28, height:28, borderRadius:4, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', color:'#848e9c', border:'1px solid transparent' }}
+        onMouseEnter={e => { (e.currentTarget as HTMLElement).style.color = '#ef5350'; (e.currentTarget as HTMLElement).style.borderColor = '#ef535066' }}
+        onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = '#848e9c'; (e.currentTarget as HTMLElement).style.borderColor = 'transparent' }}
+      >
+        <Trash2 size={15}/>
       </div>
 
-      <div style={{ padding: '4px 12px 2px', fontSize: 10, color: '#848e9c', fontWeight: 600, letterSpacing: 1, marginTop: 4 }}>主圖</div>
-      {INDICATOR_DEFS.filter(d => d.pane === 'main').map(def => (
-        <IndicatorRow
-          key={def.name} def={def}
-          isOn={activeNames.has(def.name)}
-          onToggle={() => onToggle(def.name)}
-          onSettings={() => onOpenSettings(def.name)}
-        />
-      ))}
-
-      <div style={{ padding: '6px 12px 2px', fontSize: 10, color: '#848e9c', fontWeight: 600, letterSpacing: 1, borderTop: '1px solid #1e2328', marginTop: 4 }}>副圖</div>
-      {INDICATOR_DEFS.filter(d => d.pane === 'sub').map(def => (
-        <IndicatorRow
-          key={def.name} def={def}
-          isOn={activeNames.has(def.name)}
-          onToggle={() => onToggle(def.name)}
-          onSettings={() => onOpenSettings(def.name)}
-        />
-      ))}
+      {/* Tooltip popup */}
+      {tooltip && (
+        <div style={{
+          position: 'absolute', left: 38, top: tooltip.y, zIndex: 200,
+          background: '#2b2b43', color: '#d1d4dc', fontSize: 11,
+          padding: '3px 8px', borderRadius: 4, whiteSpace: 'nowrap',
+          pointerEvents: 'none', boxShadow: '0 2px 8px rgba(0,0,0,.4)',
+        }}>
+          {tooltip.label}
+        </div>
+      )}
     </div>
   )
 }
@@ -565,13 +432,14 @@ function IndicatorPanel({
 // ─────────────────────────────────────────────────────────────────────────────
 export default function ChartPage() {
   const CHART_ID = 'kline-chart'
-  const chartRef = useRef<Chart | null>(null)
-  const wsRef    = useRef<WebSocket | null>(null)
-  const rcRef    = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const tickRef  = useRef<ReturnType<typeof setInterval> | null>(null)
+  const chartRef   = useRef<Chart | null>(null)
+  const wsRef      = useRef<WebSocket | null>(null)
+  const rcRef      = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const tickRef    = useRef<ReturnType<typeof setInterval> | null>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
 
-  const symRef = useRef(getSaved('chart_symbol', 'BTCUSDT'))
-  const ivRef  = useRef(getSaved('chart_interval', '1h'))
+  const symRef = useRef(getSaved('chart_symbol',   'BTCUSDT'))
+  const ivRef  = useRef(getSaved('chart_interval',  '1h'))
   const mtRef  = useRef<MarketType>(getSaved('chart_market', 'futures') as MarketType)
 
   const [symbol,     setSym]    = useState(symRef.current)
@@ -579,22 +447,24 @@ export default function ChartPage() {
   const [marketType, setMt]     = useState<MarketType>(mtRef.current)
   const [loading,    setLoading] = useState(false)
   const [error,      setError]   = useState<string | null>(null)
-  const [wsStatus,   setWsSt]    = useState<'connecting' | 'live' | 'disconnected'>('disconnected')
+  const [wsStatus,   setWsSt]    = useState<'connecting'|'live'|'disconnected'>('disconnected')
 
   const [price,  setPrice]  = useState<number | null>(null)
   const [ticker, setTicker] = useState<TickerInfo | null>(null)
-  const [barTs,  setBarTs]  = useState<number | null>(null)
-  const [lastTs, setLastTs] = useState(0)
-  const [agoStr, setAgoStr] = useState('')
 
   const [searchQ,  setSearchQ]  = useState('')
   const [showSymP, setShowSymP] = useState(false)
   const [showIndP, setShowIndP] = useState(false)
+  const [isFullscreen, setIsFullscreen] = useState(false)
 
   const [activeInds,   setActiveInds]   = useState<ActiveIndicator[]>([])
   const [settingsName, setSettingsName] = useState<string | null>(null)
 
-  // ── Chart init ──────────────────────────────────────────────────────────
+  // Drawing tool state
+  const [activeTool, setActiveTool] = useState<string | null>(null)
+  const activeToolRef = useRef<string | null>(null)
+
+  // ── Chart init ─────────────────────────────────────────────────────────────
   useEffect(() => {
     const chart = init(CHART_ID, {
       layout: [
@@ -602,104 +472,121 @@ export default function ChartPage() {
         { type: 'xAxis' },
       ],
       styles: {
-        grid: { horizontal: { color: '#1e2328' }, vertical: { color: '#1e2328' } },
+        grid: {
+          horizontal: { color: '#1e2328', size: 1, style: 'dashed', show: true },
+          vertical:   { color: '#1e2328', size: 1, style: 'dashed', show: true },
+        },
         candle: {
-          bar: { upColor: '#26a69a', downColor: '#ef5350', noChangeColor: '#888' },
+          bar: { upColor: '#26a69a', downColor: '#ef5350', noChangeColor: '#888', upBorderColor: '#26a69a', downBorderColor: '#ef5350', upWickColor: '#26a69a', downWickColor: '#ef5350' },
           tooltip: {
-            // OHLCV always shown in top-left of candle pane
             showRule: 'always',
             showType: 'standard',
-            labels: ['時間', '開', '高', '低', '收', '量'],
-            text: { size: 11, color: '#848e9c' },
+            labels: ['T', 'O', 'H', 'L', 'C', 'V'],
+            values: null,
+            defaultValue: 'n/a',
+            rect: { paddingLeft: 0, paddingRight: 0, paddingTop: 0, paddingBottom: 6, offsetLeft: 8, offsetTop: 8, offsetRight: 8, borderRadius: 4, borderSize: 1, borderColor: '#2b2b43', color: '#1e222d' },
+            text: { size: 11, family: 'Helvetica Neue', weight: 'normal', color: '#848e9c', marginLeft: 8, marginTop: 6, marginRight: 8, marginBottom: 0 },
           },
         },
         indicator: {
-          ohlc: { upColor: '#26a69a', downColor: '#ef5350' },
+          ohlc: { upColor: '#26a69a', downColor: '#ef5350', noChangeColor: '#888' },
           tooltip: {
-            // Indicator name+values always shown in each pane top-left
             showRule: 'always',
             showType: 'standard',
-            text: { size: 11, color: '#848e9c' },
+            rect: { paddingLeft: 0, paddingRight: 0, paddingTop: 0, paddingBottom: 6, offsetLeft: 8, offsetTop: 8, offsetRight: 8, borderRadius: 4, borderSize: 1, borderColor: '#2b2b43', color: '#1e222d' },
+            text: { size: 11, family: 'Helvetica Neue', weight: 'normal', color: '#848e9c', marginLeft: 8, marginTop: 6, marginRight: 8, marginBottom: 0 },
           },
         },
-        xAxis:     { tickText: { color: '#848e9c', size: 11 }, axisLine: { color: '#2b2b43' } },
-        yAxis:     { tickText: { color: '#848e9c', size: 11 }, axisLine: { color: '#2b2b43' } },
-        crosshair: {
-          horizontal: { line: { color: '#444' }, text: { color: '#fff', backgroundColor: '#2b2b43' } },
-          vertical:   { line: { color: '#444' }, text: { color: '#fff', backgroundColor: '#2b2b43' } },
+        xAxis: {
+          show: true,
+          axisLine: { show: true, color: '#2b2b43', size: 1 },
+          tickLine: { show: true, size: 1, length: 3, distance: 0, color: '#2b2b43' },
+          tickText: { show: true, color: '#848e9c', family: 'Helvetica Neue', weight: 'normal', size: 11, marginStart: 4, marginEnd: 4 },
         },
-        background: '#131722',
+        yAxis: {
+          show: true,
+          axisLine: { show: false, color: '#2b2b43', size: 1 },
+          tickLine: { show: false, size: 1, length: 3, distance: 0, color: '#2b2b43' },
+          tickText: { show: true, color: '#848e9c', family: 'Helvetica Neue', weight: 'normal', size: 11, marginStart: 4, marginEnd: 4 },
+        },
+        separator: {
+          size: 1, color: '#2b2b43', fill: true,
+          activeBackgroundColor: 'rgba(230, 230, 230, .15)',
+        },
+        crosshair: {
+          show: true,
+          horizontal: { show: true, line: { show: true, style: 'dashed', dashedValue: [4,2], size: 1, color: '#44475a' }, text: { show: true, size: 11, family: 'Helvetica Neue', weight: 'normal', color: '#d1d4dc', paddingLeft: 4, paddingRight: 4, paddingTop: 3, paddingBottom: 3, borderSize: 1, borderRadius: 2, borderColor: '#2b2b43', backgroundColor: '#2b2b43' } },
+          vertical:   { show: true, line: { show: true, style: 'dashed', dashedValue: [4,2], size: 1, color: '#44475a' }, text: { show: true, size: 11, family: 'Helvetica Neue', weight: 'normal', color: '#d1d4dc', paddingLeft: 4, paddingRight: 4, paddingTop: 3, paddingBottom: 3, borderSize: 1, borderRadius: 2, borderColor: '#2b2b43', backgroundColor: '#2b2b43' } },
+        },
+        overlay: {
+          line: { style: 'solid', smooth: false, size: 1, color: '#f0b90b', dashedValue: [2,2] },
+          rect: { style: 'stroke_fill', color: 'rgba(240,185,11,.1)', borderColor: '#f0b90b', borderSize: 1, borderStyle: 'solid', borderRadius: 0 },
+          circle: { style: 'stroke_fill', color: 'rgba(240,185,11,.1)', borderColor: '#f0b90b', borderSize: 1, borderStyle: 'solid' },
+          arc: { style: 'solid', color: '#f0b90b', size: 1 },
+          polygon: { style: 'stroke_fill', color: 'rgba(240,185,11,.1)', borderColor: '#f0b90b', borderSize: 1, borderStyle: 'solid' },
+          text: { style: 'fill', color: '#f0b90b', size: 13, family: 'Helvetica Neue', weight: 'normal', paddingLeft: 0, paddingRight: 0, paddingTop: 0, paddingBottom: 0, borderSize: 1, borderRadius: 2, borderColor: '#f0b90b', backgroundColor: 'transparent' },
+          point: { color: '#f0b90b', borderColor: '#f0b90b', borderSize: 1, radius: 4, activeRadius: 6, activeColor: '#f0b90b', activeBorderColor: '#fff', activeBorderSize: 2 },
+        },
       },
-      locale: 'zh-TW',
-      timezone: 'Asia/Taipei',
     })
-    if (!chart) return
-    chartRef.current = chart
-
-    // Default: MA with 4 periods on main pane
-    const defaultPeriods: PeriodEntry[] = [5, 10, 20, 60].map(v => ({ value: v, visible: true }))
-    chart.createIndicator('MA', false, { id: 'candle_pane' })
-    // Apply multi-period calcParams
-    chart.overrideIndicator({
-      name: 'MA',
-      calcParams: buildCalcParams(defaultPeriods),
-    }, 'candle_pane')
-    setActiveInds([{
-      defName: 'MA',
-      paneId: 'candle_pane',
-      visible: true,
-      periods: defaultPeriods,
-      params: {},
-    }])
+    chartRef.current = chart as Chart
 
     return () => { dispose(CHART_ID) }
   }, [])
 
-  // ── Load klines ──────────────────────────────────────────────────────────
+  // ── WebSocket ──────────────────────────────────────────────────────────────
+  const connectWS = useCallback((mt: MarketType, sym: string, iv: string) => {
+    wsRef.current?.close()
+    setWsSt('connecting')
+    const base  = mt === 'futures' ? FUTURES_WS_BASE : SPOT_WS_BASE
+    const stream = `${sym.toLowerCase()}@kline_${iv}`
+    const ws     = new WebSocket(`${base}/${stream}`)
+    wsRef.current = ws
+
+    ws.onopen  = () => setWsSt('live')
+    ws.onclose = () => {
+      setWsSt('disconnected')
+      if (rcRef.current) clearTimeout(rcRef.current)
+      rcRef.current = setTimeout(() => connectWS(mt, sym, iv), 3000)
+    }
+    ws.onerror = () => ws.close()
+    ws.onmessage = e => {
+      const d = JSON.parse(e.data)?.k
+      if (!d) return
+      const bar = { timestamp: d.t, open: +d.o, high: +d.h, low: +d.l, close: +d.c, volume: +d.v, turnover: +d.q }
+      chartRef.current?.updateData(bar)
+      setPrice(+d.c)
+    }
+  }, [])
+
+  // ── Load data ──────────────────────────────────────────────────────────────
   const loadData = useCallback(async (mt: MarketType, sym: string, iv: string) => {
     const chart = chartRef.current; if (!chart) return
     setLoading(true); setError(null)
     try {
-      const [klines, tk] = await Promise.all([fetchKlines(mt, sym, iv, 1500), fetchTicker(mt, sym)])
+      const [klines, tkr] = await Promise.all([
+        fetchKlines(mt, sym, iv, 1500),
+        fetchTicker(mt, sym),
+      ])
       chart.applyNewData(klines)
-      setTicker(tk)
-      if (klines.length) setPrice(klines[klines.length - 1].close)
-    } catch (e: any) { setError(e.message) }
-    finally { setLoading(false) }
-  }, [])
-
-  // ── WebSocket ─────────────────────────────────────────────────────────────
-  const connectWS = useCallback((mt: MarketType, sym: string, iv: string) => {
-    if (wsRef.current) { wsRef.current.close(); wsRef.current = null }
-    const base = mt === 'futures' ? FUTURES_WS_BASE : SPOT_WS_BASE
-    const ws = new WebSocket(`${base}/${sym.toLowerCase()}@kline_${iv}`)
-    wsRef.current = ws; setWsSt('connecting')
-    ws.onopen  = () => setWsSt('live')
-    ws.onclose = () => {
-      setWsSt('disconnected')
-      rcRef.current = setTimeout(() => connectWS(mtRef.current, symRef.current, ivRef.current), 3000)
-    }
-    ws.onerror = () => ws.close()
-    ws.onmessage = e => {
-      const { k } = JSON.parse(e.data)
-      chartRef.current?.updateData({ timestamp: k.t, open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v, turnover: +k.q })
-      setPrice(+k.c); setBarTs(k.t); setLastTs(Date.now())
+      setPrice(klines[klines.length - 1]?.close ?? null)
+      setTicker(tkr)
+    } catch (err: any) {
+      setError(err?.message ?? '載入失敗')
+    } finally {
+      setLoading(false)
     }
   }, [])
 
-  // ── "X ago" ticker ─────────────────────────────────────────────────────────
-  useEffect(() => {
-    tickRef.current = setInterval(() => { if (lastTs) setAgoStr(timeAgo(lastTs)) }, 1000)
-    return () => { if (tickRef.current) clearInterval(tickRef.current) }
-  }, [lastTs])
-
-  // ── Switch symbol / interval ───────────────────────────────────────────────
+  // ── Switch pair ────────────────────────────────────────────────────────────
   const switchPair = useCallback((mt: MarketType, sym: string, iv: string) => {
     symRef.current = sym; ivRef.current = iv; mtRef.current = mt
     localStorage.setItem('chart_symbol', sym)
     localStorage.setItem('chart_interval', iv)
     localStorage.setItem('chart_market', mt)
     setSym(sym); setIv(iv); setMt(mt)
+    setActiveInds([])
+    chartRef.current?.removePane()
     if (rcRef.current) clearTimeout(rcRef.current)
     loadData(mt, sym, iv)
     connectWS(mt, sym, iv)
@@ -714,7 +601,34 @@ export default function ChartPage() {
     }
   }, [])
 
-  // ── Toggle indicator ───────────────────────────────────────────────────────
+  // ── Drawing tool handler ───────────────────────────────────────────────────
+  const handleToolSelect = useCallback((toolId: string) => {
+    const chart = chartRef.current; if (!chart) return
+    // Toggle off if same tool selected again
+    if (activeToolRef.current === toolId) {
+      activeToolRef.current = null
+      setActiveTool(null)
+      chart.removeOverlay()
+      return
+    }
+    activeToolRef.current = toolId
+    setActiveTool(toolId)
+    // Create overlay — KLineChart handles mouse interaction automatically
+    try {
+      chart.createOverlay({ name: toolId })
+    } catch (err) {
+      console.warn('createOverlay error', toolId, err)
+    }
+  }, [])
+
+  const handleClearOverlays = useCallback(() => {
+    const chart = chartRef.current; if (!chart) return
+    chart.removeOverlay()
+    activeToolRef.current = null
+    setActiveTool(null)
+  }, [])
+
+  // ── Indicator toggle ───────────────────────────────────────────────────────
   const toggleIndicator = useCallback((defName: string) => {
     const chart = chartRef.current; if (!chart) return
     const def = INDICATOR_DEFS.find(d => d.name === defName)!
@@ -722,29 +636,21 @@ export default function ChartPage() {
     setActiveInds(prev => {
       const existing = prev.find(a => a.defName === defName)
       if (existing) {
-        // Remove
         try {
-          if (def.pane === 'main') {
-            chart.removeIndicator('candle_pane', defName)
-          } else {
-            chart.removePane(existing.paneId)
-          }
+          if (def.pane === 'main') chart.removeIndicator('candle_pane', defName)
+          else chart.removePane(existing.paneId)
         } catch (err) { console.warn('remove error', err) }
         return prev.filter(a => a.defName !== defName)
       } else {
-        // Add
         let paneId: string
         try {
           if (def.pane === 'main') {
-            paneId = (chart.createIndicator(defName, false, { id: 'candle_pane' }) ?? 'candle_pane') as string
-            // For multi-period indicators apply calcParams immediately
+            chart.createIndicator(defName, false, { id: 'candle_pane' })
+            paneId = 'candle_pane'
             if (def.multiPeriod && def.defaultPeriods) {
-              const defaultPeriods = def.defaultPeriods.map(v => ({ value: v, visible: true }))
-              chart.overrideIndicator({
-                name: defName,
-                calcParams: buildCalcParams(defaultPeriods),
-              }, 'candle_pane')
-              return [...prev, { defName, paneId: 'candle_pane', visible: true, periods: defaultPeriods, params: {} }]
+              const periods = def.defaultPeriods.map(v => ({ value: v, visible: true }))
+              chart.overrideIndicator({ name: defName, calcParams: buildCalcParams(periods) }, 'candle_pane')
+              return [...prev, { defName, paneId, visible: true, periods, params: {} }]
             }
           } else {
             paneId = (chart.createIndicator(defName, false, { height: 100 }) ?? `${defName}_pane`) as string
@@ -759,57 +665,58 @@ export default function ChartPage() {
   }, [])
 
   // ── Apply settings ─────────────────────────────────────────────────────────
-  const applySettings = useCallback((
-    defName: string,
-    periods?: PeriodEntry[],
-    params?: Record<string, number>,
-  ) => {
+  const applySettings = useCallback((defName: string, periods?: PeriodEntry[], params?: Record<string, number>) => {
     const chart = chartRef.current; if (!chart) return
     const def = INDICATOR_DEFS.find(d => d.name === defName)!
-
     setActiveInds(prev => prev.map(a => {
       if (a.defName !== defName) return a
-
       if (def.multiPeriod && periods) {
-        // Update calcParams (only visible periods are calculated)
         const calcParams = buildCalcParams(periods)
         if (calcParams.length > 0) {
-          try {
-            chart.overrideIndicator({ name: defName, calcParams }, a.paneId)
-          } catch (err) { console.warn('overrideIndicator error', err) }
+          try { chart.overrideIndicator({ name: defName, calcParams }, a.paneId) }
+          catch (err) { console.warn(err) }
         }
         return { ...a, periods }
       }
-
       if (params) {
-        const calcParams = Object.values(params)
-        try {
-          chart.overrideIndicator({ name: defName, calcParams }, a.paneId)
-        } catch (err) { console.warn('overrideIndicator error', err) }
+        try { chart.overrideIndicator({ name: defName, calcParams: Object.values(params) }, a.paneId) }
+        catch (err) { console.warn(err) }
         return { ...a, params }
       }
-
       return a
     }))
   }, [])
 
-  // ── Toggle visibility ──────────────────────────────────────────────────────
-  const toggleVisibility = useCallback((defName: string) => {
-    const chart = chartRef.current; if (!chart) return
-    setActiveInds(prev => prev.map(a => {
-      if (a.defName !== defName) return a
-      const next = !a.visible
-      try {
-        chart.overrideIndicator({ name: defName, visible: next }, a.paneId)
-      } catch (err) { console.warn('toggleVisibility error', err) }
-      return { ...a, visible: next }
-    }))
+  const openSettings = useCallback((defName: string) => {
+    setSettingsName(defName); setShowIndP(false)
   }, [])
 
-  // ── Open settings ──────────────────────────────────────────────────────────
-  const openSettings = useCallback((defName: string) => {
-    setSettingsName(defName)
-    setShowIndP(false)
+  // ── Screenshot ─────────────────────────────────────────────────────────────
+  const handleScreenshot = useCallback(() => {
+    const chart = chartRef.current; if (!chart) return
+    try {
+      const url = (chart as any).getConvertPictureUrl?.('png', 'transparent')
+      if (url) {
+        const a = document.createElement('a')
+        a.href = url; a.download = `${symbol}_${interval}_${Date.now()}.png`; a.click()
+      }
+    } catch (err) { console.warn('screenshot', err) }
+  }, [symbol, interval])
+
+  // ── Fullscreen ─────────────────────────────────────────────────────────────
+  const handleFullscreen = useCallback(() => {
+    const el = containerRef.current; if (!el) return
+    if (!document.fullscreenElement) {
+      el.requestFullscreen().then(() => setIsFullscreen(true)).catch(() => {})
+    } else {
+      document.exitFullscreen().then(() => setIsFullscreen(false)).catch(() => {})
+    }
+  }, [])
+
+  useEffect(() => {
+    const handler = () => setIsFullscreen(!!document.fullscreenElement)
+    document.addEventListener('fullscreenchange', handler)
+    return () => document.removeEventListener('fullscreenchange', handler)
   }, [])
 
   // ── Derived ────────────────────────────────────────────────────────────────
@@ -818,217 +725,174 @@ export default function ChartPage() {
   const filteredSyms = POPULAR_SYMBOLS.filter(s => s.includes(searchQ.toUpperCase()))
   const pctColor     = (ticker?.priceChangePct ?? 0) >= 0 ? '#26a69a' : '#ef5350'
 
-  // Only main-pane indicators show React tags in the interval row
-  const mainInds = activeInds.filter(a => INDICATOR_DEFS.find(d => d.name === a.defName)?.pane === 'main')
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Render
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden', background: '#131722', color: '#d1d4dc' }}>
+    <div ref={containerRef} style={{ display:'flex', flexDirection:'column', height:'100vh', overflow:'hidden', background:'#131722', color:'#d1d4dc' }}>
       <PageHeader title="K線圖表" />
 
-      {/* ── ROW 1: Toolbar ──────────────────────────────────────────────── */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderBottom: '1px solid #2b2b43', flexShrink: 0 }}>
+      {/* ── TOP BAR ─────────────────────────────────────────────────────── */}
+      <div style={{ display:'flex', alignItems:'center', gap:0, padding:'0 8px', borderBottom:'1px solid #2b2b43', flexShrink:0, height:40 }}>
 
-        {/* Symbol picker */}
-        <div style={{ position: 'relative' }}>
+        {/* Symbol */}
+        <div style={{ position:'relative', marginRight:8 }}>
           <button
             onClick={() => { setShowSymP(v => !v); setShowIndP(false) }}
-            style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 4, color: '#d1d4dc', fontSize: 13, fontWeight: 700, cursor: 'pointer' }}
+            style={{ display:'flex', alignItems:'center', gap:4, padding:'4px 10px', background:'transparent', border:'1px solid #2b2b43', borderRadius:4, color:'#d1d4dc', fontSize:13, fontWeight:700, cursor:'pointer' }}
           >
-            {symbol} <ChevronDown size={13} />
+            {symbol} <ChevronDown size={12}/>
           </button>
           {showSymP && (
-            <div style={{ position: 'absolute', top: '100%', left: 0, marginTop: 4, zIndex: 100, background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 6, width: 200, boxShadow: '0 8px 24px rgba(0,0,0,.5)' }}>
-              <div style={{ padding: '6px 8px', borderBottom: '1px solid #2b2b43', display: 'flex', alignItems: 'center', gap: 6 }}>
-                <Search size={13} color="#848e9c" />
-                <input
-                  autoFocus value={searchQ} onChange={e => setSearchQ(e.target.value)}
-                  placeholder="搜尋..." style={{ background: 'transparent', border: 'none', outline: 'none', color: '#d1d4dc', fontSize: 12, width: '100%' }}
-                />
+            <div style={{ position:'absolute', top:'100%', left:0, marginTop:4, zIndex:100, background:'#1e222d', border:'1px solid #2b2b43', borderRadius:6, width:200, boxShadow:'0 8px 24px rgba(0,0,0,.5)' }}>
+              <div style={{ padding:'6px 8px', borderBottom:'1px solid #2b2b43', display:'flex', alignItems:'center', gap:6 }}>
+                <Search size={12} color="#848e9c"/>
+                <input autoFocus value={searchQ} onChange={e => setSearchQ(e.target.value)}
+                  placeholder="搜尋..." style={{ background:'transparent', border:'none', outline:'none', color:'#d1d4dc', fontSize:12, width:'100%' }}/>
               </div>
-              <div style={{ maxHeight: 200, overflowY: 'auto' }}>
+              <div style={{ maxHeight:220, overflowY:'auto' }}>
                 {filteredSyms.map(s => (
-                  <div
-                    key={s}
+                  <div key={s}
                     onClick={() => { switchPair(marketType, s, interval); setShowSymP(false); setSearchQ('') }}
-                    style={{ padding: '6px 12px', fontSize: 12, cursor: 'pointer', background: s === symbol ? '#2b2b43' : 'transparent', color: s === symbol ? '#f0b90b' : '#d1d4dc' }}
-                    onMouseEnter={e => (e.currentTarget.style.background = '#2b2b43')}
-                    onMouseLeave={e => (e.currentTarget.style.background = s === symbol ? '#2b2b43' : 'transparent')}
-                  >
-                    {s}
-                  </div>
+                    style={{ padding:'6px 12px', fontSize:12, cursor:'pointer', background: s === symbol ? '#2b2b43' : 'transparent', color: s === symbol ? '#f0b90b' : '#d1d4dc' }}
+                    onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = '#2b2b43' }}
+                    onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = s === symbol ? '#2b2b43' : 'transparent' }}
+                  >{s}</div>
                 ))}
               </div>
             </div>
           )}
         </div>
 
-        {/* Spot / Futures toggle */}
-        <div style={{ display: 'flex', background: '#1e222d', borderRadius: 4, border: '1px solid #2b2b43', overflow: 'hidden' }}>
-          {(['spot', 'futures'] as MarketType[]).map(m => (
-            <button
-              key={m} onClick={() => switchPair(m, symbol, interval)}
-              style={{ padding: '3px 9px', fontSize: 11, cursor: 'pointer', border: 'none', fontWeight: marketType === m ? 700 : 400, background: marketType === m ? '#f0b90b' : 'transparent', color: marketType === m ? '#000' : '#848e9c' }}
-            >
-              {m === 'spot' ? '現貨' : '合約'}
-            </button>
+        {/* Spot / Futures */}
+        <div style={{ display:'flex', background:'#1e222d', borderRadius:4, border:'1px solid #2b2b43', overflow:'hidden', marginRight:8 }}>
+          {(['spot','futures'] as MarketType[]).map(m => (
+            <button key={m} onClick={() => switchPair(m, symbol, interval)}
+              style={{ padding:'3px 9px', fontSize:11, cursor:'pointer', border:'none', fontWeight: marketType===m ? 700 : 400, background: marketType===m ? '#f0b90b' : 'transparent', color: marketType===m ? '#000' : '#848e9c' }}
+            >{m === 'spot' ? '現貨' : '合約'}</button>
           ))}
         </div>
 
-        <div style={{ flex: 1 }} />
+        {/* Divider */}
+        <div style={{ width:1, height:20, background:'#2b2b43', marginRight:8 }}/>
 
-        {/* WS status */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: wsStatus === 'live' ? '#26a69a' : '#848e9c' }}>
-          <span style={{
-            width: 6, height: 6, borderRadius: '50%', display: 'inline-block',
-            backgroundColor: wsStatus === 'live' ? '#26a69a' : wsStatus === 'connecting' ? '#f0b90b' : '#ef5350',
-          }} />
-          {wsStatus === 'live' ? '即時' : wsStatus === 'connecting' ? '連線中' : '斷線'}
+        {/* Interval tabs */}
+        <div style={{ display:'flex', alignItems:'center', gap:1 }}>
+          {INTERVALS.map(iv => (
+            <button key={iv} onClick={() => switchPair(marketType, symbol, iv)}
+              style={{
+                padding:'3px 7px', fontSize:12, cursor:'pointer', border:'none', borderRadius:3,
+                background: interval===iv ? '#f0b90b' : 'transparent',
+                color: interval===iv ? '#000' : '#848e9c',
+                fontWeight: interval===iv ? 700 : 400,
+              }}
+              onMouseEnter={e => { if (interval !== iv) (e.currentTarget as HTMLElement).style.color = '#d1d4dc' }}
+              onMouseLeave={e => { if (interval !== iv) (e.currentTarget as HTMLElement).style.color = '#848e9c' }}
+            >{INTERVAL_LABELS[iv]}</button>
+          ))}
+        </div>
+
+        <div style={{ flex:1 }}/>
+
+        {/* WS dot */}
+        <div style={{ display:'flex', alignItems:'center', gap:4, fontSize:11, color: wsStatus==='live' ? '#26a69a' : '#848e9c', marginRight:10 }}>
+          <span style={{ width:6, height:6, borderRadius:'50%', display:'inline-block', backgroundColor: wsStatus==='live' ? '#26a69a' : wsStatus==='connecting' ? '#f0b90b' : '#ef5350' }}/>
+          {wsStatus==='live' ? '即時' : wsStatus==='connecting' ? '連線中' : '斷線'}
         </div>
 
         {/* Refresh */}
-        <button
-          onClick={() => switchPair(marketType, symbol, interval)}
-          style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 3, display: 'flex', alignItems: 'center' }}
-        >
-          <RefreshCw size={14} color={loading ? '#f0b90b' : '#848e9c'} />
-        </button>
+        <button onClick={() => switchPair(marketType, symbol, interval)}
+          title="重新載入"
+          style={{ background:'transparent', border:'none', cursor:'pointer', padding:'4px 6px', display:'flex', alignItems:'center', color:'#848e9c', borderRadius:4 }}
+          onMouseEnter={e => { (e.currentTarget as HTMLElement).style.color = '#d1d4dc' }}
+          onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = '#848e9c' }}
+        ><RefreshCw size={14} color={loading ? '#f0b90b' : undefined}/></button>
+
+        {/* Indicator button */}
+        <div style={{ position:'relative', marginLeft:2 }}>
+          <button onClick={() => { setShowIndP(v => !v); setShowSymP(false) }}
+            style={{ display:'flex', alignItems:'center', gap:4, padding:'4px 8px', fontSize:12, cursor:'pointer', background: showIndP ? '#2b2b43' : 'transparent', border:'1px solid #2b2b43', borderRadius:4, color:'#d1d4dc', marginLeft:2 }}
+          ><BarChart2 size={13}/> 指標</button>
+          {showIndP && (
+            <IndicatorPanel activeInds={activeInds} onToggle={toggleIndicator} onOpenSettings={openSettings} onClose={() => setShowIndP(false)}/>
+          )}
+        </div>
+
+        {/* Screenshot */}
+        <button onClick={handleScreenshot} title="截圖"
+          style={{ background:'transparent', border:'1px solid #2b2b43', cursor:'pointer', padding:'4px 6px', display:'flex', alignItems:'center', color:'#848e9c', borderRadius:4, marginLeft:4 }}
+          onMouseEnter={e => { (e.currentTarget as HTMLElement).style.color = '#d1d4dc' }}
+          onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = '#848e9c' }}
+        ><Camera size={13}/></button>
+
+        {/* Fullscreen */}
+        <button onClick={handleFullscreen} title="全螢幕"
+          style={{ background:'transparent', border:'1px solid #2b2b43', cursor:'pointer', padding:'4px 6px', display:'flex', alignItems:'center', color:'#848e9c', borderRadius:4, marginLeft:4 }}
+          onMouseEnter={e => { (e.currentTarget as HTMLElement).style.color = '#d1d4dc' }}
+          onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = '#848e9c' }}
+        >{isFullscreen ? <Minimize2 size={13}/> : <Maximize2 size={13}/>}</button>
       </div>
 
-      {/* ── ROW 2: Price bar ────────────────────────────────────────────── */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '3px 12px', borderBottom: '1px solid #2b2b43', flexShrink: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
-          <span style={{ fontSize: 22, fontFamily: 'monospace', fontWeight: 700, color: pctColor }}>
+      {/* ── PRICE BAR ───────────────────────────────────────────────────── */}
+      <div style={{ display:'flex', alignItems:'center', gap:12, padding:'3px 12px', borderBottom:'1px solid #2b2b43', flexShrink:0 }}>
+        <div style={{ display:'flex', alignItems:'baseline', gap:8 }}>
+          <span style={{ fontSize:22, fontFamily:'monospace', fontWeight:700, color: pctColor }}>
             {price != null ? fmtPrice(price) : '—'}
           </span>
           {ticker && (
-            <span style={{ fontSize: 12, color: pctColor }}>
+            <span style={{ fontSize:12, color: pctColor }}>
               {ticker.priceChange >= 0 ? '+' : ''}{fmtPrice(ticker.priceChange)}{'  '}
               ({ticker.priceChangePct >= 0 ? '+' : ''}{ticker.priceChangePct.toFixed(2)}%)
             </span>
           )}
         </div>
-        <div style={{ width: 1, height: 28, background: '#2b2b43' }} />
-        <div style={{ display: 'flex', gap: 16, fontSize: 11 }}>
-          {ticker ? (
-            <>
-              <div style={{ color: '#848e9c' }}>24h高 <span style={{ color: '#d1d4dc' }}>{fmtPrice(ticker.high24h)}</span></div>
-              <div style={{ color: '#848e9c' }}>24h低 <span style={{ color: '#d1d4dc' }}>{fmtPrice(ticker.low24h)}</span></div>
-              <div style={{ color: '#848e9c' }}>24h量 <span style={{ color: '#d1d4dc' }}>{fmtVol(ticker.volume24h)}</span></div>
-            </>
-          ) : (
-            <div style={{ color: '#444' }}>載入中...</div>
+        {ticker && (
+          <>
+            <div style={{ width:1, height:28, background:'#2b2b43' }}/>
+            <div style={{ display:'flex', gap:16, fontSize:11 }}>
+              <span style={{ color:'#848e9c' }}>24h高 <span style={{ color:'#26a69a' }}>{fmtPrice(ticker.high24h)}</span></span>
+              <span style={{ color:'#848e9c' }}>24h低 <span style={{ color:'#ef5350' }}>{fmtPrice(ticker.low24h)}</span></span>
+              <span style={{ color:'#848e9c' }}>24h量 <span style={{ color:'#d1d4dc' }}>{fmtVol(ticker.volume24h)}</span></span>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* ── MAIN AREA: left sidebar + chart ─────────────────────────────── */}
+      <div style={{ flex:1, minHeight:0, display:'flex', overflow:'hidden' }}>
+
+        {/* Left drawing toolbar */}
+        <div data-sidebar>
+          <DrawToolbar activeTool={activeTool} onSelect={handleToolSelect} onClear={handleClearOverlays}/>
+        </div>
+
+        {/* Chart container */}
+        <div style={{ flex:1, minWidth:0, position:'relative' }}>
+          {loading && (
+            <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center', background:'rgba(19,23,34,.7)', zIndex:10 }}>
+              <span style={{ color:'#f0b90b', fontSize:13 }}>載入中...</span>
+            </div>
           )}
-        </div>
-        <div style={{ flex: 1 }} />
-        <div style={{ fontSize: 11, color: '#848e9c', textAlign: 'right' }}>
-          {barTs && <span style={{ color: '#d1d4dc' }}>{fmtTs(barTs)}</span>}
-          {' '}({INTERVAL_LABELS[interval]})
-          {agoStr && <span style={{ marginLeft: 8 }}>更新 {agoStr}</span>}
-        </div>
-      </div>
-
-      {/* ── ROW 3: Interval + indicator tags + indicator button ────────── */}
-      {/*
-          Layout: [1分][3分]...[週] | [MA(5,10,20,60) ← hover→👁⚙✕] [EMA...] | spacer | [指標▼]
-
-          The IndicatorTag shows PLAIN GREY TEXT always. The 👁 ⚙ ✕ icons only
-          appear when the mouse is hovering over that specific tag element.
-
-          NOTE: The KLineChart canvas ALSO renders the indicator legend (MA5, MA10…)
-          inside the top-left of the candle pane via indicator.tooltip.showRule:'always'.
-          Those native canvas labels show values on crosshair hover. The React tag
-          in this toolbar row is a separate, complementary control strip.
-      */}
-      <div style={{ display: 'flex', alignItems: 'center', padding: '2px 8px', borderBottom: '1px solid #2b2b43', flexShrink: 0, gap: 2, minHeight: 28, flexWrap: 'nowrap', overflowX: 'auto' }}>
-
-        {/* Interval buttons */}
-        {INTERVALS.map(iv => {
-          const active = iv === interval
-          return (
-            <button
-              key={iv} onClick={() => switchPair(marketType, symbol, iv)}
-              style={{
-                padding: '2px 7px', fontSize: 11, borderRadius: 3, border: 'none', cursor: 'pointer',
-                fontWeight: active ? 700 : 400,
-                background: active ? '#f0b90b' : 'transparent',
-                color: active ? '#000' : '#848e9c',
-                flexShrink: 0,
-              }}
-            >
-              {INTERVAL_LABELS[iv]}
-            </button>
-          )
-        })}
-
-        {/* Divider before indicator tags */}
-        {mainInds.length > 0 && (
-          <div style={{ width: 1, height: 14, background: '#2b2b43', margin: '0 4px', flexShrink: 0 }} />
-        )}
-
-        {/* Main-pane indicator tags */}
-        {mainInds.map(ind => (
-          <IndicatorTag
-            key={ind.defName}
-            label={mainIndLabel(ind)}
-            visible={ind.visible}
-            onToggleVisible={() => toggleVisibility(ind.defName)}
-            onSettings={() => openSettings(ind.defName)}
-            onRemove={() => toggleIndicator(ind.defName)}
-          />
-        ))}
-
-        <div style={{ flex: 1 }} />
-
-        {/* Indicator panel button */}
-        <div style={{ position: 'relative', flexShrink: 0 }}>
-          <button
-            onClick={() => { setShowIndP(v => !v); setShowSymP(false) }}
-            style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '2px 8px', fontSize: 11, cursor: 'pointer', background: showIndP ? '#2b2b43' : 'transparent', border: '1px solid #2b2b43', borderRadius: 4, color: '#d1d4dc' }}
-          >
-            <BarChart2 size={13} /> 指標
-          </button>
-          {showIndP && (
-            <IndicatorPanel
-              activeInds={activeInds}
-              onToggle={toggleIndicator}
-              onOpenSettings={openSettings}
-              onClose={() => setShowIndP(false)}
-            />
+          {error && (
+            <div style={{ position:'absolute', top:8, left:'50%', transform:'translateX(-50%)', background:'#2d1a1a', border:'1px solid #ef5350', borderRadius:4, padding:'4px 12px', fontSize:12, color:'#ef5350', zIndex:10 }}>
+              {error}
+            </div>
           )}
+          {activeTool && (
+            <div style={{ position:'absolute', top:8, left:'50%', transform:'translateX(-50%)', background:'rgba(240,185,11,.15)', border:'1px solid #f0b90b66', borderRadius:4, padding:'3px 10px', fontSize:11, color:'#f0b90b', zIndex:10, pointerEvents:'none' }}>
+              繪圖模式：{DRAW_TOOLS.find(t => t.id === activeTool)?.label} — 點擊圖示再次點擊可取消
+            </div>
+          )}
+          <div id={CHART_ID} style={{ width:'100%', height:'100%' }}/>
         </div>
       </div>
 
-      {/* ── ROW 4: Chart canvas ─────────────────────────────────────────── */}
-      <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
-        {loading && (
-          <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(19,23,34,.7)', zIndex: 10 }}>
-            <span style={{ color: '#f0b90b', fontSize: 13 }}>載入中...</span>
-          </div>
-        )}
-        {error && (
-          <div style={{ position: 'absolute', top: 8, left: '50%', transform: 'translateX(-50%)', background: '#2d1a1a', border: '1px solid #ef5350', borderRadius: 4, padding: '4px 12px', fontSize: 12, color: '#ef5350', zIndex: 10 }}>
-            {error}
-          </div>
-        )}
-        <div id={CHART_ID} style={{ width: '100%', height: '100%' }} />
-      </div>
-
-      {/* ── Settings Modal ──────────────────────────────────────────────── */}
+      {/* ── Settings Modal ───────────────────────────────────────────────── */}
       {settingsName && settingsInd && settingsDef && (
-        <SettingsModal
-          indicator={settingsInd}
-          def={settingsDef}
-          onClose={() => setSettingsName(null)}
-          onApply={applySettings}
-        />
+        <SettingsModal indicator={settingsInd} def={settingsDef} onClose={() => setSettingsName(null)} onApply={applySettings}/>
       )}
 
       {/* Click-outside to close dropdowns */}
       {(showSymP || showIndP) && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 49 }} onClick={() => { setShowSymP(false); setShowIndP(false) }} />
+        <div style={{ position:'fixed', inset:0, zIndex:49 }} onClick={() => { setShowSymP(false); setShowIndP(false) }}/>
       )}
     </div>
   )
