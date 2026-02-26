@@ -19,7 +19,6 @@ import {
   Zap, AlertCircle, RefreshCw, Target
 } from 'lucide-react'
 import PageHeader from '../components/PageHeader'
-import { createChart, ColorType, IChartApi, ISeriesApi, CandlestickData, HistogramData } from 'lightweight-charts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -174,9 +173,7 @@ export default function OptimizePage() {
   const [showScript, setShowScript] = useState(true)
 
   // Chart refs
-  const equityChartRef = useRef<HTMLDivElement>(null)
-  const equityChartApi = useRef<IChartApi | null>(null)
-  const equitySeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const equityChartRef = useRef<HTMLCanvasElement>(null)
 
   // ---------------------------------------------------------------------------
   // Parse Pine Script inputs
@@ -341,51 +338,74 @@ export default function OptimizePage() {
   // ---------------------------------------------------------------------------
 
   useEffect(() => {
-    if (!equityChartRef.current) return
-
-    if (equityChartApi.current) {
-      equityChartApi.current.remove()
-      equityChartApi.current = null
-    }
-
-    const chart = createChart(equityChartRef.current, {
-      layout: { background: { type: ColorType.Solid, color: 'transparent' }, textColor: '#9ca3af' },
-      grid: { vertLines: { color: 'rgba(255,255,255,0.05)' }, horzLines: { color: 'rgba(255,255,255,0.05)' } },
-      width: equityChartRef.current.clientWidth,
-      height: 220,
-      rightPriceScale: { borderColor: 'rgba(255,255,255,0.1)' },
-      timeScale: { borderColor: 'rgba(255,255,255,0.1)', timeVisible: true },
-    })
-
-    const series = chart.addLineSeries({
-      color: '#8b5cf6',
-      lineWidth: 2,
-      priceFormat: { type: 'price', precision: 2 },
-    })
-
-    equityChartApi.current = chart
-    equitySeriesRef.current = series
-
-    const resizeObserver = new ResizeObserver(() => {
-      if (equityChartRef.current) {
-        chart.applyOptions({ width: equityChartRef.current.clientWidth })
-      }
-    })
-    resizeObserver.observe(equityChartRef.current)
-    return () => { resizeObserver.disconnect(); chart.remove() }
-  }, [])
-
-  useEffect(() => {
-    if (!selectedResult || !equitySeriesRef.current) return
+    const canvas = equityChartRef.current
+    if (!canvas || !selectedResult) return
     const eq = selectedResult.equity_curve
     if (!eq || eq.length === 0) return
 
-    const chartData = eq.map((val, i) => ({
-      time: Math.floor(Date.now() / 1000) - (eq.length - i) * 3600,
-      value: val,
-    }))
-    equitySeriesRef.current.setData(chartData as any)
-    equityChartApi.current?.timeScale().fitContent()
+    const dpr = window.devicePixelRatio || 1
+    const W = canvas.offsetWidth || 600
+    const H = 220
+    canvas.width = W * dpr
+    canvas.height = H * dpr
+    canvas.style.width = W + 'px'
+    canvas.style.height = H + 'px'
+
+    const ctx = canvas.getContext('2d')!
+    ctx.scale(dpr, dpr)
+    ctx.clearRect(0, 0, W, H)
+
+    const pad = { top: 16, right: 16, bottom: 28, left: 64 }
+    const chartW = W - pad.left - pad.right
+    const chartH = H - pad.top - pad.bottom
+
+    const minVal = Math.min(...eq)
+    const maxVal = Math.max(...eq)
+    const range = maxVal - minVal || 1
+
+    // Grid lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)'
+    ctx.lineWidth = 1
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.top + (chartH / 4) * i
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + chartW, y); ctx.stroke()
+    }
+
+    // Y axis labels
+    ctx.fillStyle = '#6b7280'
+    ctx.font = '11px monospace'
+    ctx.textAlign = 'right'
+    for (let i = 0; i <= 4; i++) {
+      const val = maxVal - (range / 4) * i
+      const y = pad.top + (chartH / 4) * i
+      ctx.fillText('$' + val.toFixed(0), pad.left - 6, y + 4)
+    }
+
+    // Line path
+    const toX = (i: number) => pad.left + (i / (eq.length - 1)) * chartW
+    const toY = (v: number) => pad.top + chartH - ((v - minVal) / range) * chartH
+
+    // Gradient fill
+    const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + chartH)
+    grad.addColorStop(0, 'rgba(139,92,246,0.25)')
+    grad.addColorStop(1, 'rgba(139,92,246,0)')
+    ctx.beginPath()
+    ctx.moveTo(toX(0), toY(eq[0]))
+    eq.forEach((v, i) => { if (i > 0) ctx.lineTo(toX(i), toY(v)) })
+    ctx.lineTo(toX(eq.length - 1), pad.top + chartH)
+    ctx.lineTo(toX(0), pad.top + chartH)
+    ctx.closePath()
+    ctx.fillStyle = grad
+    ctx.fill()
+
+    // Line stroke
+    ctx.beginPath()
+    ctx.strokeStyle = '#8b5cf6'
+    ctx.lineWidth = 2
+    ctx.lineJoin = 'round'
+    ctx.moveTo(toX(0), toY(eq[0]))
+    eq.forEach((v, i) => { if (i > 0) ctx.lineTo(toX(i), toY(v)) })
+    ctx.stroke()
   }, [selectedResult])
 
   // ---------------------------------------------------------------------------
@@ -773,7 +793,7 @@ export default function OptimizePage() {
             {/* Equity curve */}
             <div>
               <div className="text-xs text-gray-400 mb-2 font-medium">資產曲線</div>
-              <div ref={equityChartRef} className="w-full rounded-xl overflow-hidden" />
+              <canvas ref={equityChartRef} className="w-full rounded-xl" style={{ height: '220px', display: 'block' }} />
             </div>
 
             {/* Monthly PnL */}
