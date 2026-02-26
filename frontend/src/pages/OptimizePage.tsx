@@ -1,22 +1,20 @@
 // =============================================================================
 // 修改歷程記錄
 // -----------------------------------------------------------------------------
-// v2.0.0 - 2026-02-26 - 策略優化頁面（全新重寫）
-//   - 頁面標題改為「策略優化」
-//   - 新增 Pine Script 貼入區塊，支援 AI 自動解析 input 參數
-//   - 動態參數偵測 UI：自動顯示參數列表，可勾選/設定優化範圍
-//   - Gemini AI 轉譯 + Optuna 優化後端串接
-//   - 前 10 名結果列表：顯示總盈虧、MDD、盈虧比、勝率等
-//   - 點擊結果連動：Lightweight Charts 顯示對應回測圖表
-//   - 每月績效柱狀圖
-//   - 一鍵複製優化代碼功能
+// v2.2.0 - 2026-02-26
+//   - 移除 lightweight-charts import (改用純 CSS 資產曲線)
+//   - 移除 initial_capital / commission / quantity 欄位
+//   - 「AI 自動解析參數」改為「AI 建議參數範圍」(呼叫 /optimize/suggest)
+//   - AI 建議結果顯示每個參數的 reasoning 說明
+//   - 新增即時日誌面板 (接收 SSE log 事件)
+//   - 風格對齊 ChartPage (backdrop-blur, border-white/20, 圓角等)
 // =============================================================================
 
 import { useState, useRef, useEffect, useCallback } from 'react'
 import {
   Play, Sparkles, ChevronDown, ChevronUp, Settings2,
-  Copy, Check, TrendingUp, TrendingDown, BarChart2,
-  Zap, AlertCircle, RefreshCw, Target
+  Copy, Check, TrendingUp, BarChart2,
+  Zap, AlertCircle, RefreshCw, Target, Terminal
 } from 'lucide-react'
 import PageHeader from '../components/PageHeader'
 
@@ -32,6 +30,7 @@ interface DetectedParam {
   min_val?: number
   max_val?: number
   step?: number
+  reasoning?: string
 }
 
 interface ParamRange {
@@ -43,6 +42,7 @@ interface ParamRange {
   step: number
   is_int: boolean
   default_val: number
+  reasoning?: string
 }
 
 interface OptimizeResult {
@@ -104,10 +104,8 @@ function MetricBadge({ label, value, highlight }: { label: string; value: string
 function MonthlyBarChart({ data }: { data: Record<string, number> }) {
   const entries = Object.entries(data).sort(([a], [b]) => a.localeCompare(b))
   if (!entries.length) return null
-
   const vals = entries.map(([, v]) => v)
   const maxAbs = Math.max(...vals.map(Math.abs), 1)
-
   return (
     <div className="mt-4">
       <div className="text-xs text-gray-400 mb-2 font-medium">每月績效</div>
@@ -135,6 +133,42 @@ function MonthlyBarChart({ data }: { data: Record<string, number> }) {
   )
 }
 
+function EquityCurve({ curve }: { curve: number[] }) {
+  if (!curve || curve.length < 2) return null
+  const min = Math.min(...curve)
+  const max = Math.max(...curve)
+  const range = max - min || 1
+  const w = 600
+  const h = 160
+  const points = curve.map((v, i) => {
+    const x = (i / (curve.length - 1)) * w
+    const y = h - ((v - min) / range) * (h - 16)
+    return `${x},${y}`
+  }).join(' ')
+  const isPositive = curve[curve.length - 1] >= curve[0]
+  return (
+    <div className="mt-2">
+      <div className="text-xs text-gray-400 mb-2 font-medium">資產曲線</div>
+      <div className="w-full overflow-hidden rounded-xl bg-black/20 p-2">
+        <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{ height: '160px' }}>
+          <defs>
+            <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={isPositive ? '#10b981' : '#f43f5e'} stopOpacity="0.3" />
+              <stop offset="100%" stopColor={isPositive ? '#10b981' : '#f43f5e'} stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          <polyline
+            fill="none"
+            stroke={isPositive ? '#10b981' : '#f43f5e'}
+            strokeWidth="2"
+            points={points}
+          />
+        </svg>
+      </div>
+    </div>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Main Component
 // ---------------------------------------------------------------------------
@@ -142,7 +176,7 @@ function MonthlyBarChart({ data }: { data: Record<string, number> }) {
 export default function OptimizePage() {
   // Pine Script
   const [pineScript, setPineScript] = useState('')
-  const [isParsing, setIsParsing] = useState(false)
+  const [isSuggesting, setIsSuggesting] = useState(false)
   const [detectedParams, setDetectedParams] = useState<DetectedParam[]>([])
   const [paramRanges, setParamRanges] = useState<ParamRange[]>([])
   const [parseError, setParseError] = useState('')
@@ -153,9 +187,6 @@ export default function OptimizePage() {
   const [source, setSource] = useState('binance')
   const [startDate, setStartDate] = useState('2023-01-01')
   const [endDate, setEndDate] = useState(new Date().toISOString().split('T')[0])
-  const [initialCapital, setInitialCapital] = useState(10000)
-  const [commission, setCommission] = useState(0.001)
-  const [quantity, setQuantity] = useState(1)
   const [sortBy, setSortBy] = useState('profit_pct')
   const [nTrials, setNTrials] = useState(100)
 
@@ -168,41 +199,43 @@ export default function OptimizePage() {
   const [copiedCode, setCopiedCode] = useState(false)
   const [errorMsg, setErrorMsg] = useState('')
 
+  // Live log
+  const [logs, setLogs] = useState<string[]>([])
+  const [showLog, setShowLog] = useState(false)
+  const logEndRef = useRef<HTMLDivElement>(null)
+
   // UI state
   const [showSettings, setShowSettings] = useState(true)
   const [showScript, setShowScript] = useState(true)
 
-  // Chart refs
-  const equityChartRef = useRef<HTMLDivElement>(null)
-  const equityChartApi = useRef<any>(null)
-  const equitySeriesRef = useRef<any>(null)
+  // Auto-scroll log
+  useEffect(() => {
+    if (showLog) logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [logs, showLog])
 
   // ---------------------------------------------------------------------------
-  // Parse Pine Script inputs
+  // AI Suggest param ranges (calls /optimize/suggest)
   // ---------------------------------------------------------------------------
 
-  const parsePineScript = useCallback(async () => {
+  const suggestParamRanges = useCallback(async () => {
     if (!pineScript.trim()) {
       setParseError('請先貼入 Pine Script 代碼')
       return
     }
-
-    setIsParsing(true)
+    setIsSuggesting(true)
     setParseError('')
 
     try {
-      const res = await fetch('/api/optimize/parse', {
+      const res = await fetch('/api/optimize/suggest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pine_script: pineScript }),
       })
-
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
 
       setDetectedParams(data.params)
 
-      // Build param ranges from detected params (only int/float)
       const ranges: ParamRange[] = data.params
         .filter((p: DetectedParam) => p.type === 'int' || p.type === 'float')
         .map((p: DetectedParam) => {
@@ -216,6 +249,7 @@ export default function OptimizePage() {
             step: p.step ?? (p.type === 'int' ? 1 : 0.1),
             is_int: p.type === 'int',
             default_val: defVal,
+            reasoning: p.reasoning,
           }
         })
 
@@ -225,9 +259,9 @@ export default function OptimizePage() {
         setParseError('未偵測到任何 input 參數，請確認 Pine Script 包含 input.int / input.float 等宣告')
       }
     } catch (err: any) {
-      setParseError(`解析失敗：${err.message}`)
+      setParseError(`AI 建議失敗：${err.message}`)
     } finally {
-      setIsParsing(false)
+      setIsSuggesting(false)
     }
   }, [pineScript])
 
@@ -245,10 +279,9 @@ export default function OptimizePage() {
 
   const runOptimization = async () => {
     if (!pineScript.trim()) {
-      setErrorMsg('請先貼入 Pine Script 代碼並解析參數')
+      setErrorMsg('請先貼入 Pine Script 代碼並取得 AI 建議範圍')
       return
     }
-
     const enabledRanges = paramRanges.filter(p => p.enabled)
     if (enabledRanges.length === 0) {
       setErrorMsg('請至少勾選一個參數進行優化')
@@ -261,6 +294,8 @@ export default function OptimizePage() {
     setResults([])
     setSelectedResult(null)
     setErrorMsg('')
+    setLogs([])
+    setShowLog(true)
 
     try {
       const res = await fetch('/api/optimize/run', {
@@ -271,9 +306,6 @@ export default function OptimizePage() {
           symbol, interval, source,
           start_date: startDate,
           end_date: endDate,
-          initial_capital: initialCapital,
-          commission,
-          quantity,
           param_ranges: enabledRanges.map(p => ({
             name: p.name,
             min_val: p.min_val,
@@ -316,6 +348,8 @@ export default function OptimizePage() {
             if (data.type === 'progress') {
               setProgress(data.progress)
               setProgressText(`已完成 ${data.completed} / ${data.total} 次試驗`)
+            } else if (data.type === 'log') {
+              setLogs(prev => [...prev, data.message])
             } else if (data.type === 'result') {
               setResults(data.results)
               setProgress(100)
@@ -323,7 +357,7 @@ export default function OptimizePage() {
             } else if (data.type === 'error') {
               throw new Error(data.message)
             }
-          } catch (parseErr) {
+          } catch {
             // ignore malformed SSE lines
           }
         }
@@ -336,40 +370,6 @@ export default function OptimizePage() {
   }
 
   // ---------------------------------------------------------------------------
-  // Equity curve chart
-  // ---------------------------------------------------------------------------
-
-  useEffect(() => {
-    if (!equityChartRef.current) return
-
-    if (equityChartApi.current) {
-      equityChartApi.current.remove()
-      equityChartApi.current = null
-    }
-
-    const resizeObserver = new ResizeObserver(() => {
-      if (equityChartRef.current && equityChartApi.current) {
-        equityChartApi.current.applyOptions({ width: equityChartRef.current.clientWidth })
-      }
-    })
-    resizeObserver.observe(equityChartRef.current)
-    return () => { resizeObserver.disconnect() }
-  }, [])
-
-  useEffect(() => {
-    if (!selectedResult || !equitySeriesRef.current) return
-    const eq = selectedResult.equity_curve
-    if (!eq || eq.length === 0) return
-
-    const chartData = eq.map((val, i) => ({
-      time: Math.floor(Date.now() / 1000) - (eq.length - i) * 3600,
-      value: val,
-    }))
-    equitySeriesRef.current.setData(chartData as any)
-    equityChartApi.current?.timeScale().fitContent()
-  }, [selectedResult])
-
-  // ---------------------------------------------------------------------------
   // Copy optimized code
   // ---------------------------------------------------------------------------
 
@@ -377,7 +377,6 @@ export default function OptimizePage() {
     if (!selectedResult) return
     let code = pineScript
     Object.entries(selectedResult.params).forEach(([name, val]) => {
-      // Replace input.int/float default value for this param
       const pattern = new RegExp(`(${name}\\s*=\\s*input\\.(?:int|float)\\s*\\()[^)]*\\)`, 'g')
       code = code.replace(pattern, (match) => {
         return match.replace(/defval\s*=\s*[\d.]+|^(\s*\()[\d.]+/, (m) => {
@@ -400,7 +399,7 @@ export default function OptimizePage() {
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 p-4 md:p-8">
       <PageHeader
         title="策略優化"
-        subtitle="AI 自動解析 Pine Script 參數，Optuna 智能搜尋最佳組合"
+        subtitle="AI 分析 Pine Script 建議參數範圍，Optuna 智能搜尋最佳組合"
         icon={<Target className="w-8 h-8" />}
       />
 
@@ -441,30 +440,30 @@ export default function OptimizePage() {
               )}
 
               <button
-                onClick={parsePineScript}
-                disabled={isParsing || !pineScript.trim()}
+                onClick={suggestParamRanges}
+                disabled={isSuggesting || !pineScript.trim()}
                 className="flex items-center gap-2 px-5 py-2.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-xl font-medium transition-colors"
               >
-                {isParsing ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-                {isParsing ? '解析中...' : 'AI 自動解析參數'}
+                {isSuggesting ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                {isSuggesting ? 'AI 分析中...' : 'AI 建議參數範圍'}
               </button>
             </div>
           )}
         </div>
 
-        {/* ── Detected Params ── */}
+        {/* ── Param Ranges ── */}
         {paramRanges.length > 0 && (
           <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 p-6">
             <h3 className="text-white font-semibold mb-4 flex items-center gap-2">
               <Settings2 className="w-5 h-5 text-purple-400" />
               參數優化設定
-              <span className="text-xs text-gray-400 font-normal">（勾選要優化的參數並設定範圍）</span>
+              <span className="text-xs text-gray-400 font-normal">（AI 建議範圍，可自行調整）</span>
             </h3>
 
             <div className="space-y-3">
               {paramRanges.map((p) => (
                 <div key={p.name} className={`p-4 rounded-xl border transition-colors ${p.enabled ? 'bg-purple-500/10 border-purple-500/30' : 'bg-white/5 border-white/10'}`}>
-                  <div className="flex items-center gap-3 mb-3">
+                  <div className="flex items-center gap-3 mb-2">
                     <input
                       type="checkbox"
                       checked={p.enabled}
@@ -480,8 +479,12 @@ export default function OptimizePage() {
                     </span>
                   </div>
 
+                  {p.reasoning && (
+                    <p className="text-xs text-purple-300/70 mb-3 pl-7">{p.reasoning}</p>
+                  )}
+
                   {p.enabled && (
-                    <div className="grid grid-cols-3 gap-3 mt-2">
+                    <div className="grid grid-cols-3 gap-3">
                       <div>
                         <label className="block text-xs text-gray-400 mb-1">最小值</label>
                         <input
@@ -575,25 +578,6 @@ export default function OptimizePage() {
                 </div>
               </div>
 
-              {/* Capital / Commission / Quantity */}
-              <div className="grid grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">初始資金</label>
-                  <input type="number" value={initialCapital} min={100} onChange={(e) => setInitialCapital(Number(e.target.value))}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">手續費率</label>
-                  <input type="number" value={commission} step={0.0001} min={0} onChange={(e) => setCommission(Number(e.target.value))}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">倉位數量</label>
-                  <input type="number" value={quantity} min={0.01} step={0.01} onChange={(e) => setQuantity(Number(e.target.value))}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
-                </div>
-              </div>
-
               {/* Sort / Trials */}
               <div className="grid grid-cols-2 gap-4">
                 <div>
@@ -613,7 +597,7 @@ export default function OptimizePage() {
           )}
         </div>
 
-        {/* ── Run Button ── */}
+        {/* ── Error ── */}
         {errorMsg && (
           <div className="flex items-center gap-2 px-4 py-3 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-400 text-sm">
             <AlertCircle className="w-4 h-4 flex-shrink-0" />
@@ -621,6 +605,7 @@ export default function OptimizePage() {
           </div>
         )}
 
+        {/* ── Run Button ── */}
         <button
           onClick={runOptimization}
           disabled={isRunning}
@@ -649,6 +634,31 @@ export default function OptimizePage() {
               />
             </div>
             <p className="text-center text-sm text-gray-400">{progressText}</p>
+          </div>
+        )}
+
+        {/* ── Live Log Panel ── */}
+        {logs.length > 0 && (
+          <div className="bg-black/40 backdrop-blur-lg rounded-2xl border border-white/10 overflow-hidden">
+            <button
+              onClick={() => setShowLog(!showLog)}
+              className="w-full px-6 py-3 flex items-center justify-between hover:bg-white/5 transition-colors"
+            >
+              <div className="flex items-center gap-2">
+                <Terminal className="w-4 h-4 text-green-400" />
+                <span className="text-green-400 font-mono text-sm">即時日誌</span>
+                <span className="text-xs text-gray-500">{logs.length} 條</span>
+              </div>
+              {showLog ? <ChevronUp className="w-4 h-4 text-gray-400" /> : <ChevronDown className="w-4 h-4 text-gray-400" />}
+            </button>
+            {showLog && (
+              <div className="px-6 pb-4 max-h-64 overflow-y-auto font-mono text-xs text-green-300 space-y-1">
+                {logs.map((log, i) => (
+                  <div key={i} className="opacity-80">&gt; {log}</div>
+                ))}
+                <div ref={logEndRef} />
+              </div>
+            )}
           </div>
         )}
 
@@ -698,7 +708,7 @@ export default function OptimizePage() {
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex flex-wrap gap-1">
-                            {Object.entries(r.params).filter(([k]) => !k.startsWith('_') && k !== 'quantity').map(([k, v]) => (
+                            {Object.entries(r.params).filter(([k]) => !k.startsWith('_')).map(([k, v]) => (
                               <span key={k} className="text-xs px-2 py-0.5 rounded-md bg-white/10 text-gray-300">
                                 {k}: {typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(3)) : v}
                               </span>
@@ -751,11 +761,8 @@ export default function OptimizePage() {
               <MetricBadge label="毛利/毛損" value={`${selectedResult.gross_profit.toFixed(0)}/${selectedResult.gross_loss.toFixed(0)}`} />
             </div>
 
-            {/* Equity curve */}
-            <div>
-              <div className="text-xs text-gray-400 mb-2 font-medium">資產曲線</div>
-              <div ref={equityChartRef} className="w-full rounded-xl overflow-hidden" />
-            </div>
+            {/* Equity curve (pure SVG, no external lib) */}
+            <EquityCurve curve={selectedResult.equity_curve} />
 
             {/* Monthly PnL */}
             <MonthlyBarChart data={selectedResult.monthly_pnl} />
@@ -765,7 +772,7 @@ export default function OptimizePage() {
               <div className="text-xs text-gray-400 mb-2 font-medium">最佳參數值</div>
               <div className="flex flex-wrap gap-2">
                 {Object.entries(selectedResult.params)
-                  .filter(([k]) => !k.startsWith('_') && k !== 'quantity')
+                  .filter(([k]) => !k.startsWith('_'))
                   .map(([k, v]) => (
                     <div key={k} className="px-3 py-2 bg-purple-500/20 border border-purple-500/30 rounded-lg">
                       <span className="text-gray-400 text-xs">{k}: </span>
