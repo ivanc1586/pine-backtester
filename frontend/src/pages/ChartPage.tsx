@@ -1,5 +1,11 @@
 /**
- * ChartPage v9
+ * ChartPage v10
+ *
+ * Fix vs v9:
+ * - IndicatorTag: child span onMouseLeave now calls e.stopPropagation()
+ *   so parent's setHov(false) is NOT triggered when mouse moves onto icon buttons.
+ *   This means 👁 ⚙ ✕ stay visible while hovering over them.
+ * - IndicatorRow gear icon: same fix.
  *
  * Key changes vs v8:
  * 1. MA/EMA now support multiple periods (like Binance/TradingView).
@@ -249,27 +255,27 @@ function IndicatorTag({
           <span
             role="button" title={visible ? '隱藏' : '顯示'}
             onClick={e => { e.stopPropagation(); onToggleVisible() }}
+            onMouseLeave={e => e.stopPropagation()}
             style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: '0 1px' }}
-            onMouseEnter={e => (e.currentTarget.style.color = '#d1d4dc')}
-            onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
+            onMouseEnter={e => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.color = '#d1d4dc' }}
           >
             {visible ? <Eye size={10} /> : <EyeOff size={10} />}
           </span>
           <span
             role="button" title="設定"
             onClick={e => { e.stopPropagation(); onSettings() }}
+            onMouseLeave={e => e.stopPropagation()}
             style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: '0 1px' }}
-            onMouseEnter={e => (e.currentTarget.style.color = '#d1d4dc')}
-            onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
+            onMouseEnter={e => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.color = '#d1d4dc' }}
           >
             <Settings size={10} />
           </span>
           <span
             role="button" title="移除"
             onClick={e => { e.stopPropagation(); onRemove() }}
+            onMouseLeave={e => e.stopPropagation()}
             style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: '0 1px' }}
-            onMouseEnter={e => (e.currentTarget.style.color = '#ef5350')}
-            onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
+            onMouseEnter={e => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.color = '#ef5350' }}
           >
             <X size={10} />
           </span>
@@ -470,8 +476,8 @@ function IndicatorRow({ def, isOn, onToggle, onSettings }: {
           onClick={e => { e.stopPropagation(); onSettings() }}
           title="設定"
           style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: 1, flexShrink: 0 }}
-          onMouseEnter={e => ((e.currentTarget as HTMLElement).style.color = '#d1d4dc')}
-          onMouseLeave={e => ((e.currentTarget as HTMLElement).style.color = '#848e9c')}
+          onMouseEnter={e => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.color = '#d1d4dc' }}
+          onMouseLeave={e => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.color = '#848e9c' }}
         >
           <Settings size={12} />
         </span>
