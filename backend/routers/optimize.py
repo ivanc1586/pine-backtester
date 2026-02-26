@@ -2,40 +2,36 @@
 # 修改歷程記錄
 # -----------------------------------------------------------------------------
 # v1.0.0 - 2026-02-26 - 初始版本
-#   - 新增 Pine Script input 參數自動解析（支援 input.int / input.float / input.bool）
-#   - 新增 Gemini AI 轉譯層：將 Pine Script 邏輯動態轉為 Python 回測函式
-#   - 新增 Optuna 優化引擎（TPE sampler），支援 SSE 串流進度回報
+#   - Pine Script input 參數自動解析（input.int / input.float / input.bool）
+#   - Gemini AI 轉譯層：動態將 Pine Script 邏輯轉為 Python 回測函式
+#   - Optuna TPE sampler 優化引擎，SSE 串流進度回報
+#   - 技術指標對齊 TradingView：SMA/EMA/SMMA/ATR/RSI/MACD/BB
 #   - 防止偷看未來：ta.highest/lowest 強制使用 shift(1)
-#   - 正確處理 var 狀態與 strategy.position_size 跨 K 棒邏輯
-#   - 優化指標：profit_pct / win_rate / profit_factor / max_drawdown / sharpe
-#   - 結果含前 10 組合 + 每月績效 + 交易列表（供前端圖表使用）
+#   - var 狀態跨 K 線正確處理，position_size 追蹤
 # =============================================================================
 
-from __future__ import annotations
-
 import re
-import os
 import json
-import traceback
 import asyncio
-from typing import Any
-from datetime import datetime, timezone
+import logging
+import os
+from typing import AsyncGenerator
 
-import numpy as np
-import pandas as pd
 import optuna
-import httpx
+import pandas as pd
+import numpy as np
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(prefix="/optimize", tags=["optimize"])
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Schemas
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
 
 class ParamRange(BaseModel):
     name: str
@@ -50,7 +46,7 @@ class OptimizeRequest(BaseModel):
     interval: str = "1h"
     source: str = "binance"
     start_date: str = "2023-01-01"
-    end_date: str = ""
+    end_date: str = "2024-01-01"
     initial_capital: float = 10000.0
     commission: float = 0.001
     quantity: float = 1.0
@@ -62,335 +58,476 @@ class OptimizeRequest(BaseModel):
 class ParseRequest(BaseModel):
     pine_script: str
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. Pine Script input 解析
-# ─────────────────────────────────────────────────────────────────────────────
-
-INPUT_PATTERN = re.compile(
-    r'(\w+)\s*=\s*input\.(int|float|bool|string)\s*\('
-    r'\s*(?:title\s*=\s*["\']([^"\']*)["\'],\s*)?'
-    r'(?:defval\s*=\s*)?([^,\)\n]+)',
-    re.MULTILINE,
-)
+# ---------------------------------------------------------------------------
+# Pine Script input parser
+# ---------------------------------------------------------------------------
 
 def parse_pine_inputs(pine_script: str) -> list[dict]:
+    """Extract all input declarations from Pine Script."""
     params = []
     seen = set()
-    for m in INPUT_PATTERN.finditer(pine_script):
+
+    full_pattern = re.compile(
+        r'(\w+)\s*=\s*input\.(int|float|bool|string)\s*\(([^)]+)\)',
+        re.IGNORECASE
+    )
+
+    for m in full_pattern.finditer(pine_script):
         var_name = m.group(1)
-        kind     = m.group(2)
-        title    = m.group(3) or var_name
-        raw_def  = m.group(4).strip().strip('"\'')
-        if var_name in seen:
+        type_str = m.group(2).lower()
+        args_str = m.group(3)
+
+        if var_name in seen or var_name.startswith('//'):
             continue
         seen.add(var_name)
+
+        def get_named(key: str, default=None):
+            pat = re.compile(rf'{key}\s*=\s*([^,\)]+)', re.IGNORECASE)
+            found = pat.search(args_str)
+            if found:
+                return found.group(1).strip().strip('"\'')
+            return default
+
+        positional = re.split(r',(?![^(]*\))', args_str)
+        defval_raw = positional[0].strip() if positional else '0'
+
+        named_defval = get_named('defval')
+        if named_defval:
+            defval_raw = named_defval
+
+        title = get_named('title') or var_name
+        minval = get_named('minval')
+        maxval = get_named('maxval')
+        step_val = get_named('step')
+
         try:
-            if kind == "int":
-                default = int(float(raw_def))
-                params.append({"name": var_name, "title": title, "type": "int",
-                                "default": default, "min_val": max(1, default // 2),
-                                "max_val": default * 3, "step": 1})
-            elif kind == "float":
-                default = float(raw_def)
-                params.append({"name": var_name, "title": title, "type": "float",
-                                "default": default,
-                                "min_val": round(default * 0.3, 4),
-                                "max_val": round(default * 3.0, 4),
-                                "step": round(default * 0.1, 4)})
-            elif kind == "bool":
-                default = raw_def.lower() == "true"
-                params.append({"name": var_name, "title": title, "type": "bool",
-                                "default": default})
+            if type_str == 'bool':
+                defval = defval_raw.lower() == 'true'
+            elif type_str == 'int':
+                defval = int(float(defval_raw))
+            elif type_str == 'float':
+                defval = float(defval_raw)
+            else:
+                defval = defval_raw
         except Exception:
-            pass
+            defval = defval_raw
+
+        param = {
+            "name": var_name,
+            "title": title,
+            "type": type_str,
+            "default": defval,
+        }
+
+        if minval is not None:
+            try:
+                param["min_val"] = int(minval) if type_str == 'int' else float(minval)
+            except Exception:
+                pass
+        if maxval is not None:
+            try:
+                param["max_val"] = int(maxval) if type_str == 'int' else float(maxval)
+            except Exception:
+                pass
+        if step_val is not None:
+            try:
+                param["step"] = float(step_val)
+            except Exception:
+                pass
+
+        if 'min_val' not in param and type_str in ('int', 'float'):
+            try:
+                v = float(defval) if isinstance(defval, (int, float)) else 1.0
+                param['min_val'] = max(1, int(v * 0.5)) if type_str == 'int' else round(v * 0.5, 4)
+                param['max_val'] = int(v * 2.0) if type_str == 'int' else round(v * 2.0, 4)
+                param['step'] = 1 if type_str == 'int' else round(v * 0.1, 4)
+            except Exception:
+                pass
+
+        params.append(param)
+
     return params
 
+# ---------------------------------------------------------------------------
+# Gemini AI translator
+# ---------------------------------------------------------------------------
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Market data fetch
-# ─────────────────────────────────────────────────────────────────────────────
+GEMINI_SYSTEM_PROMPT = """You are an expert Pine Script to Python translator for backtesting.
+Convert the Pine Script strategy to a Python function with these STRICT rules:
 
-def _parse_date_ms(date_str: str) -> int:
-    return int(datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+1. Function signature: def run_strategy(df: pd.DataFrame, **params) -> dict
+2. df columns: open, high, low, close, volume (float64, datetime index)
+3. Use params dict for all input variables: params.get('fastLength', 9)
+4. NEVER use future data: ta.highest/lowest MUST use .shift(1) before rolling
+5. SMMA: first value = SMA, then smma = (smma_prev*(length-1) + close) / length
+6. ATR: Wilder smoothing (same formula as SMMA), NOT simple EMA
+7. var variables = persistent state across bars
+8. position tracking: integer flag (0=flat, 1=long, -1=short)
+9. Return: {"trades": [...], "equity_curve": [...]}
 
-async def fetch_candles(symbol: str, interval: str, start_date: str, end_date: str) -> list[dict]:
-    start_ms = _parse_date_ms(start_date)
-    end_ms   = _parse_date_ms(end_date) if end_date else int(datetime.now(timezone.utc).timestamp() * 1000)
-    interval_ms_map = {
-        "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
-        "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
-        "4h": 14_400_000, "6h": 21_600_000, "12h": 43_200_000,
-        "1d": 86_400_000, "1w": 604_800_000,
-    }
-    iv_ms = interval_ms_map.get(interval, 3_600_000)
-    limit = min(1000, (end_ms - start_ms) // iv_ms + 1)
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol.upper(), "interval": interval,
-                    "startTime": start_ms, "endTime": end_ms, "limit": limit},
-        )
-        r.raise_for_status()
-        rows = r.json()
-    return [{"timestamp": int(row[0]), "open": float(row[1]), "high": float(row[2]),
-             "low": float(row[3]), "close": float(row[4]), "volume": float(row[5])}
-            for row in rows]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Gemini AI 轉譯層
-# ─────────────────────────────────────────────────────────────────────────────
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL   = "gemini-2.0-flash"
-GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-
-SYSTEM_PROMPT = """You are an expert Pine Script to Python converter for backtesting.
-Convert the given Pine Script strategy to a Python function.
-
-STRICT RULES:
-1. Function signature: def run_strategy(df: pd.DataFrame, **params) -> list[dict]
-2. df columns: timestamp(ms int), open, high, low, close, volume (all float except timestamp)
-3. Return list of trade dicts: {entry_time, exit_time, entry_price, exit_price, direction, pnl_pct}
-4. direction: "long" or "short"
-5. NO lookahead bias: use .shift(1) for previous bar values
-6. ta.highest(src, n) => df[src].shift(1).rolling(n).max()
-7. ta.lowest(src, n)  => df[src].shift(1).rolling(n).min()
-8. EMA: close.ewm(span=length, adjust=False).mean()
-9. SMMA/RMA: ewm(alpha=1/length, adjust=False).mean()
-10. ATR: tr = max(high-low, |high-prev_close|, |low-prev_close|); atr = tr.ewm(alpha=1/length, adjust=False).mean()
-11. RSI: use Wilder smoothing ewm(alpha=1/length, adjust=False)
-12. var variables: use scalar Python variables updated in loop
-13. Track position with: in_position bool + entry_price + entry_time
-14. Commission is applied by backtester, do NOT deduct in run_strategy
-15. Only import: pandas as pd, numpy as np
-16. Return ONLY the Python function code, no markdown fences, no explanation.
-17. Handle NaN: skip bars where indicators are NaN
-"""
-
-async def translate_pine_to_python(pine_script: str, param_names: list[str]) -> str:
-    if not GEMINI_API_KEY:
-        return _fallback_strategy(param_names)
-
-    user_prompt = (
-        f"Pine Script to convert:\n```pine\n{pine_script}\n```\n\n"
-        f"Parameter names passed as **params: {param_names}\n\n"
-        "Generate run_strategy(df, **params) Python function. No markdown fences."
-    )
-    payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"parts": [{"text": user_prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8192},
-    }
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=payload)
-        r.raise_for_status()
-        data = r.json()
-    code = data["candidates"][0]["content"]["parts"][0]["text"]
-    code = re.sub(r"^```(?:python)?\n?", "", code.strip())
-    code = re.sub(r"\n?```$", "", code.strip())
-    return code
-
-
-def _fallback_strategy(param_names: list[str]) -> str:
-    return (
-        "def run_strategy(df, **params):\n"
-        "    fast = int(params.get('fastLength', params.get('fast_length', 10)))\n"
-        "    slow = int(params.get('slowLength', params.get('slow_length', 30)))\n"
-        "    df = df.copy()\n"
-        "    df['ema_fast'] = df['close'].ewm(span=fast, adjust=False).mean()\n"
-        "    df['ema_slow'] = df['close'].ewm(span=slow, adjust=False).mean()\n"
-        "    trades, in_pos, ep, et = [], False, 0.0, 0\n"
-        "    for i in range(slow + 1, len(df)):\n"
-        "        pf = df['ema_fast'].iloc[i-1]; ps = df['ema_slow'].iloc[i-1]\n"
-        "        cf = df['ema_fast'].iloc[i];  cs = df['ema_slow'].iloc[i]\n"
-        "        price = df['close'].iloc[i];  ts = int(df['timestamp'].iloc[i])\n"
-        "        if not in_pos and pf <= ps and cf > cs:\n"
-        "            in_pos, ep, et = True, price, ts\n"
-        "        elif in_pos and pf >= ps and cf < cs:\n"
-        "            trades.append({'entry_time': et, 'exit_time': ts,\n"
-        "                           'entry_price': ep, 'exit_price': price,\n"
-        "                           'direction': 'long', 'pnl_pct': (price-ep)/ep*100})\n"
-        "            in_pos = False\n"
-        "    return trades\n"
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Backtest executor
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _compile_strategy(python_code: str):
-    ns: dict[str, Any] = {"pd": pd, "np": np}
-    exec(compile(python_code, "<ai_strategy>", "exec"), ns)
-    fn = ns.get("run_strategy")
-    if fn is None:
-        raise ValueError("AI output missing run_strategy function")
-    return fn
-
-
-def run_backtest(candles, strategy_fn, params, initial_capital=10000.0,
-                 commission=0.001, quantity=1.0) -> dict:
-    df = pd.DataFrame(candles)
-    try:
-        trades = strategy_fn(df.copy(), **params)
-    except Exception as e:
-        return {"error": str(e), "trades": [], "profit_pct": -9999,
-                "win_rate": 0, "profit_factor": 0, "max_drawdown": 0,
-                "total_trades": 0, "sharpe": 0, "monthly": [], "params": params}
-
-    if not trades:
-        return {"trades": [], "equity_curve": [], "profit_pct": 0, "win_rate": 0,
-                "profit_factor": 0, "max_drawdown": 0, "total_trades": 0,
-                "sharpe": 0, "final_equity": initial_capital, "monthly": [], "params": params}
-
-    equity = initial_capital
-    equities = [equity]
-    pnl_list = []
-    wins = losses = 0
-    gross_profit = gross_loss = 0.0
-    enriched = []
-
-    for t in trades:
-        net_pnl_pct = t.get("pnl_pct", 0.0) - commission * 2 * 100
-        pnl_dollar  = equity * net_pnl_pct / 100
-        equity     += pnl_dollar
-        equities.append(equity)
-        pnl_list.append(net_pnl_pct)
-        if net_pnl_pct > 0:
-            wins += 1; gross_profit += pnl_dollar
-        else:
-            losses += 1; gross_loss += abs(pnl_dollar)
-        enriched.append({**t, "net_pnl_pct": round(net_pnl_pct, 4),
-                          "equity_after": round(equity, 2)})
-
-    total   = len(trades)
-    wr      = wins / total * 100 if total else 0
-    pf      = gross_profit / gross_loss if gross_loss > 0 else 999.0
-    pp      = (equity - initial_capital) / initial_capital * 100
-    eq_arr  = np.array(equities)
-    peaks   = np.maximum.accumulate(eq_arr)
-    mdd     = float(np.max((peaks - eq_arr) / peaks * 100))
-    arr     = np.array(pnl_list)
-    sharpe  = float(arr.mean() / (arr.std() + 1e-9) * np.sqrt(252)) if len(arr) > 1 else 0.0
-    monthly = _monthly_breakdown(enriched)
-    eq_curve = [{"time": int(t["exit_time"]), "value": round(t["equity_after"], 2)}
-                for t in enriched]
-
-    return {"trades": enriched, "equity_curve": eq_curve,
-            "profit_pct": round(pp, 4), "win_rate": round(wr, 2),
-            "profit_factor": round(pf, 4), "max_drawdown": round(mdd, 4),
-            "total_trades": total, "sharpe": round(sharpe, 4),
-            "final_equity": round(equity, 2), "monthly": monthly, "params": params}
-
-
-def _monthly_breakdown(trades: list[dict]) -> list[dict]:
-    monthly: dict[str, float] = {}
-    for t in trades:
-        try:
-            ts  = int(t["exit_time"]) // 1000
-            key = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m")
-            monthly[key] = monthly.get(key, 0.0) + t.get("net_pnl_pct", 0.0)
-        except Exception:
-            pass
-    return [{"month": k, "pnl_pct": round(v, 4)} for k, v in sorted(monthly.items())]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. API Endpoints
-# ─────────────────────────────────────────────────────────────────────────────
-
-SORT_REVERSE = {
-    "profit_pct": True, "win_rate": True, "profit_factor": True,
-    "max_drawdown": False, "sharpe": True,
+Each trade dict:
+{
+  "entry_time": str, "exit_time": str,
+  "entry_price": float, "exit_price": float,
+  "side": "long"/"short",
+  "pnl": float, "pnl_pct": float
 }
 
+equity_curve: list of portfolio value at each bar (same length as df)
 
-@router.post("/parse-inputs")
+Technical indicators:
+- SMA(src, n): src.rolling(n).mean()
+- EMA(src, n): src.ewm(span=n, adjust=False).mean()
+- ta.highest(src, n): src.shift(1).rolling(n).max()
+- ta.lowest(src, n): src.shift(1).rolling(n).min()
+- RSI: Wilder smoothed RS
+- ATR: Wilder smoothed true range
+
+Output ONLY the Python function, no markdown."""
+
+async def translate_with_gemini(pine_script: str) -> str:
+    """Use Gemini Flash (free tier) to translate Pine Script to Python."""
+    try:
+        import google.generativeai as genai
+
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+        if not api_key:
+            logger.warning("GEMINI_API_KEY not set, using fallback strategy")
+            return _get_fallback_strategy()
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            system_instruction=GEMINI_SYSTEM_PROMPT
+        )
+
+        prompt = f"Translate this Pine Script strategy to Python:\n\n```pinescript\n{pine_script}\n```\n\nReturn ONLY the Python function."
+        response = model.generate_content(prompt)
+        code = response.text.strip()
+
+        # Strip markdown fences
+        code = re.sub(r'^```python\s*\n?', '', code, flags=re.MULTILINE)
+        code = re.sub(r'^```\s*\n?', '', code, flags=re.MULTILINE)
+        code = re.sub(r'\n?```$', '', code.strip())
+
+        return code.strip()
+
+    except Exception as e:
+        logger.warning(f"Gemini translation failed: {e}, using fallback")
+        return _get_fallback_strategy()
+
+
+def _get_fallback_strategy() -> str:
+    return '''def run_strategy(df: pd.DataFrame, **params) -> dict:
+    fast = int(params.get("fastLength", params.get("fast_length", 9)))
+    slow = int(params.get("slowLength", params.get("slow_length", 21)))
+    qty = float(params.get("quantity", 1.0))
+    commission = float(params.get("_commission", 0.001))
+    capital = float(params.get("_capital", 10000.0))
+
+    close = df["close"]
+    fast_ema = close.ewm(span=fast, adjust=False).mean()
+    slow_ema = close.ewm(span=slow, adjust=False).mean()
+
+    position = 0
+    entry_price = 0.0
+    entry_time = None
+    trades = []
+    equity = capital
+    equity_curve = []
+
+    for i in range(len(df)):
+        if i < slow:
+            equity_curve.append(equity)
+            continue
+
+        prev_f = fast_ema.iloc[i - 1]
+        prev_s = slow_ema.iloc[i - 1]
+        curr_f = fast_ema.iloc[i]
+        curr_s = slow_ema.iloc[i]
+        price = close.iloc[i]
+        ts = str(df.index[i])
+
+        if prev_f <= prev_s and curr_f > curr_s and position == 0:
+            position = 1
+            entry_price = price
+            entry_time = ts
+
+        elif prev_f >= prev_s and curr_f < curr_s and position == 1:
+            pnl = (price - entry_price) * qty - (entry_price + price) * qty * commission
+            equity += pnl
+            trades.append({
+                "entry_time": entry_time, "exit_time": ts,
+                "entry_price": round(entry_price, 4), "exit_price": round(price, 4),
+                "side": "long", "pnl": round(pnl, 4),
+                "pnl_pct": round((price - entry_price) / entry_price * 100, 4)
+            })
+            position = 0
+
+        equity_curve.append(equity)
+
+    if position != 0 and entry_price > 0:
+        price = close.iloc[-1]
+        ts = str(df.index[-1])
+        mult = 1 if position == 1 else -1
+        pnl = (price - entry_price) * qty * mult - (entry_price + price) * qty * commission
+        equity += pnl
+        trades.append({
+            "entry_time": entry_time, "exit_time": ts,
+            "entry_price": round(entry_price, 4), "exit_price": round(price, 4),
+            "side": "long" if position == 1 else "short", "pnl": round(pnl, 4),
+            "pnl_pct": round((price - entry_price) / entry_price * 100 * mult, 4)
+        })
+
+    return {"trades": trades, "equity_curve": equity_curve}
+'''
+
+# ---------------------------------------------------------------------------
+# Metrics calculator
+# ---------------------------------------------------------------------------
+
+def calc_metrics(result: dict, initial_capital: float) -> dict:
+    trades = result.get("trades", [])
+    equity_curve = result.get("equity_curve", [])
+
+    if not trades:
+        return {
+            "total_trades": 0, "win_rate": 0.0, "profit_pct": 0.0,
+            "profit_factor": 0.0, "max_drawdown": 0.0, "sharpe_ratio": 0.0,
+            "final_equity": initial_capital, "gross_profit": 0.0,
+            "gross_loss": 0.0, "monthly_pnl": {}, "trades": [], "equity_curve": []
+        }
+
+    pnls = [t["pnl"] for t in trades]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+
+    win_rate = len(wins) / len(pnls) * 100
+    gross_profit = sum(wins) if wins else 0.0
+    gross_loss = abs(sum(losses)) if losses else 1e-9
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0.0
+
+    if equity_curve:
+        eq = np.array(equity_curve, dtype=float)
+        peak = np.maximum.accumulate(eq)
+        dd = (peak - eq) / np.where(peak == 0, 1, peak) * 100
+        max_drawdown = float(dd.max())
+        final_equity = float(equity_curve[-1])
+    else:
+        max_drawdown = 0.0
+        final_equity = initial_capital + sum(pnls)
+
+    profit_pct = (final_equity - initial_capital) / initial_capital * 100
+
+    sharpe = 0.0
+    if len(equity_curve) > 1:
+        eq = np.array(equity_curve, dtype=float)
+        rets = np.diff(eq) / np.where(eq[:-1] == 0, 1, eq[:-1])
+        if rets.std() > 0:
+            sharpe = float(rets.mean() / rets.std() * np.sqrt(252))
+
+    monthly = {}
+    for t in trades:
+        try:
+            month = str(t.get("exit_time", ""))[:7]
+            if month:
+                monthly[month] = round(monthly.get(month, 0) + t["pnl"], 4)
+        except Exception:
+            pass
+
+    return {
+        "total_trades": len(trades),
+        "win_rate": round(win_rate, 2),
+        "profit_pct": round(profit_pct, 2),
+        "profit_factor": round(profit_factor, 4),
+        "max_drawdown": round(max_drawdown, 2),
+        "sharpe_ratio": round(sharpe, 4),
+        "final_equity": round(final_equity, 2),
+        "gross_profit": round(gross_profit, 2),
+        "gross_loss": round(gross_loss, 2),
+        "monthly_pnl": monthly,
+        "trades": trades,
+        "equity_curve": equity_curve,
+    }
+
+# ---------------------------------------------------------------------------
+# Market data fetcher
+# ---------------------------------------------------------------------------
+
+async def fetch_candles(symbol: str, interval: str, source: str, start_date: str, end_date: str) -> pd.DataFrame:
+    try:
+        from routers.market import get_candles_df
+        df = await get_candles_df(symbol, interval, source, start_date, end_date)
+        if df is not None and len(df) > 0:
+            return df
+    except Exception:
+        pass
+
+    import httpx
+    url = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol": symbol.upper(), "interval": interval,
+        "startTime": int(pd.Timestamp(start_date).timestamp() * 1000),
+        "endTime": int(pd.Timestamp(end_date).timestamp() * 1000),
+        "limit": 1000,
+    }
+    all_candles = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+            if not data:
+                break
+            all_candles.extend(data)
+            if len(data) < 1000:
+                break
+            params["startTime"] = data[-1][0] + 1
+
+    if not all_candles:
+        raise HTTPException(status_code=404, detail="No candle data found")
+
+    df = pd.DataFrame(all_candles, columns=[
+        "timestamp", "open", "high", "low", "close", "volume",
+        "close_time", "quote_vol", "trades", "taker_base", "taker_quote", "ignore"
+    ])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df = df.set_index("timestamp")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    return df[["open", "high", "low", "close", "volume"]]
+
+# ---------------------------------------------------------------------------
+# Strategy executor
+# ---------------------------------------------------------------------------
+
+def execute_strategy(strategy_code: str, df: pd.DataFrame, params: dict) -> dict:
+    namespace = {"pd": pd, "np": np, "df": df}
+    try:
+        exec(compile(strategy_code, "<strategy>", "exec"), namespace)
+    except SyntaxError as e:
+        raise ValueError(f"Strategy syntax error: {e}")
+
+    run_fn = namespace.get("run_strategy")
+    if not run_fn:
+        raise ValueError("run_strategy function not found in translated code")
+    return run_fn(df, **params)
+
+# ---------------------------------------------------------------------------
+# Optuna optimization
+# ---------------------------------------------------------------------------
+
+async def run_optuna_optimization(
+    strategy_code: str, df: pd.DataFrame,
+    param_ranges: list[ParamRange], initial_capital: float,
+    commission: float, quantity: float,
+    sort_by: str, n_trials: int, top_n: int
+) -> AsyncGenerator[str, None]:
+
+    results_store = []
+    completed = [0]
+
+    minimize_metrics = {"max_drawdown"}
+    direction = "minimize" if sort_by in minimize_metrics else "maximize"
+
+    def objective(trial: optuna.Trial) -> float:
+        trial_params = {}
+        for pr in param_ranges:
+            if pr.is_int:
+                val = trial.suggest_int(pr.name, int(pr.min_val), int(pr.max_val), step=max(1, int(pr.step)))
+            else:
+                val = trial.suggest_float(pr.name, pr.min_val, pr.max_val, step=pr.step if pr.step > 0 else None)
+            trial_params[pr.name] = val
+
+        trial_params.update({"_commission": commission, "_capital": initial_capital, "quantity": quantity})
+
+        try:
+            raw = execute_strategy(strategy_code, df.copy(), trial_params)
+            metrics = calc_metrics(raw, initial_capital)
+        except Exception as e:
+            logger.debug(f"Trial failed: {e}")
+            return float("inf") if direction == "minimize" else float("-inf")
+
+        result_entry = {
+            "params": {k: v for k, v in trial_params.items() if not k.startswith("_")},
+            **metrics,
+        }
+        results_store.append(result_entry)
+        completed[0] += 1
+        return metrics.get(sort_by, 0.0)
+
+    loop = asyncio.get_event_loop()
+    study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=42))
+
+    chunk_size = max(1, n_trials // 20)
+    remaining = n_trials
+
+    while remaining > 0:
+        batch = min(chunk_size, remaining)
+        await loop.run_in_executor(None, lambda b=batch: study.optimize(objective, n_trials=b, show_progress_bar=False))
+        remaining -= batch
+        progress = min(99, int((completed[0] / n_trials) * 100))
+        yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'completed': completed[0], 'total': n_trials})}\n\n"
+
+    reverse = sort_by not in minimize_metrics
+    sorted_results = sorted(results_store, key=lambda x: x.get(sort_by, 0), reverse=reverse)
+    top_results = sorted_results[:top_n]
+
+    summary_results = []
+    for i, r in enumerate(top_results):
+        entry = {k: v for k, v in r.items()}
+        entry["rank"] = i + 1
+        summary_results.append(entry)
+
+    yield f"data: {json.dumps({'type': 'result', 'results': summary_results})}\n\n"
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+# ---------------------------------------------------------------------------
+# API Endpoints
+# ---------------------------------------------------------------------------
+
+@router.post("/parse")
 async def parse_inputs(req: ParseRequest):
-    """Auto-detect all input() parameters from Pine Script."""
-    try:
-        return {"params": parse_pine_inputs(req.pine_script)}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/translate")
-async def translate_endpoint(req: ParseRequest):
-    """Translate Pine Script to Python via Gemini (preview)."""
-    try:
-        names = [p["name"] for p in parse_pine_inputs(req.pine_script)]
-        code  = await translate_pine_to_python(req.pine_script, names)
-        return {"python_code": code}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Auto-detect all input parameters from Pine Script."""
+    params = parse_pine_inputs(req.pine_script)
+    return {"params": params, "count": len(params)}
 
 
 @router.post("/run")
-async def optimize_run(req: OptimizeRequest):
-    """Full pipeline with SSE streaming: fetch -> translate -> Optuna optimize."""
+async def run_optimization(req: OptimizeRequest):
+    """Run Optuna optimization with SSE progress streaming."""
+    try:
+        df = await fetch_candles(req.symbol, req.interval, req.source, req.start_date, req.end_date)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch data: {e}")
 
-    async def stream():
+    if len(df) < 50:
+        raise HTTPException(status_code=400, detail="Insufficient data (< 50 bars)")
+
+    try:
+        strategy_code = await translate_with_gemini(req.pine_script)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
+
+    try:
+        compile(strategy_code, "<strategy>", "exec")
+    except SyntaxError as e:
+        raise HTTPException(status_code=422, detail=f"Generated code syntax error: {e}")
+
+    async def event_stream():
         try:
-            yield f"data: {json.dumps({'type':'status','message':'正在獲取市場數據...'})}\'+'\\n\\n'
-            end = req.end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            candles = await fetch_candles(req.symbol, req.interval, req.start_date, end)
-            if not candles:
-                yield f"data: {json.dumps({'type':'error','message':'無法獲取市場數據'})}\'+'\\n\\n'
-                return
-
-            yield f"data: {json.dumps({'type':'status','message':f'獲取 {len(candles)} 根 K 棒，翻譯策略中...'})}\'+'\\n\\n'
-            param_names = [pr.name for pr in req.param_ranges]
-            try:
-                python_code = await translate_pine_to_python(req.pine_script, param_names)
-                strategy_fn = _compile_strategy(python_code)
-            except Exception as e:
-                yield f"data: {json.dumps({'type':'error','message':f'策略轉譯失敗: {e}'})}\'+'\\n\\n'
-                return
-
-            yield f"data: {json.dumps({'type':'status','message':f'轉譯完成，開始 Optuna 優化 ({req.n_trials} 次試驗)...'})}\'+'\\n\\n'
-
-            results: list[dict] = []
-            sort_by = req.sort_by
-            reverse = SORT_REVERSE.get(sort_by, True)
-
-            def objective(trial: optuna.Trial) -> float:
-                p: dict[str, Any] = {}
-                for pr in req.param_ranges:
-                    if pr.is_int:
-                        p[pr.name] = trial.suggest_int(pr.name, int(pr.min_val), int(pr.max_val), step=max(1, int(pr.step)))
-                    else:
-                        p[pr.name] = trial.suggest_float(pr.name, pr.min_val, pr.max_val, step=pr.step)
-                res = run_backtest(candles, strategy_fn, p, req.initial_capital, req.commission, req.quantity)
-                if "error" in res:
-                    return -9999.0
-                results.append(res)
-                m = res.get(sort_by, 0.0)
-                return m if reverse else -m
-
-            loop  = asyncio.get_event_loop()
-            study = optuna.create_study(direction="maximize",
-                                         sampler=optuna.samplers.TPESampler(seed=42))
-            chunk  = max(1, req.n_trials // 10)
-
-            for step in range(0, req.n_trials, chunk):
-                n = min(chunk, req.n_trials - step)
-                await loop.run_in_executor(None, lambda n=n: study.optimize(objective, n_trials=n, show_progress_bar=False))
-                done = min(step + chunk, req.n_trials)
-                pct  = round(done / req.n_trials * 100)
-                yield f"data: {json.dumps({'type':'progress','progress':pct,'done':done,'total':req.n_trials})}\'+'\\n\\n'
-
-            key_fn = (lambda r: r.get(sort_by, 0.0)) if reverse else (lambda r: -r.get(sort_by, 0.0))
-            results.sort(key=key_fn, reverse=True)
-            top = results[:req.top_n]
-            for i, r in enumerate(top):
-                r["rank"] = i + 1
-
-            yield f"data: {json.dumps({'type':'complete','results':top,'total_trials':req.n_trials,'python_code':python_code})}\'+'\\n\\n'
-
+            async for chunk in run_optuna_optimization(
+                strategy_code=strategy_code, df=df,
+                param_ranges=req.param_ranges, initial_capital=req.initial_capital,
+                commission=req.commission, quantity=req.quantity,
+                sort_by=req.sort_by, n_trials=req.n_trials, top_n=req.top_n,
+            ):
+                yield chunk
         except Exception as e:
-            yield f"data: {json.dumps({'type':'error','message':str(e),'detail':traceback.format_exc()})}\'+'\\n\\n'
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
-    return StreamingResponse(stream(), media_type="text/event-stream",
-                             headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
