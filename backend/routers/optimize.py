@@ -21,6 +21,7 @@ import logging
 import os
 from typing import AsyncGenerator
 
+import httpx
 import optuna
 import pandas as pd
 import numpy as np
@@ -31,7 +32,7 @@ from pydantic import BaseModel
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["optimize"])
+router = APIRouter(prefix="/optimize", tags=["optimize"])
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -92,7 +93,7 @@ def parse_pine_inputs(pine_script: str) -> list[dict]:
             pat = re.compile(rf'{key}\s*=\s*([^,\)]+)', re.IGNORECASE)
             found = pat.search(args_str)
             if found:
-                return found.group(1).strip().strip('"\'')
+                return found.group(1).strip().strip('"\')
             return default
 
         positional = re.split(r',(?![^(]*\))', args_str)
@@ -466,48 +467,94 @@ def calc_metrics(result: dict, initial_capital: float) -> dict:
 # Market data fetcher
 # ---------------------------------------------------------------------------
 
-async def fetch_candles(symbol: str, interval: str, source: str, start_date: str, end_date: str) -> pd.DataFrame:
+KRAKEN_PAIR_MAP = {
+    "BTCUSDT": "XBTUSD", "ETHUSDT": "ETHUSD", "SOLUSDT": "SOLUSD",
+    "BNBUSDT": "BNBUSD", "XRPUSDT": "XRPUSD", "DOGEUSDT": "XDGUSD",
+}
+
+INTERVAL_TO_MINUTES = {
+    "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+    "1h": 60, "4h": 240, "1d": 1440, "1w": 10080,
+}
+
+async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Fetch OHLCV candles using Binance.US first, then Kraken as fallback."""
+
+    # --- Binance.US (no region block) ---
+    async def _try_binance_us() -> pd.DataFrame:
+        url = "https://api.binance.us/api/v3/klines"
+        all_candles = []
+        current_start = start_ms
+        async with httpx.AsyncClient(timeout=30) as client:
+            while current_start < end_ms:
+                params = {
+                    "symbol": symbol,
+                    "interval": interval,
+                    "startTime": current_start,
+                    "endTime": end_ms,
+                    "limit": 1000,
+                }
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+                if not data:
+                    break
+                all_candles.extend(data)
+                last_ts = data[-1][0]
+                if last_ts <= current_start:
+                    break
+                current_start = last_ts + 1
+        if not all_candles:
+            raise ValueError("No candles from Binance.US")
+        df = pd.DataFrame(all_candles, columns=[
+            "timestamp","open","high","low","close","volume",
+            "close_time","quote_volume","trades","taker_buy_base",
+            "taker_buy_quote","ignore"
+        ])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        for col in ["open","high","low","close","volume"]:
+            df[col] = df[col].astype(float)
+        return df.set_index("timestamp")
+
+    # --- Kraken fallback ---
+    async def _try_kraken() -> pd.DataFrame:
+        kraken_pair = KRAKEN_PAIR_MAP.get(symbol)
+        if not kraken_pair:
+            raise ValueError(f"No Kraken pair for {symbol}")
+        minutes = INTERVAL_TO_MINUTES.get(interval, 60)
+        url = "https://api.kraken.com/0/public/OHLC"
+        since = start_ms // 1000
+        all_candles = []
+        async with httpx.AsyncClient(timeout=30) as client:
+            while True:
+                params = {"pair": kraken_pair, "interval": minutes, "since": since}
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+                if data.get("error"):
+                    raise ValueError(f"Kraken error: {data['error']}")
+                result = data.get("result", {})
+                candles = result.get(kraken_pair) or result.get(list(result.keys())[0], [])
+                new_candles = [c for c in candles if c[0] * 1000 <= end_ms]
+                all_candles.extend(new_candles)
+                last_time = result.get("last", 0)
+                if not new_candles or last_time * 1000 >= end_ms:
+                    break
+                since = last_time
+        if not all_candles:
+            raise ValueError("No candles from Kraken")
+        df = pd.DataFrame(all_candles, columns=["timestamp","open","high","low","close","vwap","volume","count"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="s")
+        for col in ["open","high","low","close","volume"]:
+            df[col] = df[col].astype(float)
+        return df.set_index("timestamp")
+
+    # Try Binance.US first, then Kraken
     try:
-        from routers.market import get_candles_df
-        df = await get_candles_df(symbol, interval, source, start_date, end_date)
-        if df is not None and len(df) > 0:
-            return df
-    except Exception:
-        pass
-
-    import httpx
-    url = "https://api.binance.com/api/v3/klines"
-    params = {
-        "symbol": symbol.upper(), "interval": interval,
-        "startTime": int(pd.Timestamp(start_date).timestamp() * 1000),
-        "endTime": int(pd.Timestamp(end_date).timestamp() * 1000),
-        "limit": 1000,
-    }
-    all_candles = []
-    async with httpx.AsyncClient(timeout=30) as client:
-        while True:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
-            if not data:
-                break
-            all_candles.extend(data)
-            if len(data) < 1000:
-                break
-            params["startTime"] = data[-1][0] + 1
-
-    if not all_candles:
-        raise HTTPException(status_code=404, detail="No candle data found")
-
-    df = pd.DataFrame(all_candles, columns=[\
-        "timestamp", "open", "high", "low", "close", "volume",\
-        "close_time", "quote_vol", "trades", "taker_base", "taker_quote", "ignore"\
-    ])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    df = df.set_index("timestamp")
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
-    return df[["open", "high", "low", "close", "volume"]]
+        return await _try_binance_us()
+    except Exception as e:
+        logger.warning(f"Binance.US failed ({e}), trying Kraken...")
+        return await _try_kraken()
 
 # ---------------------------------------------------------------------------
 # Strategy executor
@@ -639,7 +686,9 @@ async def suggest_ranges(req: SuggestRequest):
 async def run_optimization(req: OptimizeRequest):
     """Run Optuna optimization with SSE progress streaming."""
     try:
-        df = await fetch_candles(req.symbol, req.interval, req.source, req.start_date, req.end_date)
+        start_ms = int(pd.Timestamp(req.start_date).timestamp() * 1000)
+        end_ms = int(pd.Timestamp(req.end_date).timestamp() * 1000)
+        df = await fetch_candles(req.symbol, req.interval, start_ms, end_ms)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch data: {e}")
 
