@@ -34,16 +34,4 @@ export const backtestApi = {
     api.post<BacktestResult>('/api/backtest/run', data).then(r => r.data),
 }
 
-export const marketApi = {
-  getKlines: (symbol: string, interval: string, limit = 500) =>
-    api
-      .get<{ symbol: string; interval: string; data: Candle[] }>('/api/market/klines', {
-        params: { symbol, interval, limit },
-      })
-      .then(r => r.data.data),
-
-  getSymbols: () =>
-    api.get('/api/market/symbols').then(r => r.data),
-}
-
 export default api
