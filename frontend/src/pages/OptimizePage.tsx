@@ -2,22 +2,23 @@
 // 修改歷程記錄
 // -----------------------------------------------------------------------------
 // v2.0.0 - 2026-02-26 - 策略優化頁面（全新重寫）
-// v2.1.0 - 2026-02-26 - AI 建議參數範圍 + 即時日誌面板
-//   - 移除「AI 自動解析參數」按鈕，改為「AI 建議參數範圍」按鈕
-//   - AI 建議：呼叫 /optimize/suggest，Gemini 分析每個參數給出最小/最大/步長建議及理由
-//   - 使用者可在 AI 建議基礎上自行調整數值
-//   - 加入即時日誌面板：優化過程中 SSE log 事件逐行顯示
-//   - 日誌面板在開始優化後自動展開，顯示試驗進度與最佳值
+//   - 頁面標題改為「策略優化」
+//   - 新增 Pine Script 貼入區塊，支援 AI 自動解析 input 參數
+//   - 動態參數偵測 UI：自動顯示參數列表，可勾選/設定優化範圍
+//   - Gemini AI 轉譯 + Optuna 優化後端串接
+//   - 前 10 名結果列表：顯示總盈虧、MDD、盈虧比、勝率等
+//   - 點擊結果連動：Lightweight Charts 顯示對應回測圖表
+//   - 每月績效柱狀圖
+//   - 一鍵複製優化代碼功能
 // =============================================================================
 
 import { useState, useRef, useEffect, useCallback } from 'react'
 import {
   Play, Sparkles, ChevronDown, ChevronUp, Settings2,
-  Copy, Check, TrendingUp, BarChart2,
-  Zap, AlertCircle, RefreshCw, Target, Terminal, Brain
+  Copy, Check, TrendingUp, TrendingDown, BarChart2,
+  Zap, AlertCircle, RefreshCw, Target
 } from 'lucide-react'
 import PageHeader from '../components/PageHeader'
-import { createChart, ColorType, IChartApi, ISeriesApi } from 'lightweight-charts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -33,17 +34,6 @@ interface DetectedParam {
   step?: number
 }
 
-interface AISuggestion {
-  name: string
-  title: string
-  type: 'int' | 'float'
-  default: number
-  min_val: number
-  max_val: number
-  step: number
-  reasoning: string
-}
-
 interface ParamRange {
   name: string
   title: string
@@ -53,7 +43,6 @@ interface ParamRange {
   step: number
   is_int: boolean
   default_val: number
-  reasoning?: string
 }
 
 interface OptimizeResult {
@@ -153,9 +142,10 @@ function MonthlyBarChart({ data }: { data: Record<string, number> }) {
 export default function OptimizePage() {
   // Pine Script
   const [pineScript, setPineScript] = useState('')
-  const [isSuggesting, setIsSuggesting] = useState(false)
+  const [isParsing, setIsParsing] = useState(false)
+  const [detectedParams, setDetectedParams] = useState<DetectedParam[]>([])
   const [paramRanges, setParamRanges] = useState<ParamRange[]>([])
-  const [suggestError, setSuggestError] = useState('')
+  const [parseError, setParseError] = useState('')
 
   // Market settings
   const [symbol, setSymbol] = useState('BTCUSDT')
@@ -178,43 +168,30 @@ export default function OptimizePage() {
   const [copiedCode, setCopiedCode] = useState(false)
   const [errorMsg, setErrorMsg] = useState('')
 
-  // Live log
-  const [logLines, setLogLines] = useState<string[]>([])
-  const [showLog, setShowLog] = useState(false)
-  const logEndRef = useRef<HTMLDivElement>(null)
-
   // UI state
   const [showSettings, setShowSettings] = useState(true)
   const [showScript, setShowScript] = useState(true)
 
   // Chart refs
   const equityChartRef = useRef<HTMLDivElement>(null)
-  const equityChartApi = useRef<IChartApi | null>(null)
-  const equitySeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
-
-  // Auto-scroll log
-  useEffect(() => {
-    if (showLog && logEndRef.current) {
-      logEndRef.current.scrollIntoView({ behavior: 'smooth' })
-    }
-  }, [logLines, showLog])
+  const equityChartApi = useRef<any>(null)
+  const equitySeriesRef = useRef<any>(null)
 
   // ---------------------------------------------------------------------------
-  // AI Suggest param ranges
+  // Parse Pine Script inputs
   // ---------------------------------------------------------------------------
 
-  const suggestParamRanges = useCallback(async () => {
+  const parsePineScript = useCallback(async () => {
     if (!pineScript.trim()) {
-      setSuggestError('請先貼入 Pine Script 代碼')
+      setParseError('請先貼入 Pine Script 代碼')
       return
     }
 
-    setIsSuggesting(true)
-    setSuggestError('')
-    setParamRanges([])
+    setIsParsing(true)
+    setParseError('')
 
     try {
-      const res = await fetch('/api/optimize/suggest', {
+      const res = await fetch('/api/optimize/parse', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pine_script: pineScript }),
@@ -223,28 +200,34 @@ export default function OptimizePage() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
 
-      if (!data.suggestions || data.suggestions.length === 0) {
-        setSuggestError('未偵測到任何數值參數，請確認 Pine Script 包含 input.int / input.float 宣告')
-        return
-      }
+      setDetectedParams(data.params)
 
-      const ranges: ParamRange[] = data.suggestions.map((s: AISuggestion) => ({
-        name: s.name,
-        title: s.title,
-        enabled: true,
-        min_val: s.min_val,
-        max_val: s.max_val,
-        step: s.step,
-        is_int: s.type === 'int',
-        default_val: s.default,
-        reasoning: s.reasoning,
-      }))
+      // Build param ranges from detected params (only int/float)
+      const ranges: ParamRange[] = data.params
+        .filter((p: DetectedParam) => p.type === 'int' || p.type === 'float')
+        .map((p: DetectedParam) => {
+          const defVal = typeof p.default === 'number' ? p.default : 1
+          return {
+            name: p.name,
+            title: p.title,
+            enabled: true,
+            min_val: p.min_val ?? Math.max(1, Math.floor(defVal * 0.5)),
+            max_val: p.max_val ?? Math.ceil(defVal * 2),
+            step: p.step ?? (p.type === 'int' ? 1 : 0.1),
+            is_int: p.type === 'int',
+            default_val: defVal,
+          }
+        })
 
       setParamRanges(ranges)
+
+      if (data.params.length === 0) {
+        setParseError('未偵測到任何 input 參數，請確認 Pine Script 包含 input.int / input.float 等宣告')
+      }
     } catch (err: any) {
-      setSuggestError(`AI 建議失敗：${err.message}`)
+      setParseError(`解析失敗：${err.message}`)
     } finally {
-      setIsSuggesting(false)
+      setIsParsing(false)
     }
   }, [pineScript])
 
@@ -262,13 +245,13 @@ export default function OptimizePage() {
 
   const runOptimization = async () => {
     if (!pineScript.trim()) {
-      setErrorMsg('請先貼入 Pine Script 代碼並點擊 AI 建議參數範圍')
+      setErrorMsg('請先貼入 Pine Script 代碼並解析參數')
       return
     }
 
     const enabledRanges = paramRanges.filter(p => p.enabled)
     if (enabledRanges.length === 0) {
-      setErrorMsg('請先點擊「AI 建議參數範圍」，或至少勾選一個參數進行優化')
+      setErrorMsg('請至少勾選一個參數進行優化')
       return
     }
 
@@ -278,8 +261,6 @@ export default function OptimizePage() {
     setResults([])
     setSelectedResult(null)
     setErrorMsg('')
-    setLogLines([])
-    setShowLog(true)
 
     try {
       const res = await fetch('/api/optimize/run', {
@@ -335,8 +316,6 @@ export default function OptimizePage() {
             if (data.type === 'progress') {
               setProgress(data.progress)
               setProgressText(`已完成 ${data.completed} / ${data.total} 次試驗`)
-            } else if (data.type === 'log') {
-              setLogLines(prev => [...prev, data.message])
             } else if (data.type === 'result') {
               setResults(data.results)
               setProgress(100)
@@ -368,31 +347,13 @@ export default function OptimizePage() {
       equityChartApi.current = null
     }
 
-    const chart = createChart(equityChartRef.current, {
-      layout: { background: { type: ColorType.Solid, color: 'transparent' }, textColor: '#9ca3af' },
-      grid: { vertLines: { color: 'rgba(255,255,255,0.05)' }, horzLines: { color: 'rgba(255,255,255,0.05)' } },
-      width: equityChartRef.current.clientWidth,
-      height: 220,
-      rightPriceScale: { borderColor: 'rgba(255,255,255,0.1)' },
-      timeScale: { borderColor: 'rgba(255,255,255,0.1)', timeVisible: true },
-    })
-
-    const series = chart.addLineSeries({
-      color: '#8b5cf6',
-      lineWidth: 2,
-      priceFormat: { type: 'price', precision: 2 },
-    })
-
-    equityChartApi.current = chart
-    equitySeriesRef.current = series
-
     const resizeObserver = new ResizeObserver(() => {
-      if (equityChartRef.current) {
-        chart.applyOptions({ width: equityChartRef.current.clientWidth })
+      if (equityChartRef.current && equityChartApi.current) {
+        equityChartApi.current.applyOptions({ width: equityChartRef.current.clientWidth })
       }
     })
     resizeObserver.observe(equityChartRef.current)
-    return () => { resizeObserver.disconnect(); chart.remove() }
+    return () => { resizeObserver.disconnect() }
   }, [])
 
   useEffect(() => {
@@ -416,6 +377,7 @@ export default function OptimizePage() {
     if (!selectedResult) return
     let code = pineScript
     Object.entries(selectedResult.params).forEach(([name, val]) => {
+      // Replace input.int/float default value for this param
       const pattern = new RegExp(`(${name}\\s*=\\s*input\\.(?:int|float)\\s*\\()[^)]*\\)`, 'g')
       code = code.replace(pattern, (match) => {
         return match.replace(/defval\s*=\s*[\d.]+|^(\s*\()[\d.]+/, (m) => {
@@ -438,13 +400,13 @@ export default function OptimizePage() {
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 p-4 md:p-8">
       <PageHeader
         title="策略優化"
-        subtitle="AI 分析 Pine Script 參數並建議最佳範圍，Optuna 智能搜尋最佳組合"
+        subtitle="AI 自動解析 Pine Script 參數，Optuna 智能搜尋最佳組合"
         icon={<Target className="w-8 h-8" />}
       />
 
       <div className="max-w-7xl mx-auto mt-6 space-y-5">
 
-        {/* Pine Script Input */}
+        {/* ── Pine Script Input ── */}
         <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 overflow-hidden">
           <button
             onClick={() => setShowScript(!showScript)}
@@ -453,9 +415,9 @@ export default function OptimizePage() {
             <div className="flex items-center gap-3">
               <Zap className="w-5 h-5 text-yellow-400" />
               <span className="text-white font-medium">貼入 Pine Script</span>
-              {paramRanges.length > 0 && (
+              {detectedParams.length > 0 && (
                 <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400">
-                  已取得 {paramRanges.length} 個參數建議
+                  已偵測 {detectedParams.filter(p => p.type === 'int' || p.type === 'float').length} 個可優化參數
                 </span>
               )}
             </div>
@@ -466,42 +428,38 @@ export default function OptimizePage() {
             <div className="p-6 border-t border-white/10 space-y-4">
               <textarea
                 value={pineScript}
-                onChange={(e) => { setPineScript(e.target.value); setParamRanges([]); setSuggestError('') }}
+                onChange={(e) => { setPineScript(e.target.value); setDetectedParams([]); setParamRanges([]) }}
                 placeholder={`//@version=5\nstrategy("My Strategy", overlay=true)\nfastLength = input.int(9, title="Fast EMA", minval=2, maxval=50)\nslowLength = input.int(21, title="Slow EMA", minval=5, maxval=100)\n// ... 策略邏輯`}
                 className="w-full h-48 px-4 py-3 bg-black/30 border border-white/10 rounded-xl text-green-300 font-mono text-sm focus:ring-2 focus:ring-purple-500 focus:border-transparent resize-y placeholder-gray-600"
               />
 
-              {suggestError && (
+              {parseError && (
                 <div className="flex items-center gap-2 text-rose-400 text-sm">
                   <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                  {suggestError}
+                  {parseError}
                 </div>
               )}
 
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={suggestParamRanges}
-                  disabled={isSuggesting || !pineScript.trim()}
-                  className="flex items-center gap-2 px-5 py-2.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-xl font-medium transition-colors"
-                >
-                  {isSuggesting ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Brain className="w-4 h-4" />}
-                  {isSuggesting ? 'AI 分析中...' : 'AI 建議參數範圍'}
-                </button>
-                <span className="text-xs text-gray-500">Gemini 分析每個參數，給出建議的最小值、最大值與步長</span>
-              </div>
+              <button
+                onClick={parsePineScript}
+                disabled={isParsing || !pineScript.trim()}
+                className="flex items-center gap-2 px-5 py-2.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-xl font-medium transition-colors"
+              >
+                {isParsing ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                {isParsing ? '解析中...' : 'AI 自動解析參數'}
+              </button>
             </div>
           )}
         </div>
 
-        {/* AI Suggested Param Ranges */}
+        {/* ── Detected Params ── */}
         {paramRanges.length > 0 && (
           <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 p-6">
-            <h3 className="text-white font-semibold mb-1 flex items-center gap-2">
+            <h3 className="text-white font-semibold mb-4 flex items-center gap-2">
               <Settings2 className="w-5 h-5 text-purple-400" />
               參數優化設定
-              <span className="text-xs text-gray-400 font-normal ml-1">（AI 建議範圍，可自行調整）</span>
+              <span className="text-xs text-gray-400 font-normal">（勾選要優化的參數並設定範圍）</span>
             </h3>
-            <p className="text-xs text-gray-500 mb-4">勾選要優化的參數。AI 已根據策略邏輯給出建議範圍，滑鼠移到參數名稱可查看理由。</p>
 
             <div className="space-y-3">
               {paramRanges.map((p) => (
@@ -513,17 +471,11 @@ export default function OptimizePage() {
                       onChange={(e) => updateRange(p.name, 'enabled', e.target.checked)}
                       className="w-4 h-4 rounded accent-purple-500"
                     />
-                    <div className="flex-1 min-w-0">
-                      <span className="text-white font-medium" title={p.reasoning}>{p.title}</span>
+                    <div>
+                      <span className="text-white font-medium">{p.title}</span>
                       <span className="text-gray-500 text-xs ml-2">({p.name})</span>
-                      {p.reasoning && (
-                        <p className="text-gray-500 text-xs mt-0.5 truncate" title={p.reasoning}>
-                          <Sparkles className="w-3 h-3 inline mr-1 text-violet-400" />
-                          {p.reasoning}
-                        </p>
-                      )}
                     </div>
-                    <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-white/10 text-gray-300 flex-shrink-0">
+                    <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-white/10 text-gray-300">
                       預設: {p.default_val}
                     </span>
                   </div>
@@ -569,7 +521,7 @@ export default function OptimizePage() {
           </div>
         )}
 
-        {/* Market and Optimize Settings */}
+        {/* ── Market & Optimize Settings ── */}
         <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 overflow-hidden">
           <button
             onClick={() => setShowSettings(!showSettings)}
@@ -584,6 +536,7 @@ export default function OptimizePage() {
 
           {showSettings && (
             <div className="p-6 border-t border-white/10 space-y-5">
+              {/* Symbol / Interval / Source */}
               <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
                 <div>
                   <label className="block text-xs font-medium text-gray-400 mb-1.5">交易對</label>
@@ -608,6 +561,7 @@ export default function OptimizePage() {
                 </div>
               </div>
 
+              {/* Date range */}
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-medium text-gray-400 mb-1.5">開始日期</label>
@@ -621,6 +575,7 @@ export default function OptimizePage() {
                 </div>
               </div>
 
+              {/* Capital / Commission / Quantity */}
               <div className="grid grid-cols-3 gap-4">
                 <div>
                   <label className="block text-xs font-medium text-gray-400 mb-1.5">初始資金</label>
@@ -639,6 +594,7 @@ export default function OptimizePage() {
                 </div>
               </div>
 
+              {/* Sort / Trials */}
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-medium text-gray-400 mb-1.5">優化目標</label>
@@ -657,7 +613,7 @@ export default function OptimizePage() {
           )}
         </div>
 
-        {/* Run Button */}
+        {/* ── Run Button ── */}
         {errorMsg && (
           <div className="flex items-center gap-2 px-4 py-3 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-400 text-sm">
             <AlertCircle className="w-4 h-4 flex-shrink-0" />
@@ -683,8 +639,8 @@ export default function OptimizePage() {
           )}
         </button>
 
-        {/* Progress Bar */}
-        {(isRunning || progress > 0) && (
+        {/* ── Progress Bar ── */}
+        {isRunning && (
           <div className="space-y-2">
             <div className="w-full bg-white/10 rounded-full h-2 overflow-hidden">
               <div
@@ -696,46 +652,7 @@ export default function OptimizePage() {
           </div>
         )}
 
-        {/* Live Log Panel */}
-        {(logLines.length > 0 || isRunning) && (
-          <div className="bg-black/40 backdrop-blur-lg rounded-2xl border border-white/10 overflow-hidden">
-            <button
-              onClick={() => setShowLog(!showLog)}
-              className="w-full px-6 py-3 flex items-center justify-between hover:bg-white/5 transition-colors"
-            >
-              <div className="flex items-center gap-3">
-                <Terminal className="w-4 h-4 text-green-400" />
-                <span className="text-white text-sm font-medium">優化日誌</span>
-                {isRunning && (
-                  <span className="flex items-center gap-1 text-xs text-green-400">
-                    <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-                    執行中
-                  </span>
-                )}
-                <span className="text-xs text-gray-500">{logLines.length} 行</span>
-              </div>
-              {showLog ? <ChevronUp className="w-4 h-4 text-gray-400" /> : <ChevronDown className="w-4 h-4 text-gray-400" />}
-            </button>
-
-            {showLog && (
-              <div className="border-t border-white/10 p-4 max-h-56 overflow-y-auto font-mono text-xs">
-                {logLines.length === 0 ? (
-                  <p className="text-gray-600">等待日誌...</p>
-                ) : (
-                  logLines.map((line, i) => (
-                    <div key={i} className="text-green-300 leading-5">
-                      <span className="text-gray-600 mr-2 select-none">{String(i + 1).padStart(3, '0')}</span>
-                      {line}
-                    </div>
-                  ))
-                )}
-                <div ref={logEndRef} />
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Results Table */}
+        {/* ── Results Table ── */}
         {results.length > 0 && (
           <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 overflow-hidden">
             <div className="px-6 py-4 border-b border-white/10 flex items-center justify-between">
@@ -805,7 +722,7 @@ export default function OptimizePage() {
           </div>
         )}
 
-        {/* Selected Result Detail */}
+        {/* ── Selected Result Detail ── */}
         {selectedResult && (
           <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 p-6 space-y-5">
             <div className="flex items-center justify-between">
@@ -822,6 +739,7 @@ export default function OptimizePage() {
               </button>
             </div>
 
+            {/* Metrics grid */}
             <div className="grid grid-cols-4 md:grid-cols-8 gap-2">
               <MetricBadge label="總盈利" value={`${selectedResult.profit_pct >= 0 ? '+' : ''}${selectedResult.profit_pct.toFixed(2)}%`} highlight={selectedResult.profit_pct > 0} />
               <MetricBadge label="最終資產" value={`$${selectedResult.final_equity.toFixed(0)}`} />
@@ -833,13 +751,16 @@ export default function OptimizePage() {
               <MetricBadge label="毛利/毛損" value={`${selectedResult.gross_profit.toFixed(0)}/${selectedResult.gross_loss.toFixed(0)}`} />
             </div>
 
+            {/* Equity curve */}
             <div>
               <div className="text-xs text-gray-400 mb-2 font-medium">資產曲線</div>
               <div ref={equityChartRef} className="w-full rounded-xl overflow-hidden" />
             </div>
 
+            {/* Monthly PnL */}
             <MonthlyBarChart data={selectedResult.monthly_pnl} />
 
+            {/* Optimized params */}
             <div>
               <div className="text-xs text-gray-400 mb-2 font-medium">最佳參數值</div>
               <div className="flex flex-wrap gap-2">
