@@ -1,326 +1,381 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
-import {
-  createChart,
-  IChartApi,
-  ISeriesApi,
-  CandlestickData,
-  Time,
-  CrosshairMode,
-  UTCTimestamp,
-} from 'lightweight-charts'
+import { init, dispose, Chart } from 'klinecharts'
+import { Search, ChevronDown, RefreshCw } from 'lucide-react'
+import PageHeader from '../components/PageHeader'
 
-// ── Binance Futures REST (international, no geo-block) ──────────────────────
-const FAPI_BASE = 'https://fapi.binance.com'
-const FAPI_WS   = 'wss://fstream.binance.com'
+// ── Constants ────────────────────────────────────────────────────────────────
+const INTERVALS = ['1m','3m','5m','15m','30m','1h','2h','4h','6h','12h','1d','1w']
+const INTERVAL_LABELS: Record<string, string> = {
+  '1m':'1分','3m':'3分','5m':'5分','15m':'15分','30m':'30分',
+  '1h':'1時','2h':'2時','4h':'4時','6h':'6時','12h':'12時','1d':'日','1w':'週'
+}
+const POPULAR_SYMBOLS = [
+  'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT',
+  'ADAUSDT','DOGEUSDT','AVAXUSDT','DOTUSDT','MATICUSDT',
+  'LINKUSDT','UNIUSDT','LTCUSDT','ATOMUSDT','NEARUSDT',
+]
 
-const INTERVAL_MAP: Record<string, string> = {
-  '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m',
-  '1h': '1h', '4h': '4h',  '1d': '1d',  '1w': '1w',
+type MarketType = 'spot' | 'futures'
+
+const SPOT_REST    = 'https://api.binance.com/api/v3/klines'
+const FUTURES_REST = 'https://fapi.binance.com/fapi/v1/klines'
+const SPOT_WS_BASE    = 'wss://stream.binance.com:9443/ws'
+const FUTURES_WS_BASE = 'wss://fstream.binance.com/ws'
+
+const getSavedSymbol     = () => localStorage.getItem('chart_symbol')   || 'BTCUSDT'
+const getSavedInterval   = () => localStorage.getItem('chart_interval') || '1h'
+const getSavedMarketType = () => (localStorage.getItem('chart_market') as MarketType) || 'futures'
+
+interface RawKline {
+  timestamp: number
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number
+  turnover: number
 }
 
-// Fetch one batch (max 1500 per Binance Futures limit)
 async function fetchBatch(
+  marketType: MarketType,
   symbol: string,
   interval: string,
-  endTime?: number,
-  limit = 1500,
-): Promise<CandlestickData<UTCTimestamp>[]> {
-  const params = new URLSearchParams({
-    symbol,
-    interval,
-    limit: String(limit),
-    ...(endTime ? { endTime: String(endTime) } : {}),
-  })
-  const res = await fetch(`${FAPI_BASE}/fapi/v1/klines?${params}`)
-  if (!res.ok) throw new Error(`Binance REST ${res.status}`)
-  const raw: number[][] = await res.json()
+  limit: number,
+  endTime?: number
+): Promise<RawKline[]> {
+  const base = marketType === 'futures' ? FUTURES_REST : SPOT_REST
+  const maxLimit = marketType === 'futures' ? 1500 : 1000
+  const actualLimit = Math.min(limit, maxLimit)
+  const params = new URLSearchParams({ symbol, interval, limit: String(actualLimit) })
+  if (endTime) params.set('endTime', String(endTime))
+  const res = await fetch(`${base}?${params}`)
+  if (!res.ok) throw new Error(`Binance ${res.status}: ${await res.text()}`)
+  const raw: any[][] = await res.json()
   return raw.map(k => ({
-    time: (k[0] / 1000) as UTCTimestamp,
-    open:  parseFloat(k[1] as unknown as string),
-    high:  parseFloat(k[2] as unknown as string),
-    low:   parseFloat(k[3] as unknown as string),
-    close: parseFloat(k[4] as unknown as string),
+    timestamp: k[0],
+    open:      parseFloat(k[1]),
+    high:      parseFloat(k[2]),
+    low:       parseFloat(k[3]),
+    close:     parseFloat(k[4]),
+    volume:    parseFloat(k[5]),
+    turnover:  parseFloat(k[7]),
   }))
 }
 
-// Fetch ~5000 candles by chaining batches backwards
-async function fetchHistory(
+async function fetchKlines(
+  marketType: MarketType,
   symbol: string,
   interval: string,
-  targetCount = 5000,
-): Promise<CandlestickData<UTCTimestamp>[]> {
-  const batchSize = 1500
-  let all: CandlestickData<UTCTimestamp>[] = []
+  targetCount = 5000
+): Promise<RawKline[]> {
+  const batchSize = marketType === 'futures' ? 1500 : 1000
+  const batches   = Math.ceil(targetCount / batchSize)
+  let all: RawKline[] = []
   let endTime: number | undefined = undefined
-
-  while (all.length < targetCount) {
-    const need = Math.min(batchSize, targetCount - all.length)
-    const batch = await fetchBatch(symbol, interval, endTime, need)
+  for (let i = 0; i < batches; i++) {
+    const batch = await fetchBatch(marketType, symbol, interval, batchSize, endTime)
     if (!batch.length) break
-    // prepend (older data comes first)
     all = [...batch, ...all]
-    // next batch ends just before the oldest candle we have
-    endTime = (batch[0].time as number) * 1000 - 1
-    if (batch.length < need) break // no more history
+    endTime = batch[0].timestamp - 1
   }
-
-  // deduplicate & sort ascending by time
   const seen = new Set<number>()
   return all
-    .filter(c => { const t = c.time as number; if (seen.has(t)) return false; seen.add(t); return true })
-    .sort((a, b) => (a.time as number) - (b.time as number))
+    .filter(k => { if (seen.has(k.timestamp)) return false; seen.add(k.timestamp); return true })
+    .sort((a, b) => a.timestamp - b.timestamp)
 }
 
-const TIMEFRAMES = [
-  { label: '1分', value: '1m' },
-  { label: '5分', value: '5m' },
-  { label: '15分', value: '15m' },
-  { label: '30分', value: '30m' },
-  { label: '1小時', value: '1h' },
-  { label: '4小時', value: '4h' },
-  { label: '1天', value: '1d' },
-  { label: '1週', value: '1w' },
-]
-
-const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT']
-
 export default function ChartPage() {
-  const chartContainerRef = useRef<HTMLDivElement>(null)
-  const chartRef          = useRef<IChartApi | null>(null)
-  const seriesRef         = useRef<ISeriesApi<'Candlestick'> | null>(null)
-  const wsRef             = useRef<WebSocket | null>(null)
-  const reconnectTimer    = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const chartContainerId = 'kline-chart-container'
+  const chartRef   = useRef<Chart | null>(null)
+  const wsRef      = useRef<WebSocket | null>(null)
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const [symbol,    setSymbol]    = useState(() => localStorage.getItem('chart_symbol')    || 'BTCUSDT')
-  const [timeframe, setTimeframe] = useState(() => localStorage.getItem('chart_timeframe') || '1m')
-  const [currentPrice, setCurrentPrice] = useState<number | null>(null)
-  const [currentTime,  setCurrentTime]  = useState<string>('')
-  const [loading,  setLoading]  = useState(true)
-  const [error,    setError]    = useState<string | null>(null)
-  const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected')
+  const symbolRef     = useRef(getSavedSymbol())
+  const intervalRef   = useRef(getSavedInterval())
+  const marketTypeRef = useRef<MarketType>(getSavedMarketType())
 
-  // ── Chart init ─────────────────────────────────────────────────────────────
+  const [symbol,          setSymbol]         = useState(symbolRef.current)
+  const [interval,        setInterval]       = useState(intervalRef.current)
+  const [marketType,      setMarketType]     = useState<MarketType>(marketTypeRef.current)
+  const [loading,         setLoading]        = useState(false)
+  const [error,           setError]          = useState<string | null>(null)
+  const [wsStatus,        setWsStatus]       = useState<'connecting'|'live'|'disconnected'>('disconnected')
+  const [currentPrice,    setCurrentPrice]   = useState<number | null>(null)
+  const [searchQuery,     setSearchQuery]    = useState('')
+  const [showSymbolPanel, setShowSymbolPanel]= useState(false)
+
   useEffect(() => {
-    if (!chartContainerRef.current) return
-    const chart = createChart(chartContainerRef.current, {
-      width:  chartContainerRef.current.clientWidth,
-      height: chartContainerRef.current.clientHeight || 500,
-      layout: { background: { color: '#0f1117' }, textColor: '#d1d5db' },
-      grid:   { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
-      crosshair: { mode: CrosshairMode.Normal },
-      rightPriceScale: { borderColor: '#374151' },
-      timeScale: {
-        borderColor: '#374151',
-        timeVisible: true,
-        secondsVisible: false,
+    const chart = init(chartContainerId, {
+      layout: [
+        { type: 'candle', options: { gap: { bottom: 2 } } },
+        { type: 'indicator', content: ['VOL'], options: { gap: { top: 4 }, height: 100 } }
+      ],
+      customApi: {
+        formatDate: (dateTimeFormat: Intl.DateTimeFormat, timestamp: number) =>
+          dateTimeFormat.format(new Date(timestamp))
       },
+      styles: {
+        grid: {
+          horizontal: { color: '#1e2328' },
+          vertical:   { color: '#1e2328' },
+        },
+        candle: {
+          bar: {
+            upColor:       '#26a69a',
+            downColor:     '#ef5350',
+            noChangeColor: '#888888',
+          },
+          tooltip: { labels: ['時間', '開', '高', '低', '收', '量'] }
+        },
+        indicator: { ohlc: { upColor: '#26a69a', downColor: '#ef5350' } },
+        xAxis: {
+          tickText: { color: '#848e9c' },
+          axisLine: { color: '#2b2b43' },
+        },
+        yAxis: {
+          tickText: { color: '#848e9c' },
+          axisLine: { color: '#2b2b43' },
+        },
+        crosshair: {
+          horizontal: { line: { color: '#444' }, text: { color: '#fff', backgroundColor: '#2b2b43' } },
+          vertical:   { line: { color: '#444' }, text: { color: '#fff', backgroundColor: '#2b2b43' } },
+        },
+        background: '#131722',
+      },
+      locale: 'zh-TW',
+      timezone: 'Asia/Taipei',
     })
-    const series = chart.addCandlestickSeries({
-      upColor:   '#26a69a', downColor: '#ef5350',
-      borderUpColor: '#26a69a', borderDownColor: '#ef5350',
-      wickUpColor:   '#26a69a', wickDownColor:   '#ef5350',
-    })
-    chartRef.current  = chart
-    seriesRef.current = series
-
-    const ro = new ResizeObserver(() => {
-      if (chartContainerRef.current)
-        chart.resize(chartContainerRef.current.clientWidth, chartContainerRef.current.clientHeight)
-    })
-    ro.observe(chartContainerRef.current)
-
-    return () => { ro.disconnect(); chart.remove() }
+    if (chart) {
+      chart.createIndicator('MA', false, { id: 'candle_pane' })
+      chart.createIndicator('MACD', false, { height: 80 })
+      chartRef.current = chart
+    }
+    return () => { dispose(chartContainerId) }
   }, [])
 
-  // ── Load history + open WS whenever symbol / timeframe changes ─────────────
-  const loadData = useCallback(async () => {
-    if (!seriesRef.current) return
-    setLoading(true)
-    setError(null)
-    localStorage.setItem('chart_symbol',    symbol)
-    localStorage.setItem('chart_timeframe', timeframe)
-
-    // close old WS
-    if (wsRef.current) { wsRef.current.close(1000); wsRef.current = null }
-    if (reconnectTimer.current) { clearTimeout(reconnectTimer.current); reconnectTimer.current = null }
-
-    try {
-      const candles = await fetchHistory(symbol, INTERVAL_MAP[timeframe] || timeframe)
-      if (seriesRef.current && candles.length) {
-        seriesRef.current.setData(candles)
-        chartRef.current?.timeScale().fitContent()
-        const last = candles[candles.length - 1]
-        setCurrentPrice(last.close)
-        // format last candle time in local timezone
-        setCurrentTime(new Date((last.time as number) * 1000).toLocaleTimeString())
-      }
-    } catch (e) {
-      setError(`載入歷史資料失敗: ${e}`)
-    } finally {
-      setLoading(false)
+  const connectWS = useCallback((sym: string, tf: string, mt: MarketType) => {
+    if (wsRef.current) {
+      wsRef.current.onclose = null
+      wsRef.current.close()
+      wsRef.current = null
     }
-
-    // open Binance Futures stream
-    connectWS()
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol, timeframe])
-
-  useEffect(() => { loadData() }, [loadData])
-
-  // ── WebSocket (Binance Futures stream) ─────────────────────────────────────
-  const connectWS = useCallback(() => {
-    const streamName = `${symbol.toLowerCase()}@kline_${INTERVAL_MAP[timeframe] || timeframe}`
-    const url = `${FAPI_WS}/ws/${streamName}`
+    if (reconnectTimer.current) {
+      clearTimeout(reconnectTimer.current)
+      reconnectTimer.current = null
+    }
     setWsStatus('connecting')
-
-    const ws = new WebSocket(url)
+    const streamName = `${sym.toLowerCase()}@kline_${tf}`
+    const wsBase = mt === 'futures' ? FUTURES_WS_BASE : SPOT_WS_BASE
+    const ws = new WebSocket(`${wsBase}/${streamName}`)
     wsRef.current = ws
-
-    ws.onopen = () => setWsStatus('connected')
-
-    ws.onmessage = (evt) => {
+    ws.onopen = () => setWsStatus('live')
+    ws.onmessage = (event) => {
       try {
-        const msg = JSON.parse(evt.data)
+        const msg = JSON.parse(event.data)
         const k = msg.k
         if (!k) return
-        const candle: CandlestickData<UTCTimestamp> = {
-          time:  (k.t / 1000) as UTCTimestamp,
-          open:  parseFloat(k.o),
-          high:  parseFloat(k.h),
-          low:   parseFloat(k.l),
-          close: parseFloat(k.c),
+        const candle: RawKline = {
+          timestamp: k.t,
+          open:      parseFloat(k.o),
+          high:      parseFloat(k.h),
+          low:       parseFloat(k.l),
+          close:     parseFloat(k.c),
+          volume:    parseFloat(k.v),
+          turnover:  parseFloat(k.q),
         }
-        seriesRef.current?.update(candle)
-        setCurrentPrice(parseFloat(k.c))
-        setCurrentTime(new Date(k.t).toLocaleTimeString())
-      } catch { /* ignore parse errors */ }
-    }
-
-    ws.onerror = () => setWsStatus('disconnected')
-
-    ws.onclose = (evt) => {
-      setWsStatus('disconnected')
-      // auto-reconnect unless intentional close
-      if (evt.code !== 1000) {
-        reconnectTimer.current = setTimeout(() => connectWS(), 3000)
+        chartRef.current?.updateData(candle)
+        setCurrentPrice(candle.close)
+      } catch (e) {
+        console.warn('WS parse error', e)
       }
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol, timeframe])
-
-  // cleanup on unmount
-  useEffect(() => () => {
-    wsRef.current?.close(1000)
-    if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
+    ws.onerror = () => setWsStatus('disconnected')
+    ws.onclose = (e) => {
+      setWsStatus('disconnected')
+      if (e.code !== 1000) {
+        reconnectTimer.current = setTimeout(() => {
+          connectWS(symbolRef.current, intervalRef.current, marketTypeRef.current)
+        }, 3000)
+      }
+    }
   }, [])
 
-  // ── Marker API (called by BacktestPage after run) ──────────────────────────
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  ;(window as any).__chartApplyMarkers = (trades: Array<{
-    entry_time: number; entry_price: number; exit_time: number;
-    exit_price: number; pnl_pct: number; side: 'long' | 'short'
-  }>) => {
-    if (!seriesRef.current) return
-    const markers = trades.flatMap(t => [
-      {
-        time: Math.floor(t.entry_time / 1000) as UTCTimestamp,
-        position: t.side === 'long' ? 'belowBar' : 'aboveBar',
-        color: t.side === 'long' ? '#26a69a' : '#ef5350',
-        shape: t.side === 'long' ? 'arrowUp' : 'arrowDown',
-        text: t.side === 'long' ? 'B' : 'S',
-      },
-      {
-        time: Math.floor(t.exit_time / 1000) as UTCTimestamp,
-        position: t.side === 'long' ? 'aboveBar' : 'belowBar',
-        color: t.pnl_pct >= 0 ? '#26a69a' : '#ef5350',
-        shape: 'circle',
-        text: `${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct.toFixed(2)}%`,
-      },
-    ])
-    // sort ascending by time (required by lightweight-charts)
-    markers.sort((a, b) => (a.time as number) - (b.time as number))
-    seriesRef.current.setMarkers(markers as any)
+  const loadChart = useCallback(async (sym: string, tf: string, mt: MarketType) => {
+    if (!chartRef.current) return
+    setLoading(true)
+    setError(null)
+    try {
+      const candles = await fetchKlines(mt, sym, tf, 5000)
+      if (!candles.length) throw new Error('Binance 回傳空資料')
+      chartRef.current.applyNewData(candles)
+      setCurrentPrice(candles[candles.length - 1].close)
+    } catch (err: any) {
+      console.error('fetchKlines error:', err)
+      setError(err.message || '載入失敗')
+      setLoading(false)
+      return
+    }
+    setLoading(false)
+    connectWS(sym, tf, mt)
+  }, [connectWS])
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      loadChart(symbolRef.current, intervalRef.current, marketTypeRef.current)
+    }, 100)
+    return () => clearTimeout(t)
+  }, [loadChart])
+
+  const changeSymbol = (sym: string) => {
+    symbolRef.current = sym
+    localStorage.setItem('chart_symbol', sym)
+    setSymbol(sym)
+    setShowSymbolPanel(false)
+    loadChart(sym, intervalRef.current, marketTypeRef.current)
   }
 
-  // ── Render ─────────────────────────────────────────────────────────────────
-  return (
-    <div className="flex flex-col h-full bg-gray-950 text-white">
-      {/* Controls */}
-      <div className="flex items-center gap-3 p-3 border-b border-gray-800 flex-wrap">
-        {/* Symbol picker */}
-        <select
-          value={symbol}
-          onChange={e => setSymbol(e.target.value)}
-          className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500"
-        >
-          {SYMBOLS.map(s => <option key={s} value={s}>{s}</option>)}
-        </select>
+  const changeInterval = (tf: string) => {
+    intervalRef.current = tf
+    localStorage.setItem('chart_interval', tf)
+    setInterval(tf)
+    loadChart(symbolRef.current, tf, marketTypeRef.current)
+  }
 
-        {/* Timeframe buttons */}
-        <div className="flex gap-1">
-          {TIMEFRAMES.map(tf => (
+  const changeMarketType = (mt: MarketType) => {
+    marketTypeRef.current = mt
+    localStorage.setItem('chart_market', mt)
+    setMarketType(mt)
+    loadChart(symbolRef.current, intervalRef.current, mt)
+  }
+
+  const filteredSymbols = POPULAR_SYMBOLS.filter(s =>
+    s.toLowerCase().includes(searchQuery.toLowerCase())
+  )
+
+  const wsStatusColor = wsStatus === 'live' ? 'bg-green-500' :
+                        wsStatus === 'connecting' ? 'bg-yellow-400 animate-pulse' : 'bg-red-500'
+  const wsStatusLabel = wsStatus === 'live' ? 'Live' :
+                        wsStatus === 'connecting' ? '連線中' : '已斷線'
+
+  return (
+    <div className="flex flex-col h-screen bg-[#131722] text-gray-200">
+      <PageHeader title="K 線圖表" />
+
+      <div className="flex flex-wrap items-center gap-2 px-4 py-2 bg-[#1e222d] border-b border-[#2b2b43]">
+        <div className="relative">
+          <button
+            onClick={() => setShowSymbolPanel(v => !v)}
+            className="flex items-center gap-1 px-3 py-1.5 bg-[#2b2b43] rounded text-sm font-bold hover:bg-[#363a4e]"
+          >
+            {symbol}
+            <ChevronDown size={14} />
+          </button>
+          {showSymbolPanel && (
+            <div className="absolute top-9 left-0 z-50 w-56 bg-[#1e222d] border border-[#2b2b43] rounded shadow-xl">
+              <div className="p-2 border-b border-[#2b2b43]">
+                <div className="flex items-center gap-2 bg-[#131722] rounded px-2 py-1">
+                  <Search size={14} className="text-gray-400" />
+                  <input
+                    autoFocus
+                    value={searchQuery}
+                    onChange={e => setSearchQuery(e.target.value)}
+                    placeholder="搜尋交易對..."
+                    className="bg-transparent text-sm outline-none w-full"
+                  />
+                </div>
+              </div>
+              <div className="max-h-60 overflow-y-auto">
+                {filteredSymbols.map(s => (
+                  <button
+                    key={s}
+                    onClick={() => changeSymbol(s)}
+                    className={`w-full text-left px-3 py-2 text-sm hover:bg-[#2b2b43] ${s === symbol ? 'text-yellow-400 font-bold' : ''}`}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="flex rounded overflow-hidden border border-[#2b2b43]">
+          {(['spot','futures'] as MarketType[]).map(mt => (
             <button
-              key={tf.value}
-              onClick={() => setTimeframe(tf.value)}
-              className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
-                timeframe === tf.value
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+              key={mt}
+              onClick={() => changeMarketType(mt)}
+              className={`px-3 py-1.5 text-xs font-semibold transition-colors ${
+                marketType === mt
+                  ? 'bg-yellow-500 text-black'
+                  : 'bg-[#2b2b43] text-gray-400 hover:bg-[#363a4e]'
               }`}
             >
-              {tf.label}
+              {mt === 'spot' ? '現貨' : '合約'}
             </button>
           ))}
         </div>
 
-        {/* WS status dot */}
-        <div className="ml-auto flex items-center gap-2 text-xs text-gray-400">
-          <span className={`w-2 h-2 rounded-full ${
-            wsStatus === 'connected'    ? 'bg-green-400' :
-            wsStatus === 'connecting'   ? 'bg-yellow-400 animate-pulse' :
-                                          'bg-red-500'
-          }`} />
-          {wsStatus === 'connected' ? 'Live' : wsStatus === 'connecting' ? '連線中…' : '已斷線'}
+        <div className="flex gap-1 flex-wrap">
+          {INTERVALS.map(tf => (
+            <button
+              key={tf}
+              onClick={() => changeInterval(tf)}
+              className={`px-2 py-1 text-xs rounded transition-colors ${
+                interval === tf
+                  ? 'bg-yellow-500 text-black font-bold'
+                  : 'bg-[#2b2b43] text-gray-400 hover:bg-[#363a4e]'
+              }`}
+            >
+              {INTERVAL_LABELS[tf]}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex-1" />
+
+        <div className="flex items-center gap-3 text-sm">
+          {currentPrice !== null && (
+            <span className="font-mono font-bold text-white">
+              {currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 })}
+            </span>
+          )}
+          <div className="flex items-center gap-1.5">
+            <span className={`w-2 h-2 rounded-full ${wsStatusColor}`} />
+            <span className="text-xs text-gray-400">{wsStatusLabel}</span>
+          </div>
+          <button
+            onClick={() => loadChart(symbolRef.current, intervalRef.current, marketTypeRef.current)}
+            className="p-1.5 rounded hover:bg-[#2b2b43] text-gray-400 hover:text-white"
+            title="重新載入"
+          >
+            <RefreshCw size={14} />
+          </button>
         </div>
       </div>
 
-      {/* Price bar */}
-      {currentPrice !== null && (
-        <div className="flex items-center gap-3 px-4 py-2 border-b border-gray-800 text-sm">
-          <span className="text-gray-400">Current:</span>
-          <span className="text-white font-semibold text-lg">
-            ${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-          </span>
-          {currentTime && (
-            <span className="text-green-400 text-xs">● {currentTime}</span>
-          )}
-        </div>
-      )}
-
-      {/* Chart area */}
-      <div className="relative flex-1">
+      <div className="relative flex-1 min-h-0">
         {loading && (
-          <div className="absolute inset-0 flex items-center justify-center bg-gray-950/80 z-10">
-            <div className="flex flex-col items-center gap-2">
-              <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-              <span className="text-sm text-gray-400">載入歷史 K 線…</span>
-            </div>
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[#131722]/80">
+            <div className="w-8 h-8 border-2 border-yellow-400 border-t-transparent rounded-full animate-spin mb-3" />
+            <span className="text-sm text-gray-400">載入歷史 K 線（~5000 根）...</span>
           </div>
         )}
-        {error && (
-          <div className="absolute inset-0 flex items-center justify-center z-10">
-            <div className="bg-red-900/50 border border-red-700 rounded-lg p-6 text-center max-w-md">
-              <p className="text-red-400 text-sm">{error}</p>
-              <button
-                onClick={loadData}
-                className="mt-3 px-4 py-2 bg-red-700 hover:bg-red-600 rounded text-sm"
-              >
-                重試
-              </button>
-            </div>
+        {error && !loading && (
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[#131722]/90 gap-3">
+            <span className="text-red-400 text-sm">{error}</span>
+            <button
+              onClick={() => loadChart(symbolRef.current, intervalRef.current, marketTypeRef.current)}
+              className="px-4 py-2 bg-yellow-500 text-black text-sm rounded hover:bg-yellow-400"
+            >
+              重試
+            </button>
           </div>
         )}
-        <div ref={chartContainerRef} className="w-full h-full" />
+        <div
+          id={chartContainerId}
+          className="w-full h-full"
+          style={{ background: '#131722' }}
+        />
       </div>
     </div>
   )
