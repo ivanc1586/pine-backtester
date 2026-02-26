@@ -20,7 +20,7 @@ const POPULAR_SYMBOLS = [
 // ─────────────────────────────────────────────────────────────────────────────
 // Indicator catalogue
 //   pane: 'main' = overlay on K-line (MA/EMA/BOLL)
-//         'sub'  = separate pane below (VOL/MACD/RSI/KDJ) — created/destroyed dynamically
+//         'sub'  = separate pane below (VOL/MACD/RSI/KDJ)
 // ─────────────────────────────────────────────────────────────────────────────
 interface IndicatorDef {
   name: string
@@ -31,13 +31,13 @@ interface IndicatorDef {
 }
 
 const INDICATOR_DEFS: IndicatorDef[] = [
-  { name: 'MA',   label: 'MA 均線',    pane: 'main', defaultParams: { period: 14 }, paramLabels: { period: '週期' } },
-  { name: 'EMA',  label: 'EMA 指數均線', pane: 'main', defaultParams: { period: 14 }, paramLabels: { period: '週期' } },
-  { name: 'BOLL', label: 'BOLL 布林帶', pane: 'main', defaultParams: { period: 20, multiplier: 2 }, paramLabels: { period: '週期', multiplier: '倍數' } },
-  { name: 'VOL',  label: 'VOL 成交量',  pane: 'sub',  defaultParams: {}, paramLabels: {} },
-  { name: 'MACD', label: 'MACD',        pane: 'sub',  defaultParams: { shortPeriod: 12, longPeriod: 26, signalPeriod: 9 }, paramLabels: { shortPeriod: '短期', longPeriod: '長期', signalPeriod: '訊號' } },
-  { name: 'RSI',  label: 'RSI',         pane: 'sub',  defaultParams: { period: 14 }, paramLabels: { period: '週期' } },
-  { name: 'KDJ',  label: 'KDJ',         pane: 'sub',  defaultParams: { period: 9, signalPeriod: 3 }, paramLabels: { period: '週期', signalPeriod: '訊號' } },
+  { name: 'MA',   label: 'MA 均線',     pane: 'main', defaultParams: { period: 14 },                                              paramLabels: { period: '週期' } },
+  { name: 'EMA',  label: 'EMA 指數均線', pane: 'main', defaultParams: { period: 14 },                                              paramLabels: { period: '週期' } },
+  { name: 'BOLL', label: 'BOLL 布林帶',  pane: 'main', defaultParams: { period: 20, multiplier: 2 },                               paramLabels: { period: '週期', multiplier: '倍數' } },
+  { name: 'VOL',  label: 'VOL 成交量',   pane: 'sub',  defaultParams: {},                                                          paramLabels: {} },
+  { name: 'MACD', label: 'MACD',         pane: 'sub',  defaultParams: { shortPeriod: 12, longPeriod: 26, signalPeriod: 9 },        paramLabels: { shortPeriod: '短期', longPeriod: '長期', signalPeriod: '訊號' } },
+  { name: 'RSI',  label: 'RSI',          pane: 'sub',  defaultParams: { period: 14 },                                              paramLabels: { period: '週期' } },
+  { name: 'KDJ',  label: 'KDJ',          pane: 'sub',  defaultParams: { period: 9, signalPeriod: 3 },                              paramLabels: { period: '週期', signalPeriod: '訊號' } },
 ]
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -61,7 +61,7 @@ interface ActiveIndicator {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// API
+// API helpers
 // ─────────────────────────────────────────────────────────────────────────────
 const SPOT_REST       = 'https://api.binance.com/api/v3/klines'
 const FUTURES_REST    = 'https://fapi.binance.com/fapi/v1/klines'
@@ -137,10 +137,14 @@ function timeAgo(ts: number): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IndicatorTag — shown in chart overlay, hover reveals controls
-// Matches the KLineChart demo style: "MA(5,10,30,60)" grey text, hover → eye/gear/X
+// IndicatorTag
+// FIX 1: Plain text always visible. Eye / Gear / X only appear on hover.
+// This matches the KLineChart demo style: "MA(5,10,30,60)" grey label,
+// mouse over → controls appear inline to the right of the label.
 // ─────────────────────────────────────────────────────────────────────────────
-function IndicatorTag({ label, visible, onToggleVisible, onSettings, onRemove }: {
+function IndicatorTag({
+  label, visible, onToggleVisible, onSettings, onRemove,
+}: {
   label: string; visible: boolean
   onToggleVisible: () => void; onSettings: () => void; onRemove: () => void
 }) {
@@ -149,27 +153,45 @@ function IndicatorTag({ label, visible, onToggleVisible, onSettings, onRemove }:
     <span
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
-      style={{ display: 'inline-flex', alignItems: 'center', gap: 3, fontSize: 11, lineHeight: '16px', color: visible ? '#848e9c' : '#444', cursor: 'default', userSelect: 'none' }}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 2,
+        fontSize: 11, lineHeight: '16px',
+        color: visible ? '#848e9c' : '#444',
+        cursor: 'default', userSelect: 'none',
+        padding: '0 3px',
+      }}
     >
+      {/* Label always visible */}
       <span style={{ fontWeight: 500 }}>{label}</span>
+
+      {/* Controls only on hover */}
       {hovered && (
         <>
-          <button onClick={onToggleVisible} title={visible ? '隱藏' : '顯示'}
-            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#848e9c', display: 'flex', alignItems: 'center', padding: '0 1px', lineHeight: 1 }}
+          <button
+            onClick={e => { e.stopPropagation(); onToggleVisible() }}
+            title={visible ? '隱藏' : '顯示'}
+            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#848e9c', display: 'flex', alignItems: 'center', padding: '0 1px' }}
             onMouseEnter={e => (e.currentTarget.style.color = '#d1d4dc')}
-            onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}>
+            onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
+          >
             {visible ? <Eye size={10} /> : <EyeOff size={10} />}
           </button>
-          <button onClick={onSettings} title="設定"
-            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#848e9c', display: 'flex', alignItems: 'center', padding: '0 1px', lineHeight: 1 }}
+          <button
+            onClick={e => { e.stopPropagation(); onSettings() }}
+            title="設定"
+            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#848e9c', display: 'flex', alignItems: 'center', padding: '0 1px' }}
             onMouseEnter={e => (e.currentTarget.style.color = '#d1d4dc')}
-            onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}>
+            onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
+          >
             <Settings size={10} />
           </button>
-          <button onClick={onRemove} title="移除"
-            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#848e9c', display: 'flex', alignItems: 'center', padding: '0 1px', lineHeight: 1 }}
+          <button
+            onClick={e => { e.stopPropagation(); onRemove() }}
+            title="移除"
+            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#848e9c', display: 'flex', alignItems: 'center', padding: '0 1px' }}
             onMouseEnter={e => (e.currentTarget.style.color = '#ef5350')}
-            onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}>
+            onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
+          >
             <X size={10} />
           </button>
         </>
@@ -187,8 +209,14 @@ function SettingsModal({ indicator, def, onClose, onApply }: {
 }) {
   const [params, setParams] = useState({ ...indicator.params })
   return (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,.6)' }} onClick={onClose}>
-      <div style={{ background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 8, padding: 20, width: 280, boxShadow: '0 8px 32px rgba(0,0,0,.6)' }} onClick={e => e.stopPropagation()}>
+    <div
+      style={{ position: 'fixed', inset: 0, zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,.6)' }}
+      onClick={onClose}
+    >
+      <div
+        style={{ background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 8, padding: 20, width: 280, boxShadow: '0 8px 32px rgba(0,0,0,.6)' }}
+        onClick={e => e.stopPropagation()}
+      >
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
           <span style={{ fontWeight: 700, color: '#fff', fontSize: 14 }}>{def.label} 設定</span>
           <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#848e9c', display: 'flex' }}><X size={15} /></button>
@@ -199,9 +227,11 @@ function SettingsModal({ indicator, def, onClose, onApply }: {
         {Object.keys(params).map(k => (
           <div key={k} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
             <label style={{ fontSize: 13, color: '#d1d4dc' }}>{def.paramLabels[k] ?? k}</label>
-            <input type="number" value={params[k]}
+            <input
+              type="number" value={params[k]}
               onChange={e => setParams(p => ({ ...p, [k]: +e.target.value }))}
-              style={{ width: 90, background: '#131722', border: '1px solid #2b2b43', borderRadius: 4, padding: '4px 8px', fontSize: 13, color: '#fff', textAlign: 'right', outline: 'none' }} />
+              style={{ width: 90, background: '#131722', border: '1px solid #2b2b43', borderRadius: 4, padding: '4px 8px', fontSize: 13, color: '#fff', textAlign: 'right', outline: 'none' }}
+            />
           </div>
         ))}
         <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
@@ -215,15 +245,23 @@ function SettingsModal({ indicator, def, onClose, onApply }: {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Indicator Dropdown Panel
+// FIX 3: Each active indicator row shows a gear icon to open settings.
 // ─────────────────────────────────────────────────────────────────────────────
-function IndicatorPanel({ activeInds, onToggle, onClose }: {
+function IndicatorPanel({
+  activeInds, onToggle, onOpenSettings, onClose,
+}: {
   activeInds: ActiveIndicator[]
   onToggle: (defName: string) => void
+  onOpenSettings: (defName: string) => void
   onClose: () => void
 }) {
   const activeNames = new Set(activeInds.map(a => a.defName))
   return (
-    <div style={{ position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 100, width: 220, background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 8, boxShadow: '0 8px 24px rgba(0,0,0,.5)', overflow: 'hidden' }}>
+    <div style={{
+      position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 100,
+      width: 230, background: '#1e222d', border: '1px solid #2b2b43',
+      borderRadius: 8, boxShadow: '0 8px 24px rgba(0,0,0,.5)', overflow: 'hidden',
+    }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: '1px solid #2b2b43' }}>
         <span style={{ fontSize: 12, fontWeight: 700, color: '#d1d4dc' }}>技術指標</span>
         <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#848e9c', display: 'flex' }}><X size={13} /></button>
@@ -231,27 +269,65 @@ function IndicatorPanel({ activeInds, onToggle, onClose }: {
 
       <div style={{ padding: '4px 12px 2px', fontSize: 10, color: '#848e9c', fontWeight: 600, letterSpacing: 1, marginTop: 4 }}>主圖</div>
       {INDICATOR_DEFS.filter(d => d.pane === 'main').map(def => (
-        <IndicatorRow key={def.name} def={def} isOn={activeNames.has(def.name)} onToggle={() => onToggle(def.name)} />
+        <IndicatorRow
+          key={def.name} def={def}
+          isOn={activeNames.has(def.name)}
+          onToggle={() => onToggle(def.name)}
+          onSettings={() => onOpenSettings(def.name)}
+        />
       ))}
 
       <div style={{ padding: '6px 12px 2px', fontSize: 10, color: '#848e9c', fontWeight: 600, letterSpacing: 1, borderTop: '1px solid #1e2328', marginTop: 4 }}>副圖</div>
       {INDICATOR_DEFS.filter(d => d.pane === 'sub').map(def => (
-        <IndicatorRow key={def.name} def={def} isOn={activeNames.has(def.name)} onToggle={() => onToggle(def.name)} />
+        <IndicatorRow
+          key={def.name} def={def}
+          isOn={activeNames.has(def.name)}
+          onToggle={() => onToggle(def.name)}
+          onSettings={() => onOpenSettings(def.name)}
+        />
       ))}
     </div>
   )
 }
 
-function IndicatorRow({ def, isOn, onToggle }: { def: IndicatorDef; isOn: boolean; onToggle: () => void }) {
+function IndicatorRow({ def, isOn, onToggle, onSettings }: {
+  def: IndicatorDef; isOn: boolean; onToggle: () => void; onSettings: () => void
+}) {
+  const [hovered, setHovered] = useState(false)
   return (
-    <div onClick={onToggle}
-      style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', cursor: 'pointer' }}
-      onMouseEnter={e => (e.currentTarget.style.background = '#2b2b43')}
-      onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}>
-      <div style={{ width: 14, height: 14, borderRadius: 3, flexShrink: 0, border: `1px solid ${isOn ? '#f0b90b' : '#555'}`, background: isOn ? '#f0b90b' : 'transparent', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+    <div
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', cursor: 'pointer', background: hovered ? '#2b2b43' : 'transparent' }}
+    >
+      {/* Checkbox area toggles indicator on/off */}
+      <div
+        onClick={onToggle}
+        style={{
+          width: 14, height: 14, borderRadius: 3, flexShrink: 0,
+          border: `1px solid ${isOn ? '#f0b90b' : '#555'}`,
+          background: isOn ? '#f0b90b' : 'transparent',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}
+      >
         {isOn && <span style={{ fontSize: 9, fontWeight: 900, color: '#000', lineHeight: 1 }}>✓</span>}
       </div>
-      <span style={{ fontSize: 12, color: '#d1d4dc' }}>{def.label}</span>
+
+      {/* Label toggles indicator on/off */}
+      <span onClick={onToggle} style={{ fontSize: 12, color: '#d1d4dc', flex: 1 }}>{def.label}</span>
+
+      {/* FIX 3: Gear icon — only visible when row is hovered AND indicator is active */}
+      {isOn && hovered && (
+        <button
+          onClick={e => { e.stopPropagation(); onSettings() }}
+          title="設定"
+          style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#848e9c', display: 'flex', alignItems: 'center', padding: 1, flexShrink: 0 }}
+          onMouseEnter={e => (e.currentTarget.style.color = '#d1d4dc')}
+          onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
+        >
+          <Settings size={12} />
+        </button>
+      )}
     </div>
   )
 }
@@ -270,9 +346,9 @@ export default function ChartPage() {
   const ivRef  = useRef(getSaved('chart_interval', '1h'))
   const mtRef  = useRef<MarketType>(getSaved('chart_market', 'futures') as MarketType)
 
-  const [symbol,     setSym]  = useState(symRef.current)
-  const [interval,   setIv]   = useState(ivRef.current)
-  const [marketType, setMt]   = useState<MarketType>(mtRef.current)
+  const [symbol,     setSym]    = useState(symRef.current)
+  const [interval,   setIv]     = useState(ivRef.current)
+  const [marketType, setMt]     = useState<MarketType>(mtRef.current)
   const [loading,    setLoading] = useState(false)
   const [error,      setError]   = useState<string | null>(null)
   const [wsStatus,   setWsSt]    = useState<'connecting' | 'live' | 'disconnected'>('disconnected')
@@ -290,26 +366,39 @@ export default function ChartPage() {
   const [activeInds,   setActiveInds]   = useState<ActiveIndicator[]>([])
   const [settingsName, setSettingsName] = useState<string | null>(null)
 
-  // ── Chart init ────────────────────────────────────────────────────────────
+  // ── Chart init ─────────────────────────────────────────────────────────────
   useEffect(() => {
     const chart = init(CHART_ID, {
-      // Only candle + xAxis in layout. Sub-panes are added dynamically.
+      // FIX 4: Only candle + xAxis. Sub-panes are added/removed dynamically.
+      // When a sub-pane is added, the main candle pane shrinks and the xAxis
+      // (time axis) stays at the absolute bottom — it always moves DOWN when
+      // a pane is added and UP when a pane is removed. This is KLineChart's
+      // native behaviour with this layout config.
       layout: [
         { type: 'candle', options: { gap: { bottom: 2 } } },
         { type: 'xAxis' },
       ],
       styles: {
-        grid:      { horizontal: { color: '#1e2328' }, vertical: { color: '#1e2328' } },
+        grid: { horizontal: { color: '#1e2328' }, vertical: { color: '#1e2328' } },
         candle: {
           bar: { upColor: '#26a69a', downColor: '#ef5350', noChangeColor: '#888' },
-          tooltip: { showRule: 'follow_cross', labels: ['時間', '開', '高', '低', '收', '量'] },
+          tooltip: {
+            // FIX 2: 'always' means OHLCV is shown permanently in top-left,
+            // not just when the crosshair is active.
+            showRule: 'always',
+            showType: 'standard',
+            labels: ['時間', '開', '高', '低', '收', '量'],
+            text: { size: 11, color: '#848e9c' },
+          },
         },
         indicator: {
           ohlc: { upColor: '#26a69a', downColor: '#ef5350' },
           tooltip: {
-            // Always show indicator name+params in top-left; values appear on crosshair
+            // Native indicator legend always shown in each pane's top-left.
+            // KLineChart renders name+params there; values update on crosshair.
             showRule: 'always',
             showType: 'standard',
+            text: { size: 11, color: '#848e9c' },
           },
         },
         xAxis:     { tickText: { color: '#848e9c', size: 11 }, axisLine: { color: '#2b2b43' } },
@@ -333,7 +422,7 @@ export default function ChartPage() {
     return () => { dispose(CHART_ID) }
   }, [])
 
-  // ── Load klines ───────────────────────────────────────────────────────────
+  // ── Load klines ────────────────────────────────────────────────────────────
   const loadData = useCallback(async (mt: MarketType, sym: string, iv: string) => {
     const chart = chartRef.current; if (!chart) return
     setLoading(true); setError(null)
@@ -346,14 +435,17 @@ export default function ChartPage() {
     finally { setLoading(false) }
   }, [])
 
-  // ── WebSocket ─────────────────────────────────────────────────────────────
+  // ── WebSocket ──────────────────────────────────────────────────────────────
   const connectWS = useCallback((mt: MarketType, sym: string, iv: string) => {
     if (wsRef.current) { wsRef.current.close(); wsRef.current = null }
     const base = mt === 'futures' ? FUTURES_WS_BASE : SPOT_WS_BASE
     const ws = new WebSocket(`${base}/${sym.toLowerCase()}@kline_${iv}`)
     wsRef.current = ws; setWsSt('connecting')
     ws.onopen  = () => setWsSt('live')
-    ws.onclose = () => { setWsSt('disconnected'); rcRef.current = setTimeout(() => connectWS(mtRef.current, symRef.current, ivRef.current), 3000) }
+    ws.onclose = () => {
+      setWsSt('disconnected')
+      rcRef.current = setTimeout(() => connectWS(mtRef.current, symRef.current, ivRef.current), 3000)
+    }
     ws.onerror = () => ws.close()
     ws.onmessage = e => {
       const { k } = JSON.parse(e.data)
@@ -362,13 +454,13 @@ export default function ChartPage() {
     }
   }, [])
 
-  // ── "X ago" ticker ────────────────────────────────────────────────────────
+  // ── "X ago" ticker ─────────────────────────────────────────────────────────
   useEffect(() => {
     tickRef.current = setInterval(() => { if (lastTs) setAgoStr(timeAgo(lastTs)) }, 1000)
     return () => { if (tickRef.current) clearInterval(tickRef.current) }
   }, [lastTs])
 
-  // ── Switch symbol / interval ──────────────────────────────────────────────
+  // ── Switch symbol / interval ───────────────────────────────────────────────
   const switchPair = useCallback((mt: MarketType, sym: string, iv: string) => {
     symRef.current = sym; ivRef.current = iv; mtRef.current = mt
     localStorage.setItem('chart_symbol', sym)
@@ -389,7 +481,7 @@ export default function ChartPage() {
     }
   }, [])
 
-  // ── Toggle indicator ──────────────────────────────────────────────────────
+  // ── Toggle indicator ───────────────────────────────────────────────────────
   const toggleIndicator = useCallback((defName: string) => {
     const chart = chartRef.current; if (!chart) return
     const def = INDICATOR_DEFS.find(d => d.name === defName)!
@@ -397,23 +489,26 @@ export default function ChartPage() {
     setActiveInds(prev => {
       const existing = prev.find(a => a.defName === defName)
       if (existing) {
-        // Remove
+        // Remove indicator
         try {
           if (def.pane === 'main') {
             chart.removeIndicator('candle_pane', defName)
           } else {
+            // FIX 4: removePane removes the sub-pane entirely.
+            // The xAxis (time axis) then moves UP to fill the reclaimed space.
             chart.removePane(existing.paneId)
           }
         } catch (err) { console.warn('remove error', err) }
         return prev.filter(a => a.defName !== defName)
       } else {
-        // Add
+        // Add indicator
         let paneId: string
         try {
           if (def.pane === 'main') {
             paneId = (chart.createIndicator(defName, false, { id: 'candle_pane' }) ?? 'candle_pane') as string
           } else {
-            // New sub-pane, height 100px; time axis shifts up automatically
+            // FIX 4: createIndicator with height creates a new sub-pane.
+            // The main candle pane shrinks; the xAxis moves DOWN.
             paneId = (chart.createIndicator(defName, false, { height: 100 }) ?? `${defName}_pane`) as string
           }
         } catch (err) {
@@ -425,7 +520,7 @@ export default function ChartPage() {
     })
   }, [])
 
-  // ── Apply settings ────────────────────────────────────────────────────────
+  // ── Apply settings ─────────────────────────────────────────────────────────
   const applySettings = useCallback((defName: string, params: Record<string, number>) => {
     const chart = chartRef.current; if (!chart) return
     setActiveInds(prev => prev.map(a => {
@@ -435,7 +530,7 @@ export default function ChartPage() {
     }))
   }, [])
 
-  // ── Toggle visibility ─────────────────────────────────────────────────────
+  // ── Toggle visibility ──────────────────────────────────────────────────────
   const toggleVisibility = useCallback((defName: string) => {
     const chart = chartRef.current; if (!chart) return
     setActiveInds(prev => prev.map(a => {
@@ -446,15 +541,21 @@ export default function ChartPage() {
     }))
   }, [])
 
-  // ── Derived ───────────────────────────────────────────────────────────────
+  // ── Open settings (from tag or from panel gear) ────────────────────────────
+  const openSettings = useCallback((defName: string) => {
+    setSettingsName(defName)
+    setShowIndP(false)
+  }, [])
+
+  // ── Derived ────────────────────────────────────────────────────────────────
   const settingsInd  = settingsName ? activeInds.find(a => a.defName === settingsName) : null
   const settingsDef  = settingsName ? INDICATOR_DEFS.find(d => d.name === settingsName) : null
   const filteredSyms = POPULAR_SYMBOLS.filter(s => s.includes(searchQ.toUpperCase()))
   const pctColor     = (ticker?.priceChangePct ?? 0) >= 0 ? '#26a69a' : '#ef5350'
 
-  // Separate active indicators into main / sub groups for the tag bar
+  // Only main-pane indicators get React tags in the interval row.
+  // Sub-pane indicators are labelled natively by KLineChart inside each sub-pane canvas.
   const mainInds = activeInds.filter(a => INDICATOR_DEFS.find(d => d.name === a.defName)?.pane === 'main')
-  const subInds  = activeInds.filter(a => INDICATOR_DEFS.find(d => d.name === a.defName)?.pane === 'sub')
 
   function paramStr(ind: ActiveIndicator) {
     const vals = Object.values(ind.params)
@@ -468,28 +569,35 @@ export default function ChartPage() {
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden', background: '#131722', color: '#d1d4dc' }}>
       <PageHeader title="K線圖表" />
 
-      {/* ── ROW 1: Toolbar ─────────────────────────────────────────────────── */}
+      {/* ── ROW 1: Toolbar ────────────────────────────────────────────────── */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderBottom: '1px solid #2b2b43', flexShrink: 0 }}>
 
         {/* Symbol picker */}
         <div style={{ position: 'relative' }}>
-          <button onClick={() => { setShowSymP(v => !v); setShowIndP(false) }}
-            style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 4, color: '#d1d4dc', fontSize: 13, fontWeight: 700, cursor: 'pointer' }}>
+          <button
+            onClick={() => { setShowSymP(v => !v); setShowIndP(false) }}
+            style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '3px 8px', background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 4, color: '#d1d4dc', fontSize: 13, fontWeight: 700, cursor: 'pointer' }}
+          >
             {symbol} <ChevronDown size={13} />
           </button>
           {showSymP && (
             <div style={{ position: 'absolute', top: '100%', left: 0, marginTop: 4, zIndex: 100, background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 6, width: 200, boxShadow: '0 8px 24px rgba(0,0,0,.5)' }}>
               <div style={{ padding: '6px 8px', borderBottom: '1px solid #2b2b43', display: 'flex', alignItems: 'center', gap: 6 }}>
                 <Search size={13} color="#848e9c" />
-                <input autoFocus value={searchQ} onChange={e => setSearchQ(e.target.value)}
-                  placeholder="搜尋..." style={{ background: 'transparent', border: 'none', outline: 'none', color: '#d1d4dc', fontSize: 12, width: '100%' }} />
+                <input
+                  autoFocus value={searchQ} onChange={e => setSearchQ(e.target.value)}
+                  placeholder="搜尋..." style={{ background: 'transparent', border: 'none', outline: 'none', color: '#d1d4dc', fontSize: 12, width: '100%' }}
+                />
               </div>
               <div style={{ maxHeight: 200, overflowY: 'auto' }}>
                 {filteredSyms.map(s => (
-                  <div key={s} onClick={() => { switchPair(marketType, s, interval); setShowSymP(false); setSearchQ('') }}
+                  <div
+                    key={s}
+                    onClick={() => { switchPair(marketType, s, interval); setShowSymP(false); setSearchQ('') }}
                     style={{ padding: '6px 12px', fontSize: 12, cursor: 'pointer', background: s === symbol ? '#2b2b43' : 'transparent', color: s === symbol ? '#f0b90b' : '#d1d4dc' }}
                     onMouseEnter={e => (e.currentTarget.style.background = '#2b2b43')}
-                    onMouseLeave={e => (e.currentTarget.style.background = s === symbol ? '#2b2b43' : 'transparent')}>
+                    onMouseLeave={e => (e.currentTarget.style.background = s === symbol ? '#2b2b43' : 'transparent')}
+                  >
                     {s}
                   </div>
                 ))}
@@ -501,8 +609,10 @@ export default function ChartPage() {
         {/* Spot / Futures toggle */}
         <div style={{ display: 'flex', background: '#1e222d', borderRadius: 4, border: '1px solid #2b2b43', overflow: 'hidden' }}>
           {(['spot', 'futures'] as MarketType[]).map(m => (
-            <button key={m} onClick={() => switchPair(m, symbol, interval)}
-              style={{ padding: '3px 9px', fontSize: 11, cursor: 'pointer', border: 'none', fontWeight: marketType === m ? 700 : 400, background: marketType === m ? '#f0b90b' : 'transparent', color: marketType === m ? '#000' : '#848e9c' }}>
+            <button
+              key={m} onClick={() => switchPair(m, symbol, interval)}
+              style={{ padding: '3px 9px', fontSize: 11, cursor: 'pointer', border: 'none', fontWeight: marketType === m ? 700 : 400, background: marketType === m ? '#f0b90b' : 'transparent', color: marketType === m ? '#000' : '#848e9c' }}
+            >
               {m === 'spot' ? '現貨' : '合約'}
             </button>
           ))}
@@ -512,18 +622,24 @@ export default function ChartPage() {
 
         {/* WS status */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: wsStatus === 'live' ? '#26a69a' : '#848e9c' }}>
-          <span style={{ width: 6, height: 6, borderRadius: '50%', display: 'inline-block', backgroundColor: wsStatus === 'live' ? '#26a69a' : wsStatus === 'connecting' ? '#f0b90b' : '#ef5350' }} />
+          <span style={{
+            width: 6, height: 6, borderRadius: '50%', display: 'inline-block',
+            backgroundColor: wsStatus === 'live' ? '#26a69a' : wsStatus === 'connecting' ? '#f0b90b' : '#ef5350',
+          }} />
           {wsStatus === 'live' ? '即時' : wsStatus === 'connecting' ? '連線中' : '斷線'}
         </div>
 
         {/* Refresh */}
-        <button onClick={() => switchPair(marketType, symbol, interval)}
-          style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 3, display: 'flex', alignItems: 'center' }}>
+        <button
+          onClick={() => switchPair(marketType, symbol, interval)}
+          style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 3, display: 'flex', alignItems: 'center' }}
+        >
           <RefreshCw size={14} color={loading ? '#f0b90b' : '#848e9c'} />
         </button>
       </div>
 
-      {/* ── ROW 2: Price bar ────────────────────────────────────────────────── */}
+      {/* ── ROW 2: Price bar ──────────────────────────────────────────────── */}
+      {/* FIX 2: This row is always rendered — no conditional on ticker/price. */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '3px 12px', borderBottom: '1px solid #2b2b43', flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
           <span style={{ fontSize: 22, fontFamily: 'monospace', fontWeight: 700, color: pctColor }}>
@@ -537,13 +653,17 @@ export default function ChartPage() {
           )}
         </div>
         <div style={{ width: 1, height: 28, background: '#2b2b43' }} />
-        {ticker && (
-          <div style={{ display: 'flex', gap: 16, fontSize: 11 }}>
-            <div style={{ color: '#848e9c' }}>24h高 <span style={{ color: '#d1d4dc' }}>{fmtPrice(ticker.high24h)}</span></div>
-            <div style={{ color: '#848e9c' }}>24h低 <span style={{ color: '#d1d4dc' }}>{fmtPrice(ticker.low24h)}</span></div>
-            <div style={{ color: '#848e9c' }}>24h量 <span style={{ color: '#d1d4dc' }}>{fmtVol(ticker.volume24h)}</span></div>
-          </div>
-        )}
+        <div style={{ display: 'flex', gap: 16, fontSize: 11 }}>
+          {ticker ? (
+            <>
+              <div style={{ color: '#848e9c' }}>24h高 <span style={{ color: '#d1d4dc' }}>{fmtPrice(ticker.high24h)}</span></div>
+              <div style={{ color: '#848e9c' }}>24h低 <span style={{ color: '#d1d4dc' }}>{fmtPrice(ticker.low24h)}</span></div>
+              <div style={{ color: '#848e9c' }}>24h量 <span style={{ color: '#d1d4dc' }}>{fmtVol(ticker.volume24h)}</span></div>
+            </>
+          ) : (
+            <div style={{ color: '#444' }}>載入中...</div>
+          )}
+        </div>
         <div style={{ flex: 1 }} />
         <div style={{ fontSize: 11, color: '#848e9c', textAlign: 'right' }}>
           {barTs && <span style={{ color: '#d1d4dc' }}>{fmtTs(barTs)}</span>}
@@ -552,14 +672,15 @@ export default function ChartPage() {
         </div>
       </div>
 
-      {/* ── ROW 3: Interval + indicator tags + indicator button ─────────────── */}
+      {/* ── ROW 3: Interval + main-pane indicator tags + indicator button ── */}
       {/*
-          Layout of this row (mimics KLineChart demo):
-          [1分][3分]...[週] | [MA(14) 👁⚙✕] [EMA(14)] | spacer | [指標▼]
+          Layout:
+          [1分][3分]...[週] | [MA(14) ← hover reveals 👁⚙✕] [EMA(14)] | spacer | [指標▼]
 
-          Main-pane indicator tags sit inline with the interval buttons,
-          separated by a thin divider. Sub-pane tags are NOT shown here —
-          KLineChart renders its own native legend inside each sub-pane canvas.
+          FIX 1: IndicatorTag shows plain grey text always.
+                 Eye / Gear / X only appear when mouse is over that specific tag.
+                 Sub-pane indicators (VOL/MACD/RSI/KDJ) are NOT listed here —
+                 KLineChart renders their names natively in each sub-pane canvas.
       */}
       <div style={{ display: 'flex', alignItems: 'center', padding: '2px 8px', borderBottom: '1px solid #2b2b43', flexShrink: 0, gap: 2, minHeight: 28 }}>
 
@@ -567,58 +688,65 @@ export default function ChartPage() {
         {INTERVALS.map(iv => {
           const active = iv === interval
           return (
-            <button key={iv} onClick={() => switchPair(marketType, symbol, iv)}
+            <button
+              key={iv} onClick={() => switchPair(marketType, symbol, iv)}
               style={{
                 padding: '2px 7px', fontSize: 11, borderRadius: 3, border: 'none', cursor: 'pointer',
                 fontWeight: active ? 700 : 400,
                 background: active ? '#f0b90b' : 'transparent',
                 color: active ? '#000' : '#848e9c',
-              }}>
+              }}
+            >
               {INTERVAL_LABELS[iv]}
             </button>
           )
         })}
 
-        {/* Divider — only show when there are main-pane indicators */}
+        {/* Divider before indicator tags */}
         {mainInds.length > 0 && (
           <div style={{ width: 1, height: 14, background: '#2b2b43', margin: '0 4px', flexShrink: 0 }} />
         )}
 
-        {/* Main-pane indicator tags: "MA(14)" with hover controls */}
+        {/* Main-pane indicator tags — plain text always, controls on hover */}
         {mainInds.map(ind => (
           <IndicatorTag
             key={ind.defName}
             label={`${ind.defName}${paramStr(ind)}`}
             visible={ind.visible}
             onToggleVisible={() => toggleVisibility(ind.defName)}
-            onSettings={() => setSettingsName(ind.defName)}
+            onSettings={() => openSettings(ind.defName)}
             onRemove={() => toggleIndicator(ind.defName)}
           />
         ))}
 
         <div style={{ flex: 1 }} />
 
-        {/* Indicator button */}
+        {/* Indicator panel button */}
         <div style={{ position: 'relative' }}>
-          <button onClick={() => { setShowIndP(v => !v); setShowSymP(false) }}
-            style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '2px 8px', fontSize: 11, cursor: 'pointer', background: showIndP ? '#2b2b43' : 'transparent', border: '1px solid #2b2b43', borderRadius: 4, color: '#d1d4dc' }}>
+          <button
+            onClick={() => { setShowIndP(v => !v); setShowSymP(false) }}
+            style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '2px 8px', fontSize: 11, cursor: 'pointer', background: showIndP ? '#2b2b43' : 'transparent', border: '1px solid #2b2b43', borderRadius: 4, color: '#d1d4dc' }}
+          >
             <BarChart2 size={13} /> 指標
           </button>
           {showIndP && (
             <IndicatorPanel
               activeInds={activeInds}
-              onToggle={name => { toggleIndicator(name) }}
+              onToggle={toggleIndicator}
+              onOpenSettings={openSettings}
               onClose={() => setShowIndP(false)}
             />
           )}
         </div>
       </div>
 
-      {/* ── ROW 4: Chart ────────────────────────────────────────────────────── */}
+      {/* ── ROW 4: Chart canvas ────────────────────────────────────────────── */}
       {/*
-          Sub-pane indicator tags (VOL, MACD, RSI, KDJ) are rendered natively
-          by KLineChart inside each sub-pane canvas — no extra React DOM needed.
-          We only need to manage them through the Indicator button above.
+          KLineChart renders natively inside #kline-chart:
+            - Candle pane (main): OHLCV tooltip top-left (always), MA/EMA/BOLL overlay
+            - Sub-panes (dynamic): each shows its indicator name+values top-left
+            - xAxis (time axis): always at the very bottom
+          Sub-panes are added/removed via toggleIndicator — no hardcoded layout.
       */}
       <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
         {loading && (
@@ -634,9 +762,13 @@ export default function ChartPage() {
         <div id={CHART_ID} style={{ width: '100%', height: '100%' }} />
       </div>
 
-      {/* ── Settings Modal ───────────────────────────────────────────────────── */}
+      {/* ── Settings Modal ─────────────────────────────────────────────────── */}
       {settingsName && settingsInd && settingsDef && (
-        <SettingsModal indicator={settingsInd} def={settingsDef} onClose={() => setSettingsName(null)} onApply={applySettings} />
+        <SettingsModal
+          indicator={settingsInd} def={settingsDef}
+          onClose={() => setSettingsName(null)}
+          onApply={applySettings}
+        />
       )}
 
       {/* Click-outside to close dropdowns */}
