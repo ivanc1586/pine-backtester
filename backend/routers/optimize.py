@@ -31,7 +31,7 @@ from pydantic import BaseModel
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/optimize", tags=["optimize"])
+router = APIRouter(tags=["optimize"])
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -476,7 +476,7 @@ async def fetch_candles(symbol: str, interval: str, source: str, start_date: str
         pass
 
     import httpx
-    url = "https://api.binance.vision/api/v3/klines"
+    url = "https://api.binance.com/api/v3/klines"
     params = {
         "symbol": symbol.upper(), "interval": interval,
         "startTime": int(pd.Timestamp(start_date).timestamp() * 1000),
