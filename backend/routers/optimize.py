@@ -31,7 +31,7 @@ from pydantic import BaseModel
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["optimize"])
+router = APIRouter(prefix="/optimize", tags=["optimize"])
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -170,7 +170,7 @@ Convert the Pine Script strategy to a Python function with these STRICT rules:
 6. ATR: Wilder smoothing (same formula as SMMA), NOT simple EMA
 7. var variables = persistent state across bars
 8. position tracking: integer flag (0=flat, 1=long, -1=short)
-9. Return: {"trades": [...], "equity_curve": [...]} 
+9. Return: {"trades": [...], "equity_curve": [...]}
 
 Each trade dict:
 {
@@ -204,7 +204,7 @@ async def translate_with_gemini(pine_script: str) -> str:
 
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-2.0-flash",
             system_instruction=GEMINI_SYSTEM_PROMPT
         )
 
@@ -286,7 +286,7 @@ def _get_fallback_strategy() -> str:
         })
 
     return {"trades": trades, "equity_curve": equity_curve}
-''' 
+'''
 
 # ---------------------------------------------------------------------------
 # Gemini AI parameter range suggester
@@ -327,7 +327,7 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
 
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-2.0-flash",
             system_instruction=SUGGEST_SYSTEM_PROMPT
         )
 
@@ -369,7 +369,6 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
     except Exception as e:
         logger.warning(f"Gemini suggest failed: {e}, using fallback")
         return _fallback_suggest(pine_script)
-
 
 def _fallback_suggest(pine_script: str) -> list[dict]:
     """Fallback: use regex parser + heuristic bounds."""
