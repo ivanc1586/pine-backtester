@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createChart, IChartApi, ISeriesApi, Time, CrosshairMode } from 'lightweight-charts'
 import { Search, ChevronDown } from 'lucide-react'
 import PageHeader from '../components/PageHeader'
@@ -17,10 +17,9 @@ const POPULAR_SYMBOLS = [
   'LINKUSDT','UNIUSDT','LTCUSDT','ATOMUSDT','NEARUSDT',
 ]
 
-const getSavedSymbol    = () => localStorage.getItem('chart_symbol')  || 'BTCUSDT'
+const getSavedSymbol    = () => localStorage.getItem('chart_symbol')   || 'BTCUSDT'
 const getSavedTimeframe = () => localStorage.getItem('chart_interval') || '1h'
 
-// Backend base URL — same origin in prod, env var in dev
 const WS_BASE = (() => {
   const api = import.meta.env.VITE_API_URL || ''
   if (api) return api.replace(/^http/, 'ws')
@@ -32,23 +31,23 @@ export default function ChartPage() {
   const chartRef          = useRef<IChartApi | null>(null)
   const candleSeriesRef   = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const wsRef             = useRef<WebSocket | null>(null)
+  const chartReadyRef     = useRef(false)   // true once chart+series are initialised
+  const pendingLoadRef    = useRef<{sym: string, tf: string} | null>(null)
 
-  const symbolRef    = useRef(getSavedSymbol())
-  const timeframeRef = useRef(getSavedTimeframe())
-
-  const [symbol,         setSymbol]         = useState(symbolRef.current)
-  const [timeframe,      setTimeframe]      = useState(timeframeRef.current)
-  const [loading,        setLoading]        = useState(false)
-  const [error,          setError]          = useState<string | null>(null)
-  const [lastUpdated,    setLastUpdated]    = useState<Date | null>(null)
-  const [searchQuery,    setSearchQuery]    = useState('')
-  const [showSymbolPanel,setShowSymbolPanel]= useState(false)
-  const [currentPrice,   setCurrentPrice]  = useState<number | null>(null)
+  const [symbol,          setSymbol]          = useState(getSavedSymbol)
+  const [timeframe,       setTimeframe]       = useState(getSavedTimeframe)
+  const [loading,         setLoading]         = useState(false)
+  const [error,           setError]           = useState<string | null>(null)
+  const [lastUpdated,     setLastUpdated]     = useState<Date | null>(null)
+  const [searchQuery,     setSearchQuery]     = useState('')
+  const [showSymbolPanel, setShowSymbolPanel] = useState(false)
+  const [currentPrice,    setCurrentPrice]    = useState<number | null>(null)
   const { selectedStrategy } = useStrategyStore()
 
-  // ── Chart init (once) ────────────────────────────────────────────────────
+  // ── 1. Init chart (once, on mount) ───────────────────────────────────────
   useEffect(() => {
     if (!chartContainerRef.current) return
+
     const chart = createChart(chartContainerRef.current, {
       layout: { background: { color: '#131722' }, textColor: '#d1d4dc' },
       grid:   { vertLines: { color: '#1e2328' }, horzLines: { color: '#1e2328' } },
@@ -56,39 +55,64 @@ export default function ChartPage() {
       rightPriceScale: { borderColor: '#2b2b43' },
       timeScale: { borderColor: '#2b2b43', timeVisible: true, secondsVisible: false },
       width:  chartContainerRef.current.clientWidth,
-      height: 600,
+      height: 520,
     })
+
     const candleSeries = chart.addCandlestickSeries({
       upColor: '#26a69a', downColor: '#ef5350',
       borderUpColor: '#26a69a', borderDownColor: '#ef5350',
       wickUpColor:   '#26a69a', wickDownColor:   '#ef5350',
     })
-    chartRef.current       = chart
+
+    chartRef.current        = chart
     candleSeriesRef.current = candleSeries
+    chartReadyRef.current   = true
+
+    // If loadChart() was called before chart was ready, run it now
+    if (pendingLoadRef.current) {
+      const { sym, tf } = pendingLoadRef.current
+      pendingLoadRef.current = null
+      loadChart(sym, tf)
+    }
 
     const handleResize = () => {
       if (chartContainerRef.current && chartRef.current)
         chartRef.current.applyOptions({ width: chartContainerRef.current.clientWidth })
     }
     window.addEventListener('resize', handleResize)
+
     return () => {
       window.removeEventListener('resize', handleResize)
+      chartReadyRef.current = false
       chart.remove()
     }
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Load historical candles via REST, then open WS ────────────────────────
-  const connectChart = useCallback(async (sym: string, tf: string) => {
-    // 1. Close any existing WS
+  // ── 2. Load REST history + open WebSocket ────────────────────────────────
+  function closeWs() {
     if (wsRef.current) {
-      wsRef.current.onclose = null   // suppress reconnect logic
-      wsRef.current.close()
+      const ws = wsRef.current
+      ws.onclose   = null
+      ws.onerror   = null
+      ws.onmessage = null
+      ws.close(1000)
       wsRef.current = null
     }
+  }
 
-    // 2. Fetch history
+  async function loadChart(sym: string, tf: string) {
+    // Guard: chart not ready yet — queue the request
+    if (!chartReadyRef.current || !candleSeriesRef.current) {
+      pendingLoadRef.current = { sym, tf }
+      return
+    }
+
+    closeWs()
     setLoading(true)
     setError(null)
+
+    // ── REST: fetch historical candles ───────────────────────────────────
+    let formatted: {time: Time; open: number; high: number; low: number; close: number}[] = []
     try {
       const data = await marketApi.getKlines({ symbol: sym, interval: tf, limit: 500 })
       if (!data || data.length === 0) {
@@ -96,103 +120,92 @@ export default function ChartPage() {
         setLoading(false)
         return
       }
-      const formatted = data.map((k: any) => ({
+      formatted = data.map((k: any) => ({
         time:  k.time as Time,
-        open:  k.open,
-        high:  k.high,
-        low:   k.low,
-        close: k.close,
+        open:  Number(k.open),
+        high:  Number(k.high),
+        low:   Number(k.low),
+        close: Number(k.close),
       }))
-      candleSeriesRef.current?.setData(formatted)
+      candleSeriesRef.current.setData(formatted)
       chartRef.current?.timeScale().fitContent()
+      setCurrentPrice(formatted[formatted.length - 1].close)
       setLastUpdated(new Date())
-      setCurrentPrice(data[data.length - 1].close)
     } catch (err: any) {
       setError(err.message || 'Failed to fetch data')
-      console.error('REST fetch error:', err)
       setLoading(false)
       return
     }
     setLoading(false)
 
-    // 3. Open WebSocket for real-time updates
+    // ── WS: real-time updates ────────────────────────────────────────────
     const wsUrl = `${WS_BASE}/api/market/ws/klines/${sym}/${tf}`
-    console.info('Connecting WS:', wsUrl)
-    const ws = new WebSocket(wsUrl)
+    console.info('[WS] connecting:', wsUrl)
+    openWs(wsUrl, sym, tf)
+  }
+
+  function openWs(url: string, sym: string, tf: string) {
+    const ws = new WebSocket(url)
     wsRef.current = ws
+
+    ws.onopen = () => {
+      console.info('[WS] opened:', url)
+    }
 
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data)
-
-        // Ignore heartbeat / error frames
         if (msg.type === 'ping') return
         if (msg.type === 'error') {
-          console.warn('WS upstream error:', msg.message)
+          console.warn('[WS] upstream error:', msg.message)
           return
         }
-
         const candle = {
           time:  msg.time as Time,
-          open:  msg.open,
-          high:  msg.high,
-          low:   msg.low,
-          close: msg.close,
+          open:  Number(msg.open),
+          high:  Number(msg.high),
+          low:   Number(msg.low),
+          close: Number(msg.close),
         }
-
-        // update() handles both "update last bar" and "add new bar"
         candleSeriesRef.current?.update(candle)
-        setCurrentPrice(msg.close)
+        setCurrentPrice(Number(msg.close))
         setLastUpdated(new Date())
       } catch (e) {
-        console.error('WS message parse error:', e)
+        console.error('[WS] parse error:', e)
       }
     }
 
     ws.onerror = (e) => {
-      console.error('WS error:', e)
+      console.error('[WS] error:', e)
     }
 
     ws.onclose = (e) => {
-      console.warn('WS closed:', e.code, e.reason)
-      // Reconnect after 3 s if the component is still mounted
-      // and the close wasn't triggered by us (code 1000 = normal)
-      if (e.code !== 1000 && wsRef.current === ws) {
+      console.warn('[WS] closed:', e.code, e.reason)
+      // Auto-reconnect for abnormal closes (not 1000=normal, not 1008=invalid interval)
+      if (e.code !== 1000 && e.code !== 1008 && wsRef.current === ws) {
+        console.info('[WS] reconnecting in 4s...')
         setTimeout(() => {
-          if (wsRef.current === ws) {   // still the active ws
-            connectChart(symbolRef.current, timeframeRef.current)
-          }
-        }, 3000)
+          if (wsRef.current === ws) openWs(url, sym, tf)
+        }, 4000)
       }
     }
-  }, [])
+  }
 
-  // ── Trigger on symbol / timeframe change ─────────────────────────────────
+  // ── 3. React to symbol/timeframe changes ─────────────────────────────────
   useEffect(() => {
-    connectChart(symbolRef.current, timeframeRef.current)
-    return () => {
-      // Cleanup on unmount
-      if (wsRef.current) {
-        wsRef.current.onclose = null
-        wsRef.current.close(1000)
-        wsRef.current = null
-      }
-    }
-  }, [connectChart])
+    loadChart(symbol, timeframe)
+    return closeWs
+  }, [symbol, timeframe]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const handleSymbolChange = (newSymbol: string) => {
-    symbolRef.current = newSymbol
-    setSymbol(newSymbol)
-    localStorage.setItem('chart_symbol', newSymbol)
+  const handleSymbolChange = (newSym: string) => {
+    localStorage.setItem('chart_symbol', newSym)
+    setSymbol(newSym)
     setShowSymbolPanel(false)
-    connectChart(newSymbol, timeframeRef.current)
   }
 
   const handleTimeframeChange = (newTF: string) => {
-    timeframeRef.current = newTF
-    setTimeframe(newTF)
     localStorage.setItem('chart_interval', newTF)
-    connectChart(symbolRef.current, newTF)
+    setTimeframe(newTF)
   }
 
   const filteredSymbols = searchQuery.trim()
@@ -202,12 +215,13 @@ export default function ChartPage() {
   return (
     <div className="min-h-screen bg-gray-900">
       <PageHeader
-        title="📈 Price Chart"
-        subtitle={selectedStrategy ? `Strategy: ${selectedStrategy.name}` : 'Real-time market data'}
+        title="市場圖表"
+        subtitle={selectedStrategy ? `Strategy: ${selectedStrategy.name}` : ''}
       />
 
-      <div className="max-w-7xl mx-auto px-4 py-6 space-y-6">
-        {/* Controls */}
+      <div className="max-w-7xl mx-auto px-4 py-6 space-y-4">
+
+        {/* Controls bar */}
         <div className="bg-gray-800 rounded-xl shadow-xl p-4 border border-gray-700">
           <div className="flex flex-wrap gap-4 items-center">
 
@@ -223,7 +237,7 @@ export default function ChartPage() {
               </button>
 
               {showSymbolPanel && (
-                <div className="absolute top-full left-0 mt-2 w-80 bg-gray-800 border border-gray-600 rounded-lg shadow-2xl z-50 max-h-96 overflow-auto">
+                <div className="absolute top-full left-0 mt-2 w-72 bg-gray-800 border border-gray-600 rounded-lg shadow-2xl z-50 max-h-80 overflow-auto">
                   <div className="p-3 border-b border-gray-700">
                     <div className="relative">
                       <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
@@ -238,21 +252,17 @@ export default function ChartPage() {
                     </div>
                   </div>
                   <div className="p-2">
-                    {filteredSymbols.length === 0 ? (
-                      <div className="text-center py-4 text-gray-400">No symbols found</div>
-                    ) : (
-                      filteredSymbols.map(s => (
-                        <button
-                          key={s}
-                          onClick={() => handleSymbolChange(s)}
-                          className={`w-full text-left px-3 py-2 rounded hover:bg-gray-700 transition-colors ${
-                            s === symbol ? 'bg-blue-600 text-white' : 'text-gray-300'
-                          }`}
-                        >
-                          {s}
-                        </button>
-                      ))
-                    )}
+                    {filteredSymbols.map(s => (
+                      <button
+                        key={s}
+                        onClick={() => handleSymbolChange(s)}
+                        className={`w-full text-left px-3 py-2 rounded hover:bg-gray-700 transition-colors ${
+                          s === symbol ? 'bg-blue-600 text-white' : 'text-gray-300'
+                        }`}
+                      >
+                        {s}
+                      </button>
+                    ))}
                   </div>
                 </div>
               )}
@@ -264,7 +274,7 @@ export default function ChartPage() {
                 <button
                   key={int}
                   onClick={() => handleTimeframeChange(int)}
-                  className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                  className={`px-3 py-2 rounded-lg font-medium text-sm transition-colors ${
                     timeframe === int
                       ? 'bg-blue-600 text-white'
                       : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
@@ -274,39 +284,37 @@ export default function ChartPage() {
                 </button>
               ))}
             </div>
+
+            {/* Price + live dot */}
+            <div className="ml-auto flex items-center gap-3">
+              {currentPrice !== null && (
+                <span className="text-white font-mono font-bold text-lg">
+                  ${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+              )}
+              {lastUpdated && (
+                <div className="flex items-center gap-1.5 text-gray-400 text-xs">
+                  <span className="inline-block w-2 h-2 rounded-full bg-green-400 animate-pulse" />
+                  <span className="font-mono">{lastUpdated.toLocaleTimeString()}</span>
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
-        {/* Status bar */}
-        {(lastUpdated || currentPrice !== null) && (
-          <div className="bg-gray-800 rounded-lg px-4 py-2 border border-gray-700 flex items-center gap-4 text-sm">
-            {currentPrice !== null && (
-              <div className="flex items-center gap-2">
-                <span className="text-gray-400">Current:</span>
-                <span className="text-white font-mono font-bold">${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-              </div>
-            )}
-            {lastUpdated && (
-              <div className="flex items-center gap-2 text-gray-400">
-                <span className="inline-block w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-                <span className="font-mono">{lastUpdated.toLocaleTimeString()}</span>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Error message */}
+        {/* Error */}
         {error && (
-          <div className="bg-red-900/50 border border-red-700 text-red-200 px-4 py-3 rounded-lg">
+          <div className="bg-red-900/50 border border-red-700 text-red-200 px-4 py-3 rounded-lg text-sm">
             ⚠ {error}
           </div>
         )}
 
-        {/* Chart */}
-        <div className="bg-gray-800 rounded-xl shadow-xl p-4 border border-gray-700 relative">
+        {/* Chart container - explicit height so lightweight-charts renders */}
+        <div className="bg-gray-800 rounded-xl shadow-xl border border-gray-700 relative overflow-hidden">
           {loading && <LoadingSpinner />}
-          <div ref={chartContainerRef} className="w-full" />
+          <div ref={chartContainerRef} style={{ height: '520px' }} className="w-full" />
         </div>
+
       </div>
     </div>
   )
