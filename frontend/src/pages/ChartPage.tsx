@@ -582,7 +582,6 @@ export default function ChartPage() {
     localStorage.setItem('chart_market', mt)
     setSym(sym); setIv(iv); setMt(mt)
     setActiveInds([])
-    chartRef.current?.removePane()
     if (rcRef.current) clearTimeout(rcRef.current)
     loadData(mt, sym, iv)
     connectWS(mt, sym, iv)
@@ -634,7 +633,7 @@ export default function ChartPage() {
       if (existing) {
         try {
           if (def.pane === 'main') chart.removeIndicator('candle_pane', defName)
-          else chart.removePane(existing.paneId)
+          else chart.removeIndicator(existing.paneId, defName)
         } catch (err) { console.warn('remove error', err) }
         return prev.filter(a => a.defName !== defName)
       } else {
