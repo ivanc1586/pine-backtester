@@ -1,25 +1,22 @@
 // =============================================================================
-// 修改歷程記錄
+// OptimizePage v2.4.0
 // -----------------------------------------------------------------------------
-// v2.0.0 - 2026-02-26 - 策略優化頁面（全新重寫）
-// v2.1.0 - 2026-02-26 - 移除 lightweight-charts，改用 Canvas 繪製資產曲線
-// v2.2.0 - 2026-02-26 - 移除初始資金/手續費/倉位欄位（改由 Pine Script 自動解析）
-//                     - 風格對齊 ChartPage 深色 inline style
-// v2.3.0 - 2026-02-26 - 還原 21:33 版本（深色 inline style，無外部圖表庫）
+// - 完全對齊 ChartPage inline style 風格（#131722 背景、#1e222d 面板、#2b2b43 邊框）
+// - 移除 lightweight-charts（純 SVG 資產曲線）
+// - 移除 initialCapital / commission / quantity 欄位
+// - 貼上 Pine Script 後自動解析參數（debounce 800ms，不需手動按按鈕）
 // =============================================================================
 
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import {
-  Play, Sparkles, ChevronDown, ChevronUp, Settings2,
-  Copy, Check, TrendingUp, BarChart2,
-  Zap, AlertCircle, RefreshCw, Target
+  Play, Sparkles, Settings2, Copy, Check,
+  TrendingUp, BarChart2, Zap, AlertCircle, RefreshCw, Target
 } from 'lucide-react'
 import PageHeader from '../components/PageHeader'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
 interface DetectedParam {
   name: string
   title: string
@@ -54,168 +51,82 @@ interface OptimizeResult {
   gross_profit: number
   gross_loss: number
   monthly_pnl: Record<string, number>
-  trades: Trade[]
   equity_curve: number[]
 }
 
-interface Trade {
-  entry_time: string
-  exit_time: string
-  entry_price: number
-  exit_price: number
-  side: 'long' | 'short'
-  pnl: number
-  pnl_pct: number
-}
-
 const SORT_OPTIONS = [
-  { value: 'profit_pct', label: '最大盈利 %' },
-  { value: 'win_rate', label: '最高勝率' },
+  { value: 'profit_pct',    label: '最大盈利 %' },
+  { value: 'win_rate',      label: '最高勝率' },
   { value: 'profit_factor', label: '最高盈虧比' },
-  { value: 'max_drawdown', label: '最低 MDD' },
-  { value: 'sharpe_ratio', label: '最高夏普比率' },
-  { value: 'total_trades', label: '最多交易筆數' },
+  { value: 'max_drawdown',  label: '最低 MDD' },
+  { value: 'sharpe_ratio',  label: '最高夏普比率' },
+  { value: 'total_trades',  label: '最多交易筆數' },
 ]
 
-const INTERVALS = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w']
-const SOURCES = ['binance', 'coingecko', 'coincap']
+const INTERVALS       = ['1m','5m','15m','30m','1h','4h','1d','1w']
+const SOURCES         = ['binance','coingecko','coincap']
 const POPULAR_SYMBOLS = [
-  'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
-  'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT'
+  'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT',
+  'ADAUSDT','DOGEUSDT','AVAXUSDT','DOTUSDT','MATICUSDT',
 ]
 
 // ---------------------------------------------------------------------------
-// Styles
+// SVG Equity Curve
 // ---------------------------------------------------------------------------
-
-const S = {
-  page: { minHeight: '100vh', background: '#131722', padding: '24px' } as React.CSSProperties,
-  inner: { maxWidth: '1200px', margin: '0 auto', marginTop: '24px', display: 'flex', flexDirection: 'column' as const, gap: '16px' },
-  card: { background: '#1e222d', border: '1px solid #2b2b43', borderRadius: '12px', overflow: 'hidden' } as React.CSSProperties,
-  cardBody: { padding: '20px' } as React.CSSProperties,
-  cardHeader: { width: '100%', padding: '16px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'none', border: 'none', cursor: 'pointer', color: '#d1d4dc' } as React.CSSProperties,
-  label: { display: 'block', fontSize: '11px', fontWeight: 600, color: '#848e9c', marginBottom: '6px', textTransform: 'uppercase' as const, letterSpacing: '0.5px' },
-  input: { width: '100%', padding: '8px 12px', background: '#131722', border: '1px solid #2b2b43', borderRadius: '6px', color: '#d1d4dc', fontSize: '13px', boxSizing: 'border-box' as const, outline: 'none' } as React.CSSProperties,
-  select: { width: '100%', padding: '8px 12px', background: '#131722', border: '1px solid #2b2b43', borderRadius: '6px', color: '#d1d4dc', fontSize: '13px', boxSizing: 'border-box' as const, outline: 'none' } as React.CSSProperties,
-  grid2: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' } as React.CSSProperties,
-  grid3: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '12px' } as React.CSSProperties,
-  sectionTitle: { fontSize: '13px', fontWeight: 600, color: '#d1d4dc', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '16px' } as React.CSSProperties,
-  badge: { fontSize: '11px', padding: '2px 8px', borderRadius: '99px', background: 'rgba(38,166,154,0.15)', color: '#26a69a' } as React.CSSProperties,
-  errorBox: { display: 'flex', alignItems: 'center', gap: '8px', padding: '12px 16px', background: 'rgba(239,83,80,0.1)', border: '1px solid rgba(239,83,80,0.3)', borderRadius: '8px', color: '#ef5350', fontSize: '13px' } as React.CSSProperties,
-  btnPrimary: { width: '100%', padding: '14px', background: '#2962ff', border: 'none', borderRadius: '8px', color: '#fff', fontSize: '15px', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' } as React.CSSProperties,
-  btnDisabled: { opacity: 0.5, cursor: 'not-allowed' } as React.CSSProperties,
-  btnSecondary: { padding: '7px 14px', background: 'rgba(38,166,154,0.15)', border: '1px solid rgba(38,166,154,0.3)', borderRadius: '6px', color: '#26a69a', fontSize: '12px', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' } as React.CSSProperties,
-  metricBox: { textAlign: 'center' as const, padding: '10px 8px', background: '#131722', border: '1px solid #2b2b43', borderRadius: '8px' },
-  metricLabel: { fontSize: '10px', color: '#848e9c', fontWeight: 600, textTransform: 'uppercase' as const, letterSpacing: '0.3px' },
-  metricValue: { fontSize: '14px', fontWeight: 700, color: '#d1d4dc', marginTop: '2px' },
-  tableHeader: { padding: '10px 14px', textAlign: 'left' as const, fontSize: '11px', fontWeight: 600, color: '#848e9c', borderBottom: '1px solid #2b2b43', textTransform: 'uppercase' as const },
-  tableCell: { padding: '10px 14px', fontSize: '12px', color: '#d1d4dc', borderBottom: '1px solid #1e222d', verticalAlign: 'middle' as const },
-  paramCard: (enabled: boolean) => ({ padding: '14px', borderRadius: '8px', border: `1px solid ${enabled ? '#2962ff44' : '#2b2b43'}`, background: enabled ? 'rgba(41,98,255,0.07)' : '#131722' }) as React.CSSProperties,
-}
-
-// ---------------------------------------------------------------------------
-// Canvas Equity Chart
-// ---------------------------------------------------------------------------
-
-function EquityChart({ data }: { data: number[] }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas || data.length < 2) return
-    const dpr = window.devicePixelRatio || 1
-    const W = canvas.offsetWidth
-    const H = canvas.offsetHeight
-    canvas.width = W * dpr
-    canvas.height = H * dpr
-    const ctx = canvas.getContext('2d')!
-    ctx.scale(dpr, dpr)
-
-    const min = Math.min(...data)
-    const max = Math.max(...data)
-    const range = max - min || 1
-    const padL = 64, padR = 12, padT = 12, padB = 28
-    const W2 = W - padL - padR
-    const H2 = H - padT - padB
-
-    ctx.clearRect(0, 0, W, H)
-
-    // Grid lines
-    ctx.strokeStyle = 'rgba(43,43,67,0.8)'
-    ctx.lineWidth = 1
-    for (let i = 0; i <= 4; i++) {
-      const y = padT + (H2 / 4) * i
-      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke()
-      const val = max - (range / 4) * i
-      ctx.fillStyle = '#848e9c'
-      ctx.font = '10px sans-serif'
-      ctx.textAlign = 'right'
-      ctx.fillText(val >= 1000 ? `$${(val / 1000).toFixed(1)}k` : `$${val.toFixed(0)}`, padL - 4, y + 4)
-    }
-
-    // Gradient fill
-    const toX = (i: number) => padL + (i / (data.length - 1)) * W2
-    const toY = (v: number) => padT + H2 - ((v - min) / range) * H2
-    const grad = ctx.createLinearGradient(0, padT, 0, padT + H2)
-    grad.addColorStop(0, 'rgba(41,98,255,0.35)')
-    grad.addColorStop(1, 'rgba(41,98,255,0.02)')
-    ctx.beginPath()
-    ctx.moveTo(toX(0), toY(data[0]))
-    data.forEach((v, i) => { if (i > 0) ctx.lineTo(toX(i), toY(v)) })
-    ctx.lineTo(toX(data.length - 1), padT + H2)
-    ctx.lineTo(toX(0), padT + H2)
-    ctx.closePath()
-    ctx.fillStyle = grad
-    ctx.fill()
-
-    // Line
-    ctx.beginPath()
-    ctx.strokeStyle = '#2962ff'
-    ctx.lineWidth = 2
-    ctx.lineJoin = 'round'
-    ctx.moveTo(toX(0), toY(data[0]))
-    data.forEach((v, i) => { if (i > 0) ctx.lineTo(toX(i), toY(v)) })
-    ctx.stroke()
-  }, [data])
+function EquityCurve({ data }: { data: number[] }) {
+  if (!data || data.length < 2) return null
+  const W = 600, H = 160, PAD = 8
+  const min = Math.min(...data)
+  const max = Math.max(...data)
+  const range = max - min || 1
+  const pts = data.map((v, i) => {
+    const x = PAD + (i / (data.length - 1)) * (W - PAD * 2)
+    const y = PAD + (1 - (v - min) / range) * (H - PAD * 2)
+    return `${x},${y}`
+  })
+  const polyline = pts.join(' ')
+  const fill = `${pts.join(' ')} ${W - PAD},${H - PAD} ${PAD},${H - PAD}`
+  const isUp = data[data.length - 1] >= data[0]
+  const stroke = isUp ? '#26a69a' : '#ef5350'
+  const fillColor = isUp ? 'rgba(38,166,154,0.12)' : 'rgba(239,83,80,0.12)'
 
   return (
-    <canvas
-      ref={canvasRef}
-      style={{ width: '100%', height: '200px', display: 'block', borderRadius: '8px', background: '#131722' }}
-    />
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: H, display: 'block' }}>
+      <polygon points={fill} fill={fillColor} />
+      <polyline points={polyline} fill="none" stroke={stroke} strokeWidth={2} strokeLinejoin="round" />
+    </svg>
   )
 }
 
 // ---------------------------------------------------------------------------
-// Monthly bar chart
+// Monthly Bar Chart
 // ---------------------------------------------------------------------------
-
 function MonthlyBarChart({ data }: { data: Record<string, number> }) {
   const entries = Object.entries(data).sort(([a], [b]) => a.localeCompare(b))
   if (!entries.length) return null
   const vals = entries.map(([, v]) => v)
   const maxAbs = Math.max(...vals.map(Math.abs), 1)
+
   return (
-    <div style={{ marginTop: '16px' }}>
-      <div style={{ fontSize: '11px', color: '#848e9c', fontWeight: 600, textTransform: 'uppercase', marginBottom: '8px' }}>每月績效</div>
-      <div style={{ display: 'flex', alignItems: 'flex-end', gap: '4px', height: '72px', overflowX: 'auto', paddingBottom: '4px' }}>
+    <div>
+      <div style={{ fontSize: 11, color: '#848e9c', marginBottom: 8, fontWeight: 600 }}>每月績效</div>
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 4, height: 80, overflowX: 'auto', paddingBottom: 4 }}>
         {entries.map(([month, pnl]) => {
-          const pct = (pnl / maxAbs) * 100
+          const pct = (Math.abs(pnl) / maxAbs) * 60
           const isPos = pnl >= 0
           return (
-            <div key={month} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: '28px' }}>
-              <div style={{ height: '52px', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', width: '100%' }}>
+            <div key={month} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: 28 }}>
+              <div style={{ height: 60, display: 'flex', alignItems: 'flex-end' }}>
                 <div
-                  title={`${month}: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`}
                   style={{
-                    width: '20px',
-                    height: `${Math.max(3, Math.abs(pct) * 0.52)}px`,
+                    width: 20, height: Math.max(3, pct),
                     background: isPos ? '#26a69a' : '#ef5350',
-                    borderRadius: '2px',
+                    borderRadius: 2,
                   }}
+                  title={`${month}: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`}
                 />
               </div>
-              <div style={{ fontSize: '9px', color: '#848e9c', marginTop: '2px' }}>{month.slice(5)}</div>
+              <div style={{ fontSize: 9, color: '#848e9c', marginTop: 3 }}>{month.slice(5)}</div>
             </div>
           )
         })}
@@ -225,76 +136,127 @@ function MonthlyBarChart({ data }: { data: Record<string, number> }) {
 }
 
 // ---------------------------------------------------------------------------
+// Metric Badge
+// ---------------------------------------------------------------------------
+function MetricBadge({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {
+  return (
+    <div style={{
+      textAlign: 'center', padding: '8px 12px',
+      background: highlight ? 'rgba(38,166,154,0.15)' : 'rgba(255,255,255,0.04)',
+      borderRadius: 6, border: `1px solid ${highlight ? 'rgba(38,166,154,0.3)' : '#2b2b43'}`,
+    }}>
+      <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 2 }}>{label}</div>
+      <div style={{ fontSize: 13, fontWeight: 700, color: highlight ? '#26a69a' : '#d1d4dc' }}>{value}</div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Input style helper
+// ---------------------------------------------------------------------------
+const inputStyle: React.CSSProperties = {
+  width: '100%', padding: '6px 10px', background: '#131722',
+  border: '1px solid #2b2b43', borderRadius: 4, color: '#d1d4dc',
+  fontSize: 12, outline: 'none', boxSizing: 'border-box',
+}
+
+const selectStyle: React.CSSProperties = {
+  ...inputStyle, cursor: 'pointer',
+}
+
+// ---------------------------------------------------------------------------
 // Main Component
 // ---------------------------------------------------------------------------
-
 export default function OptimizePage() {
-  // Pine Script
-  const [pineScript, setPineScript] = useState('')
-  const [isParsing, setIsParsing] = useState(false)
+  const [pineScript,     setPineScript]     = useState('')
+  const [isParsing,      setIsParsing]      = useState(false)
   const [detectedParams, setDetectedParams] = useState<DetectedParam[]>([])
-  const [paramRanges, setParamRanges] = useState<ParamRange[]>([])
-  const [parseError, setParseError] = useState('')
+  const [paramRanges,    setParamRanges]    = useState<ParamRange[]>([])
+  const [parseError,     setParseError]     = useState('')
 
-  // Market settings
-  const [symbol, setSymbol] = useState('BTCUSDT')
-  const [interval, setIntervalVal] = useState('1h')
-  const [source, setSource] = useState('binance')
-  const [startDate, setStartDate] = useState('2023-01-01')
-  const [endDate, setEndDate] = useState(new Date().toISOString().split('T')[0])
-  const [sortBy, setSortBy] = useState('profit_pct')
-  const [nTrials, setNTrials] = useState(100)
+  const [symbol,       setSymbol]      = useState('BTCUSDT')
+  const [intervalVal,  setIntervalVal] = useState('1h')
+  const [source,       setSource]      = useState('binance')
+  const [startDate,    setStartDate]   = useState('2023-01-01')
+  const [endDate,      setEndDate]     = useState(new Date().toISOString().split('T')[0])
+  const [sortBy,       setSortBy]      = useState('profit_pct')
+  const [nTrials,      setNTrials]     = useState(100)
 
-  // Optimization state
-  const [isRunning, setIsRunning] = useState(false)
-  const [progress, setProgress] = useState(0)
+  const [isRunning,    setIsRunning]   = useState(false)
+  const [progress,     setProgress]    = useState(0)
   const [progressText, setProgressText] = useState('')
-  const [results, setResults] = useState<OptimizeResult[]>([])
+  const [results,      setResults]     = useState<OptimizeResult[]>([])
   const [selectedResult, setSelectedResult] = useState<OptimizeResult | null>(null)
-  const [copiedCode, setCopiedCode] = useState(false)
-  const [errorMsg, setErrorMsg] = useState('')
+  const [copiedCode,   setCopiedCode]  = useState(false)
+  const [errorMsg,     setErrorMsg]    = useState('')
 
-  // UI state
-  const [showSettings, setShowSettings] = useState(true)
-  const [showScript, setShowScript] = useState(true)
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // ---------------------------------------------------------------------------
-  // Parse Pine Script inputs
+  // Auto-parse on Pine Script change (debounce 800ms)
   // ---------------------------------------------------------------------------
-
-  const parsePineScript = useCallback(async () => {
-    if (!pineScript.trim()) { setParseError('請先貼入 Pine Script 代碼'); return }
-    setIsParsing(true); setParseError('')
+  const parsePineScript = useCallback(async (script: string) => {
+    if (!script.trim()) {
+      setDetectedParams([])
+      setParamRanges([])
+      setParseError('')
+      return
+    }
+    setIsParsing(true)
+    setParseError('')
     try {
       const res = await fetch('/api/optimize/parse', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pine_script: pineScript }),
+        body: JSON.stringify({ pine_script: script }),
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
       setDetectedParams(data.params)
+
       const ranges: ParamRange[] = data.params
         .filter((p: DetectedParam) => p.type === 'int' || p.type === 'float')
         .map((p: DetectedParam) => {
           const defVal = typeof p.default === 'number' ? p.default : 1
           return {
-            name: p.name, title: p.title, enabled: true,
-            min_val: p.min_val ?? Math.max(1, Math.floor(defVal * 0.5)),
-            max_val: p.max_val ?? Math.ceil(defVal * 2),
-            step: p.step ?? (p.type === 'int' ? 1 : 0.1),
-            is_int: p.type === 'int', default_val: defVal,
+            name: p.name,
+            title: p.title,
+            enabled: true,
+            min_val:     p.min_val ?? Math.max(1, Math.floor(defVal * 0.5)),
+            max_val:     p.max_val ?? Math.ceil(defVal * 2),
+            step:        p.step   ?? (p.type === 'int' ? 1 : 0.1),
+            is_int:      p.type === 'int',
+            default_val: defVal,
           }
         })
       setParamRanges(ranges)
-      if (data.params.length === 0) setParseError('未偵測到任何 input 參數')
+
+      if (data.params.length === 0) {
+        setParseError('未偵測到 input 參數，請確認 Pine Script 包含 input.int / input.float 宣告')
+      }
     } catch (err: any) {
       setParseError(`解析失敗：${err.message}`)
     } finally {
       setIsParsing(false)
     }
-  }, [pineScript])
+  }, [])
 
+  const handleScriptChange = (value: string) => {
+    setPineScript(value)
+    setDetectedParams([])
+    setParamRanges([])
+    setParseError('')
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    if (value.trim()) {
+      debounceRef.current = setTimeout(() => parsePineScript(value), 800)
+    }
+  }
+
+  useEffect(() => () => { if (debounceRef.current) clearTimeout(debounceRef.current) }, [])
+
+  // ---------------------------------------------------------------------------
+  // Update param range
+  // ---------------------------------------------------------------------------
   const updateRange = (name: string, field: keyof ParamRange, value: any) => {
     setParamRanges(prev => prev.map(p => p.name === name ? { ...p, [field]: value } : p))
   }
@@ -302,9 +264,8 @@ export default function OptimizePage() {
   // ---------------------------------------------------------------------------
   // Run optimization
   // ---------------------------------------------------------------------------
-
   const runOptimization = async () => {
-    if (!pineScript.trim()) { setErrorMsg('請先貼入 Pine Script 代碼並解析參數'); return }
+    if (!pineScript.trim()) { setErrorMsg('請先貼入 Pine Script 代碼'); return }
     const enabledRanges = paramRanges.filter(p => p.enabled)
     if (enabledRanges.length === 0) { setErrorMsg('請至少勾選一個參數進行優化'); return }
 
@@ -317,23 +278,16 @@ export default function OptimizePage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           pine_script: pineScript,
-          symbol, interval, source,
-          start_date: startDate,
-          end_date: endDate,
+          symbol, interval: intervalVal, source,
+          start_date: startDate, end_date: endDate,
           param_ranges: enabledRanges.map(p => ({
             name: p.name, min_val: p.min_val, max_val: p.max_val,
             step: p.step, is_int: p.is_int,
           })),
-          sort_by: sortBy,
-          n_trials: nTrials,
-          top_n: 10,
+          sort_by: sortBy, n_trials: nTrials, top_n: 10,
         }),
       })
-
-      if (!res.ok) {
-        const err = await res.json()
-        throw new Error(err.detail || '優化請求失敗')
-      }
+      if (!res.ok) { const e = await res.json(); throw new Error(e.detail || '優化請求失敗') }
 
       const reader = res.body?.getReader()
       if (!reader) throw new Error('無法讀取串流回應')
@@ -361,7 +315,7 @@ export default function OptimizePage() {
             } else if (data.type === 'error') {
               throw new Error(data.message)
             }
-          } catch { /* ignore malformed SSE */ }
+          } catch (_) {}
         }
       }
     } catch (err: any) {
@@ -374,256 +328,222 @@ export default function OptimizePage() {
   // ---------------------------------------------------------------------------
   // Copy optimized code
   // ---------------------------------------------------------------------------
-
   const copyOptimizedCode = useCallback(() => {
     if (!selectedResult) return
     let code = pineScript
     Object.entries(selectedResult.params).forEach(([name, val]) => {
       const pattern = new RegExp(`(${name}\\s*=\\s*input\\.(?:int|float)\\s*\\()[^)]*\\)`, 'g')
       code = code.replace(pattern, (match) =>
-        match.replace(/defval\s*=\s*[\d.]+|^(\s*\()[\d.]+/, (m) =>
-          m.includes('defval') ? `defval = ${val}` : m.replace(/[\d.]+/, String(val))
-        )
+        match.replace(/defval\s*=\s*[\d.]+/, `defval = ${val}`)
       )
     })
     navigator.clipboard.writeText(code).then(() => {
-      setCopiedCode(true); setTimeout(() => setCopiedCode(false), 2500)
+      setCopiedCode(true)
+      setTimeout(() => setCopiedCode(false), 2500)
     })
   }, [selectedResult, pineScript])
 
   // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
-
   return (
-    <div style={S.page}>
-      <div style={{ maxWidth: '1200px', margin: '0 auto' }}>
-        <PageHeader
-          title="策略優化"
-          subtitle="AI 自動解析 Pine Script 參數，Optuna 智能搜尋最佳組合"
-          icon={<Target style={{ width: '28px', height: '28px' }} />}
-        />
-      </div>
+    <div style={{ minHeight: '100vh', background: '#131722', color: '#d1d4dc' }}>
+      <PageHeader
+        title="策略優化"
+        subtitle="貼入 Pine Script 自動偵測參數，Optuna 智能搜尋最佳組合"
+        icon={<Target size={24} />}
+      />
 
-      <div style={S.inner}>
+      <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px 16px', display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-        {/* -- Pine Script Input -- */}
-        <div style={S.card}>
-          <button style={S.cardHeader} onClick={() => setShowScript(!showScript)}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-              <Zap style={{ width: '16px', height: '16px', color: '#f0b90b' }} />
-              <span style={{ fontWeight: 600, fontSize: '13px' }}>貼入 Pine Script</span>
-              {detectedParams.filter(p => p.type === 'int' || p.type === 'float').length > 0 && (
-                <span style={S.badge}>
-                  已偵測 {detectedParams.filter(p => p.type === 'int' || p.type === 'float').length} 個可優化參數
-                </span>
-              )}
-            </div>
-            {showScript
-              ? <ChevronUp style={{ width: '16px', height: '16px', color: '#848e9c' }} />
-              : <ChevronDown style={{ width: '16px', height: '16px', color: '#848e9c' }} />}
-          </button>
-
-          {showScript && (
-            <div style={{ padding: '0 20px 20px', borderTop: '1px solid #2b2b43', paddingTop: '16px' }}>
-              <textarea
-                value={pineScript}
-                onChange={(e) => { setPineScript(e.target.value); setDetectedParams([]); setParamRanges([]) }}
-                placeholder={'//@version=5\nstrategy("My Strategy", overlay=true, initial_capital=10000, commission_value=0.1)\nfastLength = input.int(9, title="Fast EMA", minval=2, maxval=50)\n// ... 策略邏輯'}
-                style={{
-                  ...S.input,
-                  height: '160px',
-                  fontFamily: 'monospace',
-                  fontSize: '12px',
-                  color: '#26a69a',
-                  resize: 'vertical',
-                  marginBottom: '12px',
-                }}
-              />
-              {parseError && (
-                <div style={{ ...S.errorBox, marginBottom: '12px' }}>
-                  <AlertCircle style={{ width: '14px', height: '14px', flexShrink: 0 }} />
-                  {parseError}
-                </div>
-              )}
-              <button
-                onClick={parsePineScript}
-                disabled={isParsing || !pineScript.trim()}
-                style={{
-                  padding: '8px 18px', background: '#2962ff', border: 'none', borderRadius: '6px',
-                  color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer',
-                  display: 'flex', alignItems: 'center', gap: '6px',
-                  ...(isParsing || !pineScript.trim() ? S.btnDisabled : {}),
-                }}
-              >
-                {isParsing
-                  ? <><RefreshCw style={{ width: '13px', height: '13px' }} /> 解析中...</>
-                  : <><Sparkles style={{ width: '13px', height: '13px' }} /> AI 自動解析參數</>}
-              </button>
-            </div>
-          )}
+        {/* Pine Script Input */}
+        <div style={{ background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 16px', borderBottom: '1px solid #2b2b43' }}>
+            <Zap size={15} color="#f0b90b" />
+            <span style={{ fontWeight: 700, fontSize: 13 }}>貼入 Pine Script</span>
+            {isParsing && (
+              <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: '#848e9c' }}>
+                <RefreshCw size={11} style={{ animation: 'spin 1s linear infinite' }} /> 解析中...
+              </span>
+            )}
+            {!isParsing && detectedParams.length > 0 && (
+              <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 10, background: 'rgba(38,166,154,0.15)', color: '#26a69a', border: '1px solid rgba(38,166,154,0.3)' }}>
+                偵測到 {paramRanges.length} 個可優化參數
+              </span>
+            )}
+          </div>
+          <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <textarea
+              value={pineScript}
+              onChange={(e) => handleScriptChange(e.target.value)}
+              placeholder={`//@version=5\nstrategy("My Strategy", overlay=true)\nfastLength = input.int(9, title="Fast EMA", minval=2, maxval=50)\nslowLength = input.int(21, title="Slow EMA", minval=5, maxval=100)\n// 貼上完整策略後自動解析參數...`}
+              style={{
+                width: '100%', height: 180, padding: '10px 12px',
+                background: '#131722', border: '1px solid #2b2b43', borderRadius: 6,
+                color: '#26a69a', fontFamily: 'monospace', fontSize: 12,
+                resize: 'vertical', outline: 'none', boxSizing: 'border-box',
+              }}
+            />
+            {parseError && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#ef5350' }}>
+                <AlertCircle size={13} /> {parseError}
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* -- Detected Params -- */}
+        {/* Detected Params */}
         {paramRanges.length > 0 && (
-          <div style={S.card}>
-            <div style={{ padding: '20px' }}>
-              <div style={S.sectionTitle}>
-                <Settings2 style={{ width: '15px', height: '15px', color: '#2962ff' }} />
-                參數優化設定
-                <span style={{ fontSize: '11px', color: '#848e9c', fontWeight: 400 }}>（勾選要優化的參數並設定範圍）</span>
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                {paramRanges.map((p) => (
-                  <div key={p.name} style={S.paramCard(p.enabled)}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: p.enabled ? '12px' : '0' }}>
-                      <input
-                        type="checkbox" checked={p.enabled}
-                        onChange={(e) => updateRange(p.name, 'enabled', e.target.checked)}
-                        style={{ width: '14px', height: '14px', accentColor: '#2962ff' }}
-                      />
-                      <span style={{ color: '#d1d4dc', fontWeight: 600, fontSize: '13px' }}>{p.title}</span>
-                      <span style={{ color: '#848e9c', fontSize: '11px' }}>({p.name})</span>
-                      <span style={{ marginLeft: 'auto', fontSize: '11px', color: '#848e9c' }}>預設: {p.default_val}</span>
+          <div style={{ background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 8, padding: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+              <Settings2 size={14} color="#f0b90b" />
+              <span style={{ fontWeight: 700, fontSize: 13 }}>參數優化設定</span>
+              <span style={{ fontSize: 11, color: '#848e9c' }}>勾選要優化的參數並設定範圍</span>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {paramRanges.map((p) => (
+                <div key={p.name} style={{
+                  padding: '10px 14px', borderRadius: 6,
+                  background: p.enabled ? 'rgba(240,185,11,0.06)' : 'rgba(255,255,255,0.02)',
+                  border: `1px solid ${p.enabled ? 'rgba(240,185,11,0.25)' : '#2b2b43'}`,
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <div
+                      onClick={() => updateRange(p.name, 'enabled', !p.enabled)}
+                      style={{
+                        width: 14, height: 14, borderRadius: 3, cursor: 'pointer', flexShrink: 0,
+                        border: `1px solid ${p.enabled ? '#f0b90b' : '#555'}`,
+                        background: p.enabled ? '#f0b90b' : 'transparent',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      }}
+                    >
+                      {p.enabled && <span style={{ fontSize: 9, fontWeight: 900, color: '#000', lineHeight: 1 }}>✓</span>}
                     </div>
-                    {p.enabled && (
-                      <div style={S.grid3}>
-                        {[
-                          { field: 'min_val' as const, label: '最小值' },
-                          { field: 'max_val' as const, label: '最大值' },
-                          { field: 'step' as const, label: '步長' },
-                        ].map(({ field, label }) => (
-                          <div key={field}>
-                            <label style={S.label}>{label}</label>
-                            <input
-                              type="number" value={p[field] as number}
-                              step={p.is_int ? 1 : 0.01}
-                              min={field === 'step' ? (p.is_int ? 1 : 0.01) : undefined}
-                              onChange={(e) => updateRange(p.name, field, parseFloat(e.target.value))}
-                              style={S.input}
-                            />
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                    <span style={{ fontSize: 13, color: '#d1d4dc', fontWeight: 600 }}>{p.title}</span>
+                    <span style={{ fontSize: 11, color: '#848e9c' }}>({p.name})</span>
+                    <span style={{ marginLeft: 'auto', fontSize: 11, color: '#848e9c' }}>預設: {p.default_val}</span>
                   </div>
-                ))}
-              </div>
+                  {p.enabled && (
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginTop: 10 }}>
+                      {([['最小值','min_val'],['最大值','max_val'],['步長','step']] as [string, keyof ParamRange][]).map(([label, field]) => (
+                        <div key={field}>
+                          <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>{label}</div>
+                          <input
+                            type="number"
+                            value={p[field] as number}
+                            step={p.is_int ? 1 : 0.01}
+                            min={field === 'step' ? (p.is_int ? 1 : 0.01) : undefined}
+                            onChange={(e) => updateRange(p.name, field, parseFloat(e.target.value))}
+                            style={inputStyle}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
             </div>
           </div>
         )}
 
-        {/* -- Market & Optimize Settings -- */}
-        <div style={S.card}>
-          <button style={S.cardHeader} onClick={() => setShowSettings(!showSettings)}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-              <Settings2 style={{ width: '16px', height: '16px', color: '#2962ff' }} />
-              <span style={{ fontWeight: 600, fontSize: '13px' }}>市場與優化設定</span>
+        {/* Market & Optimize Settings */}
+        <div style={{ background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 8, padding: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+            <Settings2 size={14} color="#f0b90b" />
+            <span style={{ fontWeight: 700, fontSize: 13 }}>市場與優化設定</span>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginBottom: 12 }}>
+            <div>
+              <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>交易對</div>
+              <select value={symbol} onChange={(e) => setSymbol(e.target.value)} style={selectStyle}>
+                {POPULAR_SYMBOLS.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
             </div>
-            {showSettings
-              ? <ChevronUp style={{ width: '16px', height: '16px', color: '#848e9c' }} />
-              : <ChevronDown style={{ width: '16px', height: '16px', color: '#848e9c' }} />}
-          </button>
-
-          {showSettings && (
-            <div style={{ padding: '0 20px 20px', borderTop: '1px solid #2b2b43', paddingTop: '16px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
-              <div style={S.grid3}>
-                <div>
-                  <label style={S.label}>交易對</label>
-                  <select value={symbol} onChange={(e) => setSymbol(e.target.value)} style={S.select}>
-                    {POPULAR_SYMBOLS.map(s => <option key={s} value={s}>{s}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label style={S.label}>時間框架</label>
-                  <select value={interval} onChange={(e) => setIntervalVal(e.target.value)} style={S.select}>
-                    {INTERVALS.map(i => <option key={i} value={i}>{i}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label style={S.label}>資料來源</label>
-                  <select value={source} onChange={(e) => setSource(e.target.value)} style={S.select}>
-                    {SOURCES.map(s => <option key={s} value={s}>{s}</option>)}
-                  </select>
-                </div>
-              </div>
-
-              <div style={S.grid2}>
-                <div>
-                  <label style={S.label}>開始日期</label>
-                  <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} style={S.input} />
-                </div>
-                <div>
-                  <label style={S.label}>結束日期</label>
-                  <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} style={S.input} />
-                </div>
-              </div>
-
-              <div style={S.grid2}>
-                <div>
-                  <label style={S.label}>優化目標</label>
-                  <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} style={S.select}>
-                    {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label style={S.label}>試驗次數 (Trials)</label>
-                  <input
-                    type="number" value={nTrials} min={10} max={2000} step={10}
-                    onChange={(e) => setNTrials(Number(e.target.value))}
-                    style={S.input}
-                  />
-                </div>
-              </div>
+            <div>
+              <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>時間框架</div>
+              <select value={intervalVal} onChange={(e) => setIntervalVal(e.target.value)} style={selectStyle}>
+                {INTERVALS.map(i => <option key={i} value={i}>{i}</option>)}
+              </select>
             </div>
-          )}
+            <div>
+              <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>資料來源</div>
+              <select value={source} onChange={(e) => setSource(e.target.value)} style={selectStyle}>
+                {SOURCES.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12 }}>
+            <div>
+              <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>開始日期</div>
+              <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} style={inputStyle} />
+            </div>
+            <div>
+              <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>結束日期</div>
+              <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} style={inputStyle} />
+            </div>
+            <div>
+              <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>優化目標</div>
+              <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} style={selectStyle}>
+                {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
+            </div>
+            <div>
+              <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>試驗次數</div>
+              <input type="number" value={nTrials} min={10} max={2000} step={10}
+                onChange={(e) => setNTrials(Number(e.target.value))} style={inputStyle} />
+            </div>
+          </div>
         </div>
 
-        {/* -- Error -- */}
+        {/* Error */}
         {errorMsg && (
-          <div style={S.errorBox}>
-            <AlertCircle style={{ width: '14px', height: '14px', flexShrink: 0 }} />
-            {errorMsg}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', background: 'rgba(239,83,80,0.1)', border: '1px solid rgba(239,83,80,0.3)', borderRadius: 6, fontSize: 12, color: '#ef5350' }}>
+            <AlertCircle size={13} /> {errorMsg}
           </div>
         )}
 
-        {/* -- Run Button -- */}
+        {/* Run Button */}
         <button
           onClick={runOptimization}
           disabled={isRunning}
-          style={{ ...S.btnPrimary, ...(isRunning ? S.btnDisabled : {}) }}
+          style={{
+            width: '100%', padding: '14px 0', borderRadius: 6, border: 'none', cursor: isRunning ? 'not-allowed' : 'pointer',
+            background: isRunning ? '#2b2b43' : '#f0b90b', color: isRunning ? '#848e9c' : '#000',
+            fontWeight: 700, fontSize: 15, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+          }}
         >
           {isRunning
-            ? <><RefreshCw style={{ width: '16px', height: '16px' }} /> 優化中... {progress}%</>
-            : <><Play style={{ width: '16px', height: '16px' }} /> 開始策略優化</>}
+            ? <><RefreshCw size={16} style={{ animation: 'spin 1s linear infinite' }} /> 優化中... {progress}%</>
+            : <><Play size={16} /> 開始策略優化</>
+          }
         </button>
 
-        {/* -- Progress Bar -- */}
+        {/* Progress Bar */}
         {isRunning && (
           <div>
-            <div style={{ width: '100%', background: '#2b2b43', borderRadius: '99px', height: '6px', overflow: 'hidden', marginBottom: '8px' }}>
-              <div style={{ height: '100%', background: '#2962ff', borderRadius: '99px', width: `${progress}%`, transition: 'width 0.3s' }} />
+            <div style={{ width: '100%', height: 4, background: '#2b2b43', borderRadius: 2, overflow: 'hidden' }}>
+              <div style={{ height: '100%', width: `${progress}%`, background: '#f0b90b', transition: 'width 0.3s', borderRadius: 2 }} />
             </div>
-            <div style={{ textAlign: 'center', fontSize: '12px', color: '#848e9c' }}>{progressText}</div>
+            <div style={{ textAlign: 'center', fontSize: 11, color: '#848e9c', marginTop: 6 }}>{progressText}</div>
           </div>
         )}
 
-        {/* -- Results Table -- */}
+        {/* Results Table */}
         {results.length > 0 && (
-          <div style={S.card}>
-            <div style={{ padding: '16px 20px', borderBottom: '1px solid #2b2b43', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 600, color: '#d1d4dc' }}>
-                <BarChart2 style={{ width: '15px', height: '15px', color: '#2962ff' }} />
-                前 {results.length} 名最佳參數組合
+          <div style={{ background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 8, overflow: 'hidden' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', borderBottom: '1px solid #2b2b43' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <BarChart2 size={14} color="#f0b90b" />
+                <span style={{ fontWeight: 700, fontSize: 13 }}>前 {results.length} 名最佳參數組合</span>
               </div>
-              <span style={{ fontSize: '11px', color: '#848e9c' }}>點擊列查看詳細</span>
+              <span style={{ fontSize: 11, color: '#848e9c' }}>點擊列查看詳細</span>
             </div>
             <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
-                  <tr style={{ background: '#131722' }}>
-                    {['排名', '參數', '總盈利%', 'MDD%', '盈虧比', '勝率%', '交易數', '夏普'].map(h => (
-                      <th key={h} style={S.tableHeader}>{h}</th>
+                  <tr style={{ borderBottom: '1px solid #2b2b43' }}>
+                    {['排名','參數','總盈利%','MDD%','盈虧比','勝率%','交易數','夏普'].map(h => (
+                      <th key={h} style={{ padding: '8px 12px', textAlign: h === '排名' || h === '參數' ? 'left' : 'right', color: '#848e9c', fontWeight: 600 }}>{h}</th>
                     ))}
                   </tr>
                 </thead>
@@ -635,37 +555,37 @@ export default function OptimizePage() {
                         key={r.rank}
                         onClick={() => setSelectedResult(r)}
                         style={{
-                          cursor: 'pointer',
-                          background: isSelected ? 'rgba(41,98,255,0.1)' : 'transparent',
+                          borderBottom: '1px solid #1e2328', cursor: 'pointer',
+                          background: isSelected ? 'rgba(240,185,11,0.08)' : 'transparent',
                         }}
                         onMouseEnter={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.03)' }}
-                        onMouseLeave={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'transparent' }}
+                        onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = isSelected ? 'rgba(240,185,11,0.08)' : 'transparent' }}
                       >
-                        <td style={S.tableCell}>
+                        <td style={{ padding: '8px 12px' }}>
                           <span style={{
                             display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                            width: '24px', height: '24px', borderRadius: '50%', fontSize: '11px', fontWeight: 700,
+                            width: 22, height: 22, borderRadius: '50%', fontSize: 11, fontWeight: 700,
                             background: r.rank === 1 ? '#f0b90b' : r.rank === 2 ? '#848e9c' : r.rank === 3 ? '#cd7f32' : '#2b2b43',
-                            color: r.rank <= 3 ? '#131722' : '#d1d4dc',
+                            color: r.rank <= 3 ? '#000' : '#d1d4dc',
                           }}>{r.rank}</span>
                         </td>
-                        <td style={S.tableCell}>
-                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                        <td style={{ padding: '8px 12px' }}>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                             {Object.entries(r.params).filter(([k]) => !k.startsWith('_')).map(([k, v]) => (
-                              <span key={k} style={{ fontSize: '11px', padding: '2px 6px', background: '#2b2b43', borderRadius: '4px', color: '#d1d4dc' }}>
+                              <span key={k} style={{ fontSize: 10, padding: '2px 6px', background: '#2b2b43', borderRadius: 3, color: '#d1d4dc' }}>
                                 {k}: {typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(3)) : v}
                               </span>
                             ))}
                           </div>
                         </td>
-                        <td style={{ ...S.tableCell, color: r.profit_pct >= 0 ? '#26a69a' : '#ef5350', fontWeight: 600 }}>
+                        <td style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 700, color: r.profit_pct >= 0 ? '#26a69a' : '#ef5350' }}>
                           {r.profit_pct >= 0 ? '+' : ''}{r.profit_pct.toFixed(2)}%
                         </td>
-                        <td style={{ ...S.tableCell, color: '#ef5350' }}>{r.max_drawdown.toFixed(2)}%</td>
-                        <td style={S.tableCell}>{r.profit_factor.toFixed(2)}</td>
-                        <td style={S.tableCell}>{r.win_rate.toFixed(1)}%</td>
-                        <td style={S.tableCell}>{r.total_trades}</td>
-                        <td style={S.tableCell}>{r.sharpe_ratio.toFixed(2)}</td>
+                        <td style={{ padding: '8px 12px', textAlign: 'right', color: '#ef5350' }}>{r.max_drawdown.toFixed(2)}%</td>
+                        <td style={{ padding: '8px 12px', textAlign: 'right', color: '#d1d4dc' }}>{r.profit_factor.toFixed(2)}</td>
+                        <td style={{ padding: '8px 12px', textAlign: 'right', color: '#d1d4dc' }}>{r.win_rate.toFixed(1)}%</td>
+                        <td style={{ padding: '8px 12px', textAlign: 'right', color: '#848e9c' }}>{r.total_trades}</td>
+                        <td style={{ padding: '8px 12px', textAlign: 'right', color: '#848e9c' }}>{r.sharpe_ratio.toFixed(2)}</td>
                       </tr>
                     )
                   })}
@@ -675,68 +595,65 @@ export default function OptimizePage() {
           </div>
         )}
 
-        {/* -- Selected Result Detail -- */}
+        {/* Selected Result Detail */}
         {selectedResult && (
-          <div style={S.card}>
-            <div style={{ padding: '20px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 600, color: '#d1d4dc' }}>
-                  <TrendingUp style={{ width: '15px', height: '15px', color: '#2962ff' }} />
-                  第 {selectedResult.rank} 名詳細分析
-                </div>
-                <button onClick={copyOptimizedCode} style={S.btnSecondary}>
-                  {copiedCode
-                    ? <><Check style={{ width: '13px', height: '13px' }} /> 已複製！</>
-                    : <><Copy style={{ width: '13px', height: '13px' }} /> 複製優化代碼</>}
-                </button>
+          <div style={{ background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 8, padding: 16, display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <TrendingUp size={14} color="#f0b90b" />
+                <span style={{ fontWeight: 700, fontSize: 13 }}>第 {selectedResult.rank} 名詳細分析</span>
               </div>
-
-              {/* Metrics */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px', marginBottom: '16px' }}>
-                {[
-                  { label: '總盈利', value: `${selectedResult.profit_pct >= 0 ? '+' : ''}${selectedResult.profit_pct.toFixed(2)}%`, color: selectedResult.profit_pct >= 0 ? '#26a69a' : '#ef5350' },
-                  { label: '最終資產', value: `$${selectedResult.final_equity.toFixed(0)}`, color: '#d1d4dc' },
-                  { label: 'MDD', value: `${selectedResult.max_drawdown.toFixed(2)}%`, color: '#ef5350' },
-                  { label: '盈虧比', value: selectedResult.profit_factor.toFixed(2), color: selectedResult.profit_factor > 1.5 ? '#26a69a' : '#d1d4dc' },
-                  { label: '勝率', value: `${selectedResult.win_rate.toFixed(1)}%`, color: selectedResult.win_rate > 50 ? '#26a69a' : '#d1d4dc' },
-                  { label: '交易數', value: String(selectedResult.total_trades), color: '#d1d4dc' },
-                  { label: '夏普', value: selectedResult.sharpe_ratio.toFixed(2), color: selectedResult.sharpe_ratio > 1 ? '#26a69a' : '#d1d4dc' },
-                  { label: '毛利/毛損', value: `${selectedResult.gross_profit.toFixed(0)}/${selectedResult.gross_loss.toFixed(0)}`, color: '#d1d4dc' },
-                ].map(({ label, value, color }) => (
-                  <div key={label} style={S.metricBox}>
-                    <div style={S.metricLabel}>{label}</div>
-                    <div style={{ ...S.metricValue, color }}>{value}</div>
-                  </div>
-                ))}
+              <button
+                onClick={copyOptimizedCode}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+                  background: copiedCode ? 'rgba(38,166,154,0.15)' : 'rgba(240,185,11,0.1)',
+                  border: `1px solid ${copiedCode ? 'rgba(38,166,154,0.3)' : 'rgba(240,185,11,0.3)'}`,
+                  borderRadius: 4, color: copiedCode ? '#26a69a' : '#f0b90b',
+                  fontSize: 12, cursor: 'pointer', fontWeight: 600,
+                }}
+              >
+                {copiedCode ? <Check size={13} /> : <Copy size={13} />}
+                {copiedCode ? '已複製！' : '複製優化代碼'}
+              </button>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8 }}>
+              <MetricBadge label="總盈利" value={`${selectedResult.profit_pct >= 0 ? '+' : ''}${selectedResult.profit_pct.toFixed(2)}%`} highlight={selectedResult.profit_pct > 0} />
+              <MetricBadge label="MDD" value={`${selectedResult.max_drawdown.toFixed(2)}%`} />
+              <MetricBadge label="盈虧比" value={selectedResult.profit_factor.toFixed(2)} highlight={selectedResult.profit_factor > 1.5} />
+              <MetricBadge label="勝率" value={`${selectedResult.win_rate.toFixed(1)}%`} highlight={selectedResult.win_rate > 50} />
+              <MetricBadge label="交易數" value={String(selectedResult.total_trades)} />
+              <MetricBadge label="夏普" value={selectedResult.sharpe_ratio.toFixed(2)} highlight={selectedResult.sharpe_ratio > 1} />
+              <MetricBadge label="最終資產" value={`$${selectedResult.final_equity.toFixed(0)}`} />
+              <MetricBadge label="毛利/毛損" value={`${selectedResult.gross_profit.toFixed(0)} / ${selectedResult.gross_loss.toFixed(0)}`} />
+            </div>
+            <div>
+              <div style={{ fontSize: 11, color: '#848e9c', marginBottom: 8, fontWeight: 600 }}>資產曲線</div>
+              <div style={{ background: '#131722', borderRadius: 6, border: '1px solid #2b2b43', overflow: 'hidden' }}>
+                <EquityCurve data={selectedResult.equity_curve} />
               </div>
-
-              {/* Equity curve */}
-              <div style={{ marginBottom: '4px', fontSize: '11px', color: '#848e9c', fontWeight: 600, textTransform: 'uppercase' }}>資產曲線</div>
-              <EquityChart data={selectedResult.equity_curve} />
-
-              {/* Monthly PnL */}
-              <MonthlyBarChart data={selectedResult.monthly_pnl} />
-
-              {/* Best params */}
-              <div style={{ marginTop: '16px' }}>
-                <div style={{ fontSize: '11px', color: '#848e9c', fontWeight: 600, textTransform: 'uppercase', marginBottom: '8px' }}>最佳參數值</div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
-                  {Object.entries(selectedResult.params)
-                    .filter(([k]) => !k.startsWith('_'))
-                    .map(([k, v]) => (
-                      <div key={k} style={{ padding: '8px 14px', background: 'rgba(41,98,255,0.12)', border: '1px solid rgba(41,98,255,0.3)', borderRadius: '8px' }}>
-                        <span style={{ color: '#848e9c', fontSize: '11px' }}>{k}: </span>
-                        <span style={{ color: '#d1d4dc', fontWeight: 700, fontSize: '13px' }}>
-                          {typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(4)) : String(v)}
-                        </span>
-                      </div>
-                    ))}
-                </div>
+            </div>
+            <MonthlyBarChart data={selectedResult.monthly_pnl} />
+            <div>
+              <div style={{ fontSize: 11, color: '#848e9c', marginBottom: 8, fontWeight: 600 }}>最佳參數值</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {Object.entries(selectedResult.params)
+                  .filter(([k]) => !k.startsWith('_'))
+                  .map(([k, v]) => (
+                    <div key={k} style={{ padding: '6px 12px', background: 'rgba(240,185,11,0.1)', border: '1px solid rgba(240,185,11,0.25)', borderRadius: 4 }}>
+                      <span style={{ fontSize: 11, color: '#848e9c' }}>{k}: </span>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: '#f0b90b' }}>
+                        {typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(4)) : String(v)}
+                      </span>
+                    </div>
+                  ))}
               </div>
             </div>
           </div>
         )}
       </div>
+
+      <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
     </div>
   )
 }
