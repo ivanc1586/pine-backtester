@@ -204,7 +204,7 @@ async def translate_with_gemini(pine_script: str) -> str:
 
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
+            model_name="gemini-1.5-flash",
             system_instruction=GEMINI_SYSTEM_PROMPT
         )
 
@@ -327,7 +327,7 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
 
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
+            model_name="gemini-1.5-flash",
             system_instruction=SUGGEST_SYSTEM_PROMPT
         )
 
@@ -476,7 +476,7 @@ async def fetch_candles(symbol: str, interval: str, source: str, start_date: str
         pass
 
     import httpx
-    url = "https://api.binance.com/api/v3/klines"
+    url = "https://api.binance.vision/api/v3/klines"
     params = {
         "symbol": symbol.upper(), "interval": interval,
         "startTime": int(pd.Timestamp(start_date).timestamp() * 1000),
