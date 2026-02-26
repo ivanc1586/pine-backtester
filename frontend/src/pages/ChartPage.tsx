@@ -17,8 +17,11 @@ const POPULAR_SYMBOLS = [
 
 type MarketType = 'spot' | 'futures'
 
+// Binance REST/WS endpoints
 const SPOT_REST    = 'https://api.binance.com/api/v3/klines'
 const FUTURES_REST = 'https://fapi.binance.com/fapi/v1/klines'
+const SPOT_TICKER    = 'https://api.binance.com/api/v3/ticker/24hr'
+const FUTURES_TICKER = 'https://fapi.binance.com/fapi/v1/ticker/24hr'
 const SPOT_WS_BASE    = 'wss://stream.binance.com:9443/ws'
 const FUTURES_WS_BASE = 'wss://fstream.binance.com/ws'
 
@@ -26,6 +29,7 @@ const getSavedSymbol     = () => localStorage.getItem('chart_symbol')   || 'BTCU
 const getSavedInterval   = () => localStorage.getItem('chart_interval') || '1h'
 const getSavedMarketType = () => (localStorage.getItem('chart_market') as MarketType) || 'futures'
 
+// ── Types ────────────────────────────────────────────────────────────────────
 interface RawKline {
   timestamp: number
   open: number
@@ -36,6 +40,15 @@ interface RawKline {
   turnover: number
 }
 
+interface TickerInfo {
+  priceChange: number       // 24h 絕對變動
+  priceChangePct: number    // 24h 百分比變動
+  high24h: number
+  low24h: number
+  volume24h: number         // base asset volume
+}
+
+// ── Fetch: klines ─────────────────────────────────────────────────────────────
 async function fetchBatch(
   marketType: MarketType,
   symbol: string,
@@ -46,11 +59,14 @@ async function fetchBatch(
   const base = marketType === 'futures' ? FUTURES_REST : SPOT_REST
   const maxLimit = marketType === 'futures' ? 1500 : 1000
   const actualLimit = Math.min(limit, maxLimit)
+
   const params = new URLSearchParams({ symbol, interval, limit: String(actualLimit) })
   if (endTime) params.set('endTime', String(endTime))
+
   const res = await fetch(`${base}?${params}`)
   if (!res.ok) throw new Error(`Binance ${res.status}: ${await res.text()}`)
   const raw: any[][] = await res.json()
+
   return raw.map(k => ({
     timestamp: k[0],
     open:      parseFloat(k[1]),
@@ -63,52 +79,107 @@ async function fetchBatch(
 }
 
 async function fetchKlines(
-  marketType: MarketType,
-  symbol: string,
-  interval: string,
-  targetCount = 5000
+  marketType: MarketType, symbol: string, interval: string, targetCount = 5000
 ): Promise<RawKline[]> {
   const batchSize = marketType === 'futures' ? 1500 : 1000
   const batches   = Math.ceil(targetCount / batchSize)
   let all: RawKline[] = []
   let endTime: number | undefined = undefined
+
   for (let i = 0; i < batches; i++) {
     const batch = await fetchBatch(marketType, symbol, interval, batchSize, endTime)
     if (!batch.length) break
     all = [...batch, ...all]
     endTime = batch[0].timestamp - 1
   }
+
   const seen = new Set<number>()
   return all
     .filter(k => { if (seen.has(k.timestamp)) return false; seen.add(k.timestamp); return true })
     .sort((a, b) => a.timestamp - b.timestamp)
 }
 
+// ── Fetch: 24h ticker ─────────────────────────────────────────────────────────
+async function fetchTicker(marketType: MarketType, symbol: string): Promise<TickerInfo> {
+  const base = marketType === 'futures' ? FUTURES_TICKER : SPOT_TICKER
+  const res = await fetch(`${base}?symbol=${symbol}`)
+  if (!res.ok) throw new Error(`Ticker ${res.status}`)
+  const d = await res.json()
+  return {
+    priceChange:    parseFloat(d.priceChange),
+    priceChangePct: parseFloat(d.priceChangePercent),
+    high24h:        parseFloat(d.highPrice),
+    low24h:         parseFloat(d.lowPrice),
+    volume24h:      parseFloat(d.volume),
+  }
+}
+
+// ── Format helpers ────────────────────────────────────────────────────────────
+function formatPrice(p: number): string {
+  if (p >= 1000)   return p.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  if (p >= 1)      return p.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 4 })
+  return p.toLocaleString(undefined, { minimumFractionDigits: 6, maximumFractionDigits: 8 })
+}
+
+function formatVolume(v: number): string {
+  if (v >= 1_000_000_000) return (v / 1_000_000_000).toFixed(2) + 'B'
+  if (v >= 1_000_000)     return (v / 1_000_000).toFixed(2) + 'M'
+  if (v >= 1_000)         return (v / 1_000).toFixed(2) + 'K'
+  return v.toFixed(2)
+}
+
+function formatTimestamp(ts: number): string {
+  return new Date(ts).toLocaleString('zh-TW', {
+    timeZone: 'Asia/Taipei',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  })
+}
+
+function timeAgo(ts: number): string {
+  const diff = Math.floor((Date.now() - ts) / 1000)
+  if (diff < 5)  return '剛剛'
+  if (diff < 60) return `${diff} 秒前`
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分前`
+  return `${Math.floor(diff / 3600)} 時前`
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
 export default function ChartPage() {
   const chartContainerId = 'kline-chart-container'
-  const chartRef   = useRef<Chart | null>(null)
-  const wsRef      = useRef<WebSocket | null>(null)
+  const chartRef       = useRef<Chart | null>(null)
+  const wsRef          = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const tickIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const symbolRef     = useRef(getSavedSymbol())
   const intervalRef   = useRef(getSavedInterval())
   const marketTypeRef = useRef<MarketType>(getSavedMarketType())
 
-  const [symbol,          setSymbol]         = useState(symbolRef.current)
-  const [interval,        setInterval]       = useState(intervalRef.current)
-  const [marketType,      setMarketType]     = useState<MarketType>(marketTypeRef.current)
-  const [loading,         setLoading]        = useState(false)
-  const [error,           setError]          = useState<string | null>(null)
-  const [wsStatus,        setWsStatus]       = useState<'connecting'|'live'|'disconnected'>('disconnected')
-  const [currentPrice,    setCurrentPrice]   = useState<number | null>(null)
-  const [searchQuery,     setSearchQuery]    = useState('')
-  const [showSymbolPanel, setShowSymbolPanel]= useState(false)
+  const [symbol,          setSymbol]          = useState(symbolRef.current)
+  const [interval,        setInterval]        = useState(intervalRef.current)
+  const [marketType,      setMarketType]      = useState<MarketType>(marketTypeRef.current)
+  const [loading,         setLoading]         = useState(false)
+  const [error,           setError]           = useState<string | null>(null)
+  const [wsStatus,        setWsStatus]        = useState<'connecting'|'live'|'disconnected'>('disconnected')
 
+  // Price info bar states
+  const [currentPrice,    setCurrentPrice]    = useState<number | null>(null)
+  const [ticker,          setTicker]          = useState<TickerInfo | null>(null)
+  const [lastUpdateTs,    setLastUpdateTs]    = useState<number | null>(null)
+  const [barTimestamp,    setBarTimestamp]    = useState<number | null>(null)
+  const [timeAgoStr,      setTimeAgoStr]      = useState('')
+
+  const [searchQuery,     setSearchQuery]     = useState('')
+  const [showSymbolPanel, setShowSymbolPanel] = useState(false)
+
+  // ── Chart init (once) ──────────────────────────────────────────────────────
   useEffect(() => {
     const chart = init(chartContainerId, {
       layout: [
         { type: 'candle', options: { gap: { bottom: 2 } } },
-        { type: 'indicator', content: ['VOL'], options: { gap: { top: 4 }, height: 100 } }
+        { type: 'indicator', content: ['VOL'], options: { gap: { top: 4 }, height: 80 } },
       ],
       customApi: {
         formatDate: (dateTimeFormat: Intl.DateTimeFormat, timestamp: number) =>
@@ -125,17 +196,11 @@ export default function ChartPage() {
             downColor:     '#ef5350',
             noChangeColor: '#888888',
           },
-          tooltip: { labels: ['時間', '開', '高', '低', '收', '量'] }
+          tooltip: { labels: ['時間', '開', '高', '低', '收', '量'] },
         },
         indicator: { ohlc: { upColor: '#26a69a', downColor: '#ef5350' } },
-        xAxis: {
-          tickText: { color: '#848e9c' },
-          axisLine: { color: '#2b2b43' },
-        },
-        yAxis: {
-          tickText: { color: '#848e9c' },
-          axisLine: { color: '#2b2b43' },
-        },
+        xAxis: { tickText: { color: '#848e9c' }, axisLine: { color: '#2b2b43' } },
+        yAxis: { tickText: { color: '#848e9c' }, axisLine: { color: '#2b2b43' } },
         crosshair: {
           horizontal: { line: { color: '#444' }, text: { color: '#fff', backgroundColor: '#2b2b43' } },
           vertical:   { line: { color: '#444' }, text: { color: '#fff', backgroundColor: '#2b2b43' } },
@@ -145,14 +210,29 @@ export default function ChartPage() {
       locale: 'zh-TW',
       timezone: 'Asia/Taipei',
     })
+
     if (chart) {
       chart.createIndicator('MA', false, { id: 'candle_pane' })
       chart.createIndicator('MACD', false, { height: 80 })
       chartRef.current = chart
     }
+
     return () => { dispose(chartContainerId) }
   }, [])
 
+  // ── "X 秒前" ticker (re-render every second) ───────────────────────────────
+  useEffect(() => {
+    tickIntervalRef.current = setInterval(() => {
+      if (lastUpdateTs !== null) {
+        setTimeAgoStr(timeAgo(lastUpdateTs))
+      }
+    }, 1000)
+    return () => {
+      if (tickIntervalRef.current) clearInterval(tickIntervalRef.current)
+    }
+  }, [lastUpdateTs])
+
+  // ── WebSocket ──────────────────────────────────────────────────────────────
   const connectWS = useCallback((sym: string, tf: string, mt: MarketType) => {
     if (wsRef.current) {
       wsRef.current.onclose = null
@@ -163,17 +243,21 @@ export default function ChartPage() {
       clearTimeout(reconnectTimer.current)
       reconnectTimer.current = null
     }
+
     setWsStatus('connecting')
     const streamName = `${sym.toLowerCase()}@kline_${tf}`
     const wsBase = mt === 'futures' ? FUTURES_WS_BASE : SPOT_WS_BASE
     const ws = new WebSocket(`${wsBase}/${streamName}`)
     wsRef.current = ws
+
     ws.onopen = () => setWsStatus('live')
+
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data)
         const k = msg.k
         if (!k) return
+
         const candle: RawKline = {
           timestamp: k.t,
           open:      parseFloat(k.o),
@@ -185,12 +269,15 @@ export default function ChartPage() {
         }
         chartRef.current?.updateData(candle)
         setCurrentPrice(candle.close)
+        setBarTimestamp(k.t)
+        setLastUpdateTs(Date.now())
       } catch (e) {
         console.warn('WS parse error', e)
       }
     }
-    ws.onerror = () => setWsStatus('disconnected')
-    ws.onclose = (e) => {
+
+    ws.onerror  = () => setWsStatus('disconnected')
+    ws.onclose  = (e) => {
       setWsStatus('disconnected')
       if (e.code !== 1000) {
         reconnectTimer.current = setTimeout(() => {
@@ -200,25 +287,40 @@ export default function ChartPage() {
     }
   }, [])
 
+  // ── Load history + ticker + connect WS ────────────────────────────────────
   const loadChart = useCallback(async (sym: string, tf: string, mt: MarketType) => {
     if (!chartRef.current) return
     setLoading(true)
     setError(null)
+    setTicker(null)
+
     try {
-      const candles = await fetchKlines(mt, sym, tf, 5000)
+      // fetch klines & 24h ticker in parallel
+      const [candles, tickerInfo] = await Promise.all([
+        fetchKlines(mt, sym, tf, 5000),
+        fetchTicker(mt, sym),
+      ])
+
       if (!candles.length) throw new Error('Binance 回傳空資料')
       chartRef.current.applyNewData(candles)
-      setCurrentPrice(candles[candles.length - 1].close)
+
+      const last = candles[candles.length - 1]
+      setCurrentPrice(last.close)
+      setBarTimestamp(last.timestamp)
+      setLastUpdateTs(Date.now())
+      setTicker(tickerInfo)
     } catch (err: any) {
-      console.error('fetchKlines error:', err)
+      console.error('loadChart error:', err)
       setError(err.message || '載入失敗')
       setLoading(false)
       return
     }
+
     setLoading(false)
     connectWS(sym, tf, mt)
   }, [connectWS])
 
+  // ── Initial load ──────────────────────────────────────────────────────────
   useEffect(() => {
     const t = setTimeout(() => {
       loadChart(symbolRef.current, intervalRef.current, marketTypeRef.current)
@@ -226,11 +328,13 @@ export default function ChartPage() {
     return () => clearTimeout(t)
   }, [loadChart])
 
+  // ── Handlers ──────────────────────────────────────────────────────────────
   const changeSymbol = (sym: string) => {
     symbolRef.current = sym
     localStorage.setItem('chart_symbol', sym)
     setSymbol(sym)
     setShowSymbolPanel(false)
+    setSearchQuery('')
     loadChart(sym, intervalRef.current, marketTypeRef.current)
   }
 
@@ -252,16 +356,22 @@ export default function ChartPage() {
     s.toLowerCase().includes(searchQuery.toLowerCase())
   )
 
-  const wsStatusColor = wsStatus === 'live' ? 'bg-green-500' :
-                        wsStatus === 'connecting' ? 'bg-yellow-400 animate-pulse' : 'bg-red-500'
-  const wsStatusLabel = wsStatus === 'live' ? 'Live' :
-                        wsStatus === 'connecting' ? '連線中' : '已斷線'
+  const priceColor = (ticker?.priceChange ?? 0) >= 0 ? 'text-[#26a69a]' : 'text-[#ef5350]'
+
+  const wsStatusColor = wsStatus === 'live'
+    ? 'bg-green-500'
+    : wsStatus === 'connecting'
+    ? 'bg-yellow-400 animate-pulse'
+    : 'bg-red-500'
 
   return (
     <div className="flex flex-col h-screen bg-[#131722] text-gray-200">
       <PageHeader title="K 線圖表" />
 
+      {/* ── Top toolbar ── */}
       <div className="flex flex-wrap items-center gap-2 px-4 py-2 bg-[#1e222d] border-b border-[#2b2b43]">
+
+        {/* Symbol picker */}
         <div className="relative">
           <button
             onClick={() => setShowSymbolPanel(v => !v)}
@@ -299,8 +409,9 @@ export default function ChartPage() {
           )}
         </div>
 
+        {/* Spot / Futures toggle */}
         <div className="flex rounded overflow-hidden border border-[#2b2b43]">
-          {(['spot','futures'] as MarketType[]).map(mt => (
+          {(['spot', 'futures'] as MarketType[]).map(mt => (
             <button
               key={mt}
               onClick={() => changeMarketType(mt)}
@@ -315,6 +426,7 @@ export default function ChartPage() {
           ))}
         </div>
 
+        {/* Interval buttons */}
         <div className="flex gap-1 flex-wrap">
           {INTERVALS.map(tf => (
             <button
@@ -331,17 +443,16 @@ export default function ChartPage() {
           ))}
         </div>
 
+        {/* Spacer */}
         <div className="flex-1" />
 
-        <div className="flex items-center gap-3 text-sm">
-          {currentPrice !== null && (
-            <span className="font-mono font-bold text-white">
-              {currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 })}
-            </span>
-          )}
+        {/* WS status + reload */}
+        <div className="flex items-center gap-2">
           <div className="flex items-center gap-1.5">
             <span className={`w-2 h-2 rounded-full ${wsStatusColor}`} />
-            <span className="text-xs text-gray-400">{wsStatusLabel}</span>
+            <span className="text-xs text-gray-500">
+              {wsStatus === 'live' ? 'Live' : wsStatus === 'connecting' ? '連線中' : '已斷線'}
+            </span>
           </div>
           <button
             onClick={() => loadChart(symbolRef.current, intervalRef.current, marketTypeRef.current)}
@@ -353,6 +464,63 @@ export default function ChartPage() {
         </div>
       </div>
 
+      {/* ── Price Info Bar (Binance-style) ── */}
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-1 px-4 py-2 bg-[#161a25] border-b border-[#2b2b43] text-xs">
+
+        {/* 大價格 */}
+        {currentPrice !== null && (
+          <div className="flex flex-col">
+            <span className={`text-2xl font-bold font-mono leading-tight ${priceColor}`}>
+              {formatPrice(currentPrice)}
+            </span>
+            {/* 24h 漲跌（絕對值 + %） */}
+            {ticker && (
+              <div className={`flex items-center gap-1 mt-0.5 font-mono ${priceColor}`}>
+                <span>{ticker.priceChange >= 0 ? '+' : ''}{formatPrice(Math.abs(ticker.priceChange))}</span>
+                <span>({ticker.priceChange >= 0 ? '+' : ''}{ticker.priceChangePct.toFixed(2)}%)</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 分隔線 */}
+        {ticker && <div className="h-8 w-px bg-[#2b2b43]" />}
+
+        {/* 24h 高/低/量 */}
+        {ticker && (
+          <div className="flex gap-5 text-gray-400">
+            <div className="flex flex-col">
+              <span className="text-[10px] text-gray-600">24h 高</span>
+              <span className="text-gray-200 font-mono">{formatPrice(ticker.high24h)}</span>
+            </div>
+            <div className="flex flex-col">
+              <span className="text-[10px] text-gray-600">24h 低</span>
+              <span className="text-gray-200 font-mono">{formatPrice(ticker.low24h)}</span>
+            </div>
+            <div className="flex flex-col">
+              <span className="text-[10px] text-gray-600">24h 量</span>
+              <span className="text-gray-200 font-mono">{formatVolume(ticker.volume24h)}</span>
+            </div>
+          </div>
+        )}
+
+        {/* Spacer */}
+        <div className="flex-1" />
+
+        {/* 當前 Bar 日期 + 更新時間 */}
+        <div className="flex flex-col items-end text-gray-500">
+          {barTimestamp !== null && (
+            <span>{formatTimestamp(barTimestamp)}&nbsp;
+              <span className="text-gray-600">({INTERVAL_LABELS[interval] ?? interval})</span>
+            </span>
+          )}
+          {timeAgoStr && (
+            <span className="text-[10px] text-gray-600">更新 {timeAgoStr}</span>
+          )}
+        </div>
+      </div>
+
+      {/* ── Chart area ── */}
       <div className="relative flex-1 min-h-0">
         {loading && (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[#131722]/80">
