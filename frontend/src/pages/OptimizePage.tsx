@@ -1,20 +1,18 @@
 // =============================================================================
 // 修改歷程記錄
 // -----------------------------------------------------------------------------
-// v2.2.0 - 2026-02-26
-//   - 移除 lightweight-charts import (改用純 CSS 資產曲線)
-//   - 移除 initial_capital / commission / quantity 欄位
-//   - 「AI 自動解析參數」改為「AI 建議參數範圍」(呼叫 /optimize/suggest)
-//   - AI 建議結果顯示每個參數的 reasoning 說明
-//   - 新增即時日誌面板 (接收 SSE log 事件)
-//   - 風格對齊 ChartPage (backdrop-blur, border-white/20, 圓角等)
+// v2.0.0 - 2026-02-26 - 策略優化頁面（全新重寫）
+// v2.1.0 - 2026-02-26 - 移除 lightweight-charts，改用 Canvas 繪製資產曲線
+// v2.2.0 - 2026-02-26 - 移除初始資金/手續費/倉位欄位（改由 Pine Script 自動解析）
+//                     - 風格對齊 ChartPage 深色 inline style
+// v2.3.0 - 2026-02-26 - 還原 21:33 版本（深色 inline style，無外部圖表庫）
 // =============================================================================
 
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import {
   Play, Sparkles, ChevronDown, ChevronUp, Settings2,
   Copy, Check, TrendingUp, BarChart2,
-  Zap, AlertCircle, RefreshCw, Target, Terminal
+  Zap, AlertCircle, RefreshCw, Target
 } from 'lucide-react'
 import PageHeader from '../components/PageHeader'
 
@@ -30,7 +28,6 @@ interface DetectedParam {
   min_val?: number
   max_val?: number
   step?: number
-  reasoning?: string
 }
 
 interface ParamRange {
@@ -42,7 +39,6 @@ interface ParamRange {
   step: number
   is_int: boolean
   default_val: number
-  reasoning?: string
 }
 
 interface OptimizeResult {
@@ -89,17 +85,110 @@ const POPULAR_SYMBOLS = [
 ]
 
 // ---------------------------------------------------------------------------
-// Sub-components
+// Styles
 // ---------------------------------------------------------------------------
 
-function MetricBadge({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {
+const S = {
+  page: { minHeight: '100vh', background: '#131722', padding: '24px' } as React.CSSProperties,
+  inner: { maxWidth: '1200px', margin: '0 auto', marginTop: '24px', display: 'flex', flexDirection: 'column' as const, gap: '16px' },
+  card: { background: '#1e222d', border: '1px solid #2b2b43', borderRadius: '12px', overflow: 'hidden' } as React.CSSProperties,
+  cardBody: { padding: '20px' } as React.CSSProperties,
+  cardHeader: { width: '100%', padding: '16px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'none', border: 'none', cursor: 'pointer', color: '#d1d4dc' } as React.CSSProperties,
+  label: { display: 'block', fontSize: '11px', fontWeight: 600, color: '#848e9c', marginBottom: '6px', textTransform: 'uppercase' as const, letterSpacing: '0.5px' },
+  input: { width: '100%', padding: '8px 12px', background: '#131722', border: '1px solid #2b2b43', borderRadius: '6px', color: '#d1d4dc', fontSize: '13px', boxSizing: 'border-box' as const, outline: 'none' } as React.CSSProperties,
+  select: { width: '100%', padding: '8px 12px', background: '#131722', border: '1px solid #2b2b43', borderRadius: '6px', color: '#d1d4dc', fontSize: '13px', boxSizing: 'border-box' as const, outline: 'none' } as React.CSSProperties,
+  grid2: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' } as React.CSSProperties,
+  grid3: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '12px' } as React.CSSProperties,
+  sectionTitle: { fontSize: '13px', fontWeight: 600, color: '#d1d4dc', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '16px' } as React.CSSProperties,
+  badge: { fontSize: '11px', padding: '2px 8px', borderRadius: '99px', background: 'rgba(38,166,154,0.15)', color: '#26a69a' } as React.CSSProperties,
+  errorBox: { display: 'flex', alignItems: 'center', gap: '8px', padding: '12px 16px', background: 'rgba(239,83,80,0.1)', border: '1px solid rgba(239,83,80,0.3)', borderRadius: '8px', color: '#ef5350', fontSize: '13px' } as React.CSSProperties,
+  btnPrimary: { width: '100%', padding: '14px', background: '#2962ff', border: 'none', borderRadius: '8px', color: '#fff', fontSize: '15px', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' } as React.CSSProperties,
+  btnDisabled: { opacity: 0.5, cursor: 'not-allowed' } as React.CSSProperties,
+  btnSecondary: { padding: '7px 14px', background: 'rgba(38,166,154,0.15)', border: '1px solid rgba(38,166,154,0.3)', borderRadius: '6px', color: '#26a69a', fontSize: '12px', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' } as React.CSSProperties,
+  metricBox: { textAlign: 'center' as const, padding: '10px 8px', background: '#131722', border: '1px solid #2b2b43', borderRadius: '8px' },
+  metricLabel: { fontSize: '10px', color: '#848e9c', fontWeight: 600, textTransform: 'uppercase' as const, letterSpacing: '0.3px' },
+  metricValue: { fontSize: '14px', fontWeight: 700, color: '#d1d4dc', marginTop: '2px' },
+  tableHeader: { padding: '10px 14px', textAlign: 'left' as const, fontSize: '11px', fontWeight: 600, color: '#848e9c', borderBottom: '1px solid #2b2b43', textTransform: 'uppercase' as const },
+  tableCell: { padding: '10px 14px', fontSize: '12px', color: '#d1d4dc', borderBottom: '1px solid #1e222d', verticalAlign: 'middle' as const },
+  paramCard: (enabled: boolean) => ({ padding: '14px', borderRadius: '8px', border: `1px solid ${enabled ? '#2962ff44' : '#2b2b43'}`, background: enabled ? 'rgba(41,98,255,0.07)' : '#131722' }) as React.CSSProperties,
+}
+
+// ---------------------------------------------------------------------------
+// Canvas Equity Chart
+// ---------------------------------------------------------------------------
+
+function EquityChart({ data }: { data: number[] }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas || data.length < 2) return
+    const dpr = window.devicePixelRatio || 1
+    const W = canvas.offsetWidth
+    const H = canvas.offsetHeight
+    canvas.width = W * dpr
+    canvas.height = H * dpr
+    const ctx = canvas.getContext('2d')!
+    ctx.scale(dpr, dpr)
+
+    const min = Math.min(...data)
+    const max = Math.max(...data)
+    const range = max - min || 1
+    const padL = 64, padR = 12, padT = 12, padB = 28
+    const W2 = W - padL - padR
+    const H2 = H - padT - padB
+
+    ctx.clearRect(0, 0, W, H)
+
+    // Grid lines
+    ctx.strokeStyle = 'rgba(43,43,67,0.8)'
+    ctx.lineWidth = 1
+    for (let i = 0; i <= 4; i++) {
+      const y = padT + (H2 / 4) * i
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke()
+      const val = max - (range / 4) * i
+      ctx.fillStyle = '#848e9c'
+      ctx.font = '10px sans-serif'
+      ctx.textAlign = 'right'
+      ctx.fillText(val >= 1000 ? `$${(val / 1000).toFixed(1)}k` : `$${val.toFixed(0)}`, padL - 4, y + 4)
+    }
+
+    // Gradient fill
+    const toX = (i: number) => padL + (i / (data.length - 1)) * W2
+    const toY = (v: number) => padT + H2 - ((v - min) / range) * H2
+    const grad = ctx.createLinearGradient(0, padT, 0, padT + H2)
+    grad.addColorStop(0, 'rgba(41,98,255,0.35)')
+    grad.addColorStop(1, 'rgba(41,98,255,0.02)')
+    ctx.beginPath()
+    ctx.moveTo(toX(0), toY(data[0]))
+    data.forEach((v, i) => { if (i > 0) ctx.lineTo(toX(i), toY(v)) })
+    ctx.lineTo(toX(data.length - 1), padT + H2)
+    ctx.lineTo(toX(0), padT + H2)
+    ctx.closePath()
+    ctx.fillStyle = grad
+    ctx.fill()
+
+    // Line
+    ctx.beginPath()
+    ctx.strokeStyle = '#2962ff'
+    ctx.lineWidth = 2
+    ctx.lineJoin = 'round'
+    ctx.moveTo(toX(0), toY(data[0]))
+    data.forEach((v, i) => { if (i > 0) ctx.lineTo(toX(i), toY(v)) })
+    ctx.stroke()
+  }, [data])
+
   return (
-    <div className={`text-center px-3 py-2 rounded-lg ${highlight ? 'bg-emerald-500/20' : 'bg-white/5'}`}>
-      <div className={`text-xs font-medium ${highlight ? 'text-emerald-400' : 'text-gray-400'}`}>{label}</div>
-      <div className={`text-sm font-bold mt-0.5 ${highlight ? 'text-emerald-300' : 'text-white'}`}>{value}</div>
-    </div>
+    <canvas
+      ref={canvasRef}
+      style={{ width: '100%', height: '200px', display: 'block', borderRadius: '8px', background: '#131722' }}
+    />
   )
 }
+
+// ---------------------------------------------------------------------------
+// Monthly bar chart
+// ---------------------------------------------------------------------------
 
 function MonthlyBarChart({ data }: { data: Record<string, number> }) {
   const entries = Object.entries(data).sort(([a], [b]) => a.localeCompare(b))
@@ -107,63 +196,29 @@ function MonthlyBarChart({ data }: { data: Record<string, number> }) {
   const vals = entries.map(([, v]) => v)
   const maxAbs = Math.max(...vals.map(Math.abs), 1)
   return (
-    <div className="mt-4">
-      <div className="text-xs text-gray-400 mb-2 font-medium">每月績效</div>
-      <div className="flex items-end gap-1 h-24 overflow-x-auto pb-1">
+    <div style={{ marginTop: '16px' }}>
+      <div style={{ fontSize: '11px', color: '#848e9c', fontWeight: 600, textTransform: 'uppercase', marginBottom: '8px' }}>每月績效</div>
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: '4px', height: '72px', overflowX: 'auto', paddingBottom: '4px' }}>
         {entries.map(([month, pnl]) => {
           const pct = (pnl / maxAbs) * 100
           const isPos = pnl >= 0
           return (
-            <div key={month} className="flex flex-col items-center min-w-[32px]">
-              <div className="relative w-full flex items-end justify-center" style={{ height: '64px' }}>
+            <div key={month} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: '28px' }}>
+              <div style={{ height: '52px', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', width: '100%' }}>
                 <div
-                  className={`w-6 rounded-sm transition-all ${isPos ? 'bg-emerald-500' : 'bg-rose-500'}`}
-                  style={{ height: `${Math.max(4, Math.abs(pct) * 0.64)}px` }}
                   title={`${month}: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`}
+                  style={{
+                    width: '20px',
+                    height: `${Math.max(3, Math.abs(pct) * 0.52)}px`,
+                    background: isPos ? '#26a69a' : '#ef5350',
+                    borderRadius: '2px',
+                  }}
                 />
               </div>
-              <div className="text-gray-500 mt-1" style={{ fontSize: '9px' }}>
-                {month.slice(5)}
-              </div>
+              <div style={{ fontSize: '9px', color: '#848e9c', marginTop: '2px' }}>{month.slice(5)}</div>
             </div>
           )
         })}
-      </div>
-    </div>
-  )
-}
-
-function EquityCurve({ curve }: { curve: number[] }) {
-  if (!curve || curve.length < 2) return null
-  const min = Math.min(...curve)
-  const max = Math.max(...curve)
-  const range = max - min || 1
-  const w = 600
-  const h = 160
-  const points = curve.map((v, i) => {
-    const x = (i / (curve.length - 1)) * w
-    const y = h - ((v - min) / range) * (h - 16)
-    return `${x},${y}`
-  }).join(' ')
-  const isPositive = curve[curve.length - 1] >= curve[0]
-  return (
-    <div className="mt-2">
-      <div className="text-xs text-gray-400 mb-2 font-medium">資產曲線</div>
-      <div className="w-full overflow-hidden rounded-xl bg-black/20 p-2">
-        <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{ height: '160px' }}>
-          <defs>
-            <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={isPositive ? '#10b981' : '#f43f5e'} stopOpacity="0.3" />
-              <stop offset="100%" stopColor={isPositive ? '#10b981' : '#f43f5e'} stopOpacity="0" />
-            </linearGradient>
-          </defs>
-          <polyline
-            fill="none"
-            stroke={isPositive ? '#10b981' : '#f43f5e'}
-            strokeWidth="2"
-            points={points}
-          />
-        </svg>
       </div>
     </div>
   )
@@ -176,7 +231,7 @@ function EquityCurve({ curve }: { curve: number[] }) {
 export default function OptimizePage() {
   // Pine Script
   const [pineScript, setPineScript] = useState('')
-  const [isSuggesting, setIsSuggesting] = useState(false)
+  const [isParsing, setIsParsing] = useState(false)
   const [detectedParams, setDetectedParams] = useState<DetectedParam[]>([])
   const [paramRanges, setParamRanges] = useState<ParamRange[]>([])
   const [parseError, setParseError] = useState('')
@@ -199,75 +254,46 @@ export default function OptimizePage() {
   const [copiedCode, setCopiedCode] = useState(false)
   const [errorMsg, setErrorMsg] = useState('')
 
-  // Live log
-  const [logs, setLogs] = useState<string[]>([])
-  const [showLog, setShowLog] = useState(false)
-  const logEndRef = useRef<HTMLDivElement>(null)
-
   // UI state
   const [showSettings, setShowSettings] = useState(true)
   const [showScript, setShowScript] = useState(true)
 
-  // Auto-scroll log
-  useEffect(() => {
-    if (showLog) logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [logs, showLog])
-
   // ---------------------------------------------------------------------------
-  // AI Suggest param ranges (calls /optimize/suggest)
+  // Parse Pine Script inputs
   // ---------------------------------------------------------------------------
 
-  const suggestParamRanges = useCallback(async () => {
-    if (!pineScript.trim()) {
-      setParseError('請先貼入 Pine Script 代碼')
-      return
-    }
-    setIsSuggesting(true)
-    setParseError('')
-
+  const parsePineScript = useCallback(async () => {
+    if (!pineScript.trim()) { setParseError('請先貼入 Pine Script 代碼'); return }
+    setIsParsing(true); setParseError('')
     try {
-      const res = await fetch('/api/optimize/suggest', {
+      const res = await fetch('/api/optimize/parse', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pine_script: pineScript }),
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-
       setDetectedParams(data.params)
-
       const ranges: ParamRange[] = data.params
         .filter((p: DetectedParam) => p.type === 'int' || p.type === 'float')
         .map((p: DetectedParam) => {
           const defVal = typeof p.default === 'number' ? p.default : 1
           return {
-            name: p.name,
-            title: p.title,
-            enabled: true,
+            name: p.name, title: p.title, enabled: true,
             min_val: p.min_val ?? Math.max(1, Math.floor(defVal * 0.5)),
             max_val: p.max_val ?? Math.ceil(defVal * 2),
             step: p.step ?? (p.type === 'int' ? 1 : 0.1),
-            is_int: p.type === 'int',
-            default_val: defVal,
-            reasoning: p.reasoning,
+            is_int: p.type === 'int', default_val: defVal,
           }
         })
-
       setParamRanges(ranges)
-
-      if (data.params.length === 0) {
-        setParseError('未偵測到任何 input 參數，請確認 Pine Script 包含 input.int / input.float 等宣告')
-      }
+      if (data.params.length === 0) setParseError('未偵測到任何 input 參數')
     } catch (err: any) {
-      setParseError(`AI 建議失敗：${err.message}`)
+      setParseError(`解析失敗：${err.message}`)
     } finally {
-      setIsSuggesting(false)
+      setIsParsing(false)
     }
   }, [pineScript])
-
-  // ---------------------------------------------------------------------------
-  // Update param range
-  // ---------------------------------------------------------------------------
 
   const updateRange = (name: string, field: keyof ParamRange, value: any) => {
     setParamRanges(prev => prev.map(p => p.name === name ? { ...p, [field]: value } : p))
@@ -278,24 +304,12 @@ export default function OptimizePage() {
   // ---------------------------------------------------------------------------
 
   const runOptimization = async () => {
-    if (!pineScript.trim()) {
-      setErrorMsg('請先貼入 Pine Script 代碼並取得 AI 建議範圍')
-      return
-    }
+    if (!pineScript.trim()) { setErrorMsg('請先貼入 Pine Script 代碼並解析參數'); return }
     const enabledRanges = paramRanges.filter(p => p.enabled)
-    if (enabledRanges.length === 0) {
-      setErrorMsg('請至少勾選一個參數進行優化')
-      return
-    }
+    if (enabledRanges.length === 0) { setErrorMsg('請至少勾選一個參數進行優化'); return }
 
-    setIsRunning(true)
-    setProgress(0)
-    setProgressText('正在初始化...')
-    setResults([])
-    setSelectedResult(null)
-    setErrorMsg('')
-    setLogs([])
-    setShowLog(true)
+    setIsRunning(true); setProgress(0); setProgressText('正在初始化...')
+    setResults([]); setSelectedResult(null); setErrorMsg('')
 
     try {
       const res = await fetch('/api/optimize/run', {
@@ -307,11 +321,8 @@ export default function OptimizePage() {
           start_date: startDate,
           end_date: endDate,
           param_ranges: enabledRanges.map(p => ({
-            name: p.name,
-            min_val: p.min_val,
-            max_val: p.max_val,
-            step: p.step,
-            is_int: p.is_int,
+            name: p.name, min_val: p.min_val, max_val: p.max_val,
+            step: p.step, is_int: p.is_int,
           })),
           sort_by: sortBy,
           n_trials: nTrials,
@@ -326,40 +337,31 @@ export default function OptimizePage() {
 
       const reader = res.body?.getReader()
       if (!reader) throw new Error('無法讀取串流回應')
-
       const decoder = new TextDecoder()
       let buffer = ''
 
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
         buffer = lines.pop() || ''
-
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue
           const payload = line.slice(6).trim()
           if (!payload) continue
-
           try {
             const data = JSON.parse(payload)
             if (data.type === 'progress') {
               setProgress(data.progress)
               setProgressText(`已完成 ${data.completed} / ${data.total} 次試驗`)
-            } else if (data.type === 'log') {
-              setLogs(prev => [...prev, data.message])
             } else if (data.type === 'result') {
-              setResults(data.results)
-              setProgress(100)
+              setResults(data.results); setProgress(100)
               setProgressText(`優化完成！共 ${data.results.length} 個最佳組合`)
             } else if (data.type === 'error') {
               throw new Error(data.message)
             }
-          } catch {
-            // ignore malformed SSE lines
-          }
+          } catch { /* ignore malformed SSE */ }
         }
       }
     } catch (err: any) {
@@ -378,16 +380,14 @@ export default function OptimizePage() {
     let code = pineScript
     Object.entries(selectedResult.params).forEach(([name, val]) => {
       const pattern = new RegExp(`(${name}\\s*=\\s*input\\.(?:int|float)\\s*\\()[^)]*\\)`, 'g')
-      code = code.replace(pattern, (match) => {
-        return match.replace(/defval\s*=\s*[\d.]+|^(\s*\()[\d.]+/, (m) => {
-          if (m.includes('defval')) return `defval = ${val}`
-          return m.replace(/[\d.]+/, String(val))
-        })
-      })
+      code = code.replace(pattern, (match) =>
+        match.replace(/defval\s*=\s*[\d.]+|^(\s*\()[\d.]+/, (m) =>
+          m.includes('defval') ? `defval = ${val}` : m.replace(/[\d.]+/, String(val))
+        )
+      )
     })
     navigator.clipboard.writeText(code).then(() => {
-      setCopiedCode(true)
-      setTimeout(() => setCopiedCode(false), 2500)
+      setCopiedCode(true); setTimeout(() => setCopiedCode(false), 2500)
     })
   }, [selectedResult, pineScript])
 
@@ -396,295 +396,235 @@ export default function OptimizePage() {
   // ---------------------------------------------------------------------------
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 p-4 md:p-8">
-      <PageHeader
-        title="策略優化"
-        subtitle="AI 分析 Pine Script 建議參數範圍，Optuna 智能搜尋最佳組合"
-        icon={<Target className="w-8 h-8" />}
-      />
+    <div style={S.page}>
+      <div style={{ maxWidth: '1200px', margin: '0 auto' }}>
+        <PageHeader
+          title="策略優化"
+          subtitle="AI 自動解析 Pine Script 參數，Optuna 智能搜尋最佳組合"
+          icon={<Target style={{ width: '28px', height: '28px' }} />}
+        />
+      </div>
 
-      <div className="max-w-7xl mx-auto mt-6 space-y-5">
+      <div style={S.inner}>
 
-        {/* ── Pine Script Input ── */}
-        <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 overflow-hidden">
-          <button
-            onClick={() => setShowScript(!showScript)}
-            className="w-full px-6 py-4 flex items-center justify-between hover:bg-white/5 transition-colors"
-          >
-            <div className="flex items-center gap-3">
-              <Zap className="w-5 h-5 text-yellow-400" />
-              <span className="text-white font-medium">貼入 Pine Script</span>
-              {detectedParams.length > 0 && (
-                <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400">
+        {/* -- Pine Script Input -- */}
+        <div style={S.card}>
+          <button style={S.cardHeader} onClick={() => setShowScript(!showScript)}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <Zap style={{ width: '16px', height: '16px', color: '#f0b90b' }} />
+              <span style={{ fontWeight: 600, fontSize: '13px' }}>貼入 Pine Script</span>
+              {detectedParams.filter(p => p.type === 'int' || p.type === 'float').length > 0 && (
+                <span style={S.badge}>
                   已偵測 {detectedParams.filter(p => p.type === 'int' || p.type === 'float').length} 個可優化參數
                 </span>
               )}
             </div>
-            {showScript ? <ChevronUp className="w-5 h-5 text-white" /> : <ChevronDown className="w-5 h-5 text-white" />}
+            {showScript
+              ? <ChevronUp style={{ width: '16px', height: '16px', color: '#848e9c' }} />
+              : <ChevronDown style={{ width: '16px', height: '16px', color: '#848e9c' }} />}
           </button>
 
           {showScript && (
-            <div className="p-6 border-t border-white/10 space-y-4">
+            <div style={{ padding: '0 20px 20px', borderTop: '1px solid #2b2b43', paddingTop: '16px' }}>
               <textarea
                 value={pineScript}
                 onChange={(e) => { setPineScript(e.target.value); setDetectedParams([]); setParamRanges([]) }}
-                placeholder={`//@version=5\nstrategy("My Strategy", overlay=true)\nfastLength = input.int(9, title="Fast EMA", minval=2, maxval=50)\nslowLength = input.int(21, title="Slow EMA", minval=5, maxval=100)\n// ... 策略邏輯`}
-                className="w-full h-48 px-4 py-3 bg-black/30 border border-white/10 rounded-xl text-green-300 font-mono text-sm focus:ring-2 focus:ring-purple-500 focus:border-transparent resize-y placeholder-gray-600"
+                placeholder={'//@version=5\nstrategy("My Strategy", overlay=true, initial_capital=10000, commission_value=0.1)\nfastLength = input.int(9, title="Fast EMA", minval=2, maxval=50)\n// ... 策略邏輯'}
+                style={{
+                  ...S.input,
+                  height: '160px',
+                  fontFamily: 'monospace',
+                  fontSize: '12px',
+                  color: '#26a69a',
+                  resize: 'vertical',
+                  marginBottom: '12px',
+                }}
               />
-
               {parseError && (
-                <div className="flex items-center gap-2 text-rose-400 text-sm">
-                  <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                <div style={{ ...S.errorBox, marginBottom: '12px' }}>
+                  <AlertCircle style={{ width: '14px', height: '14px', flexShrink: 0 }} />
                   {parseError}
                 </div>
               )}
-
               <button
-                onClick={suggestParamRanges}
-                disabled={isSuggesting || !pineScript.trim()}
-                className="flex items-center gap-2 px-5 py-2.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-xl font-medium transition-colors"
+                onClick={parsePineScript}
+                disabled={isParsing || !pineScript.trim()}
+                style={{
+                  padding: '8px 18px', background: '#2962ff', border: 'none', borderRadius: '6px',
+                  color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', gap: '6px',
+                  ...(isParsing || !pineScript.trim() ? S.btnDisabled : {}),
+                }}
               >
-                {isSuggesting ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-                {isSuggesting ? 'AI 分析中...' : 'AI 建議參數範圍'}
+                {isParsing
+                  ? <><RefreshCw style={{ width: '13px', height: '13px' }} /> 解析中...</>
+                  : <><Sparkles style={{ width: '13px', height: '13px' }} /> AI 自動解析參數</>}
               </button>
             </div>
           )}
         </div>
 
-        {/* ── Param Ranges ── */}
+        {/* -- Detected Params -- */}
         {paramRanges.length > 0 && (
-          <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 p-6">
-            <h3 className="text-white font-semibold mb-4 flex items-center gap-2">
-              <Settings2 className="w-5 h-5 text-purple-400" />
-              參數優化設定
-              <span className="text-xs text-gray-400 font-normal">（AI 建議範圍，可自行調整）</span>
-            </h3>
-
-            <div className="space-y-3">
-              {paramRanges.map((p) => (
-                <div key={p.name} className={`p-4 rounded-xl border transition-colors ${p.enabled ? 'bg-purple-500/10 border-purple-500/30' : 'bg-white/5 border-white/10'}`}>
-                  <div className="flex items-center gap-3 mb-2">
-                    <input
-                      type="checkbox"
-                      checked={p.enabled}
-                      onChange={(e) => updateRange(p.name, 'enabled', e.target.checked)}
-                      className="w-4 h-4 rounded accent-purple-500"
-                    />
-                    <div>
-                      <span className="text-white font-medium">{p.title}</span>
-                      <span className="text-gray-500 text-xs ml-2">({p.name})</span>
+          <div style={S.card}>
+            <div style={{ padding: '20px' }}>
+              <div style={S.sectionTitle}>
+                <Settings2 style={{ width: '15px', height: '15px', color: '#2962ff' }} />
+                參數優化設定
+                <span style={{ fontSize: '11px', color: '#848e9c', fontWeight: 400 }}>（勾選要優化的參數並設定範圍）</span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                {paramRanges.map((p) => (
+                  <div key={p.name} style={S.paramCard(p.enabled)}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: p.enabled ? '12px' : '0' }}>
+                      <input
+                        type="checkbox" checked={p.enabled}
+                        onChange={(e) => updateRange(p.name, 'enabled', e.target.checked)}
+                        style={{ width: '14px', height: '14px', accentColor: '#2962ff' }}
+                      />
+                      <span style={{ color: '#d1d4dc', fontWeight: 600, fontSize: '13px' }}>{p.title}</span>
+                      <span style={{ color: '#848e9c', fontSize: '11px' }}>({p.name})</span>
+                      <span style={{ marginLeft: 'auto', fontSize: '11px', color: '#848e9c' }}>預設: {p.default_val}</span>
                     </div>
-                    <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-white/10 text-gray-300">
-                      預設: {p.default_val}
-                    </span>
+                    {p.enabled && (
+                      <div style={S.grid3}>
+                        {[
+                          { field: 'min_val' as const, label: '最小值' },
+                          { field: 'max_val' as const, label: '最大值' },
+                          { field: 'step' as const, label: '步長' },
+                        ].map(({ field, label }) => (
+                          <div key={field}>
+                            <label style={S.label}>{label}</label>
+                            <input
+                              type="number" value={p[field] as number}
+                              step={p.is_int ? 1 : 0.01}
+                              min={field === 'step' ? (p.is_int ? 1 : 0.01) : undefined}
+                              onChange={(e) => updateRange(p.name, field, parseFloat(e.target.value))}
+                              style={S.input}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
-
-                  {p.reasoning && (
-                    <p className="text-xs text-purple-300/70 mb-3 pl-7">{p.reasoning}</p>
-                  )}
-
-                  {p.enabled && (
-                    <div className="grid grid-cols-3 gap-3">
-                      <div>
-                        <label className="block text-xs text-gray-400 mb-1">最小值</label>
-                        <input
-                          type="number"
-                          value={p.min_val}
-                          step={p.is_int ? 1 : 0.01}
-                          onChange={(e) => updateRange(p.name, 'min_val', parseFloat(e.target.value))}
-                          className="w-full px-3 py-2 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:ring-1 focus:ring-purple-500"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-gray-400 mb-1">最大值</label>
-                        <input
-                          type="number"
-                          value={p.max_val}
-                          step={p.is_int ? 1 : 0.01}
-                          onChange={(e) => updateRange(p.name, 'max_val', parseFloat(e.target.value))}
-                          className="w-full px-3 py-2 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:ring-1 focus:ring-purple-500"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-gray-400 mb-1">步長</label>
-                        <input
-                          type="number"
-                          value={p.step}
-                          step={p.is_int ? 1 : 0.01}
-                          min={p.is_int ? 1 : 0.01}
-                          onChange={(e) => updateRange(p.name, 'step', parseFloat(e.target.value))}
-                          className="w-full px-3 py-2 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:ring-1 focus:ring-purple-500"
-                        />
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
           </div>
         )}
 
-        {/* ── Market & Optimize Settings ── */}
-        <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 overflow-hidden">
-          <button
-            onClick={() => setShowSettings(!showSettings)}
-            className="w-full px-6 py-4 flex items-center justify-between hover:bg-white/5 transition-colors"
-          >
-            <div className="flex items-center gap-3">
-              <Settings2 className="w-5 h-5 text-purple-400" />
-              <span className="text-white font-medium">市場與優化設定</span>
+        {/* -- Market & Optimize Settings -- */}
+        <div style={S.card}>
+          <button style={S.cardHeader} onClick={() => setShowSettings(!showSettings)}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <Settings2 style={{ width: '16px', height: '16px', color: '#2962ff' }} />
+              <span style={{ fontWeight: 600, fontSize: '13px' }}>市場與優化設定</span>
             </div>
-            {showSettings ? <ChevronUp className="w-5 h-5 text-white" /> : <ChevronDown className="w-5 h-5 text-white" />}
+            {showSettings
+              ? <ChevronUp style={{ width: '16px', height: '16px', color: '#848e9c' }} />
+              : <ChevronDown style={{ width: '16px', height: '16px', color: '#848e9c' }} />}
           </button>
 
           {showSettings && (
-            <div className="p-6 border-t border-white/10 space-y-5">
-              {/* Symbol / Interval / Source */}
-              <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+            <div style={{ padding: '0 20px 20px', borderTop: '1px solid #2b2b43', paddingTop: '16px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+              <div style={S.grid3}>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">交易對</label>
-                  <select value={symbol} onChange={(e) => setSymbol(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500">
+                  <label style={S.label}>交易對</label>
+                  <select value={symbol} onChange={(e) => setSymbol(e.target.value)} style={S.select}>
                     {POPULAR_SYMBOLS.map(s => <option key={s} value={s}>{s}</option>)}
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">時間框架</label>
-                  <select value={interval} onChange={(e) => setIntervalVal(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500">
+                  <label style={S.label}>時間框架</label>
+                  <select value={interval} onChange={(e) => setIntervalVal(e.target.value)} style={S.select}>
                     {INTERVALS.map(i => <option key={i} value={i}>{i}</option>)}
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">資料來源</label>
-                  <select value={source} onChange={(e) => setSource(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500">
+                  <label style={S.label}>資料來源</label>
+                  <select value={source} onChange={(e) => setSource(e.target.value)} style={S.select}>
                     {SOURCES.map(s => <option key={s} value={s}>{s}</option>)}
                   </select>
                 </div>
               </div>
 
-              {/* Date range */}
-              <div className="grid grid-cols-2 gap-4">
+              <div style={S.grid2}>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">開始日期</label>
-                  <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
+                  <label style={S.label}>開始日期</label>
+                  <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} style={S.input} />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">結束日期</label>
-                  <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
+                  <label style={S.label}>結束日期</label>
+                  <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} style={S.input} />
                 </div>
               </div>
 
-              {/* Sort / Trials */}
-              <div className="grid grid-cols-2 gap-4">
+              <div style={S.grid2}>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">優化目標</label>
-                  <select value={sortBy} onChange={(e) => setSortBy(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500">
+                  <label style={S.label}>優化目標</label>
+                  <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} style={S.select}>
                     {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">試驗次數 (Trials)</label>
-                  <input type="number" value={nTrials} min={10} max={2000} step={10} onChange={(e) => setNTrials(Number(e.target.value))}
-                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
+                  <label style={S.label}>試驗次數 (Trials)</label>
+                  <input
+                    type="number" value={nTrials} min={10} max={2000} step={10}
+                    onChange={(e) => setNTrials(Number(e.target.value))}
+                    style={S.input}
+                  />
                 </div>
               </div>
             </div>
           )}
         </div>
 
-        {/* ── Error ── */}
+        {/* -- Error -- */}
         {errorMsg && (
-          <div className="flex items-center gap-2 px-4 py-3 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-400 text-sm">
-            <AlertCircle className="w-4 h-4 flex-shrink-0" />
+          <div style={S.errorBox}>
+            <AlertCircle style={{ width: '14px', height: '14px', flexShrink: 0 }} />
             {errorMsg}
           </div>
         )}
 
-        {/* ── Run Button ── */}
+        {/* -- Run Button -- */}
         <button
           onClick={runOptimization}
           disabled={isRunning}
-          className="w-full py-4 bg-gradient-to-r from-purple-600 to-violet-600 hover:from-purple-700 hover:to-violet-700 disabled:opacity-50 text-white rounded-2xl font-semibold text-lg flex items-center justify-center gap-3 transition-all shadow-lg shadow-purple-900/30"
+          style={{ ...S.btnPrimary, ...(isRunning ? S.btnDisabled : {}) }}
         >
-          {isRunning ? (
-            <>
-              <RefreshCw className="w-5 h-5 animate-spin" />
-              優化中... {progress}%
-            </>
-          ) : (
-            <>
-              <Play className="w-5 h-5" />
-              開始策略優化
-            </>
-          )}
+          {isRunning
+            ? <><RefreshCw style={{ width: '16px', height: '16px' }} /> 優化中... {progress}%</>
+            : <><Play style={{ width: '16px', height: '16px' }} /> 開始策略優化</>}
         </button>
 
-        {/* ── Progress Bar ── */}
+        {/* -- Progress Bar -- */}
         {isRunning && (
-          <div className="space-y-2">
-            <div className="w-full bg-white/10 rounded-full h-2 overflow-hidden">
-              <div
-                className="h-full bg-gradient-to-r from-purple-500 to-violet-500 transition-all duration-300 rounded-full"
-                style={{ width: `${progress}%` }}
-              />
+          <div>
+            <div style={{ width: '100%', background: '#2b2b43', borderRadius: '99px', height: '6px', overflow: 'hidden', marginBottom: '8px' }}>
+              <div style={{ height: '100%', background: '#2962ff', borderRadius: '99px', width: `${progress}%`, transition: 'width 0.3s' }} />
             </div>
-            <p className="text-center text-sm text-gray-400">{progressText}</p>
+            <div style={{ textAlign: 'center', fontSize: '12px', color: '#848e9c' }}>{progressText}</div>
           </div>
         )}
 
-        {/* ── Live Log Panel ── */}
-        {logs.length > 0 && (
-          <div className="bg-black/40 backdrop-blur-lg rounded-2xl border border-white/10 overflow-hidden">
-            <button
-              onClick={() => setShowLog(!showLog)}
-              className="w-full px-6 py-3 flex items-center justify-between hover:bg-white/5 transition-colors"
-            >
-              <div className="flex items-center gap-2">
-                <Terminal className="w-4 h-4 text-green-400" />
-                <span className="text-green-400 font-mono text-sm">即時日誌</span>
-                <span className="text-xs text-gray-500">{logs.length} 條</span>
-              </div>
-              {showLog ? <ChevronUp className="w-4 h-4 text-gray-400" /> : <ChevronDown className="w-4 h-4 text-gray-400" />}
-            </button>
-            {showLog && (
-              <div className="px-6 pb-4 max-h-64 overflow-y-auto font-mono text-xs text-green-300 space-y-1">
-                {logs.map((log, i) => (
-                  <div key={i} className="opacity-80">&gt; {log}</div>
-                ))}
-                <div ref={logEndRef} />
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ── Results Table ── */}
+        {/* -- Results Table -- */}
         {results.length > 0 && (
-          <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 overflow-hidden">
-            <div className="px-6 py-4 border-b border-white/10 flex items-center justify-between">
-              <h3 className="text-white font-semibold flex items-center gap-2">
-                <BarChart2 className="w-5 h-5 text-purple-400" />
+          <div style={S.card}>
+            <div style={{ padding: '16px 20px', borderBottom: '1px solid #2b2b43', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 600, color: '#d1d4dc' }}>
+                <BarChart2 style={{ width: '15px', height: '15px', color: '#2962ff' }} />
                 前 {results.length} 名最佳參數組合
-              </h3>
-              <span className="text-xs text-gray-400">點擊任一列查看詳細圖表</span>
+              </div>
+              <span style={{ fontSize: '11px', color: '#848e9c' }}>點擊列查看詳細</span>
             </div>
-
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                 <thead>
-                  <tr className="border-b border-white/10">
-                    <th className="px-4 py-3 text-left text-gray-400 font-medium">排名</th>
-                    <th className="px-4 py-3 text-left text-gray-400 font-medium">參數</th>
-                    <th className="px-4 py-3 text-right text-gray-400 font-medium">總盈利%</th>
-                    <th className="px-4 py-3 text-right text-gray-400 font-medium">MDD%</th>
-                    <th className="px-4 py-3 text-right text-gray-400 font-medium">盈虧比</th>
-                    <th className="px-4 py-3 text-right text-gray-400 font-medium">勝率%</th>
-                    <th className="px-4 py-3 text-right text-gray-400 font-medium">交易數</th>
-                    <th className="px-4 py-3 text-right text-gray-400 font-medium">夏普</th>
+                  <tr style={{ background: '#131722' }}>
+                    {['排名', '參數', '總盈利%', 'MDD%', '盈虧比', '勝率%', '交易數', '夏普'].map(h => (
+                      <th key={h} style={S.tableHeader}>{h}</th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
@@ -694,35 +634,38 @@ export default function OptimizePage() {
                       <tr
                         key={r.rank}
                         onClick={() => setSelectedResult(r)}
-                        className={`border-b border-white/5 cursor-pointer transition-colors ${
-                          isSelected ? 'bg-purple-500/20' : 'hover:bg-white/5'
-                        }`}
+                        style={{
+                          cursor: 'pointer',
+                          background: isSelected ? 'rgba(41,98,255,0.1)' : 'transparent',
+                        }}
+                        onMouseEnter={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.03)' }}
+                        onMouseLeave={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'transparent' }}
                       >
-                        <td className="px-4 py-3">
-                          <span className={`inline-flex items-center justify-center w-7 h-7 rounded-full text-xs font-bold ${
-                            r.rank === 1 ? 'bg-yellow-500 text-black' :
-                            r.rank === 2 ? 'bg-gray-400 text-black' :
-                            r.rank === 3 ? 'bg-amber-700 text-white' :
-                            'bg-white/10 text-gray-300'
-                          }`}>{r.rank}</span>
+                        <td style={S.tableCell}>
+                          <span style={{
+                            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                            width: '24px', height: '24px', borderRadius: '50%', fontSize: '11px', fontWeight: 700,
+                            background: r.rank === 1 ? '#f0b90b' : r.rank === 2 ? '#848e9c' : r.rank === 3 ? '#cd7f32' : '#2b2b43',
+                            color: r.rank <= 3 ? '#131722' : '#d1d4dc',
+                          }}>{r.rank}</span>
                         </td>
-                        <td className="px-4 py-3">
-                          <div className="flex flex-wrap gap-1">
+                        <td style={S.tableCell}>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
                             {Object.entries(r.params).filter(([k]) => !k.startsWith('_')).map(([k, v]) => (
-                              <span key={k} className="text-xs px-2 py-0.5 rounded-md bg-white/10 text-gray-300">
+                              <span key={k} style={{ fontSize: '11px', padding: '2px 6px', background: '#2b2b43', borderRadius: '4px', color: '#d1d4dc' }}>
                                 {k}: {typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(3)) : v}
                               </span>
                             ))}
                           </div>
                         </td>
-                        <td className={`px-4 py-3 text-right font-semibold ${r.profit_pct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        <td style={{ ...S.tableCell, color: r.profit_pct >= 0 ? '#26a69a' : '#ef5350', fontWeight: 600 }}>
                           {r.profit_pct >= 0 ? '+' : ''}{r.profit_pct.toFixed(2)}%
                         </td>
-                        <td className="px-4 py-3 text-right text-rose-400">{r.max_drawdown.toFixed(2)}%</td>
-                        <td className="px-4 py-3 text-right text-white">{r.profit_factor.toFixed(2)}</td>
-                        <td className="px-4 py-3 text-right text-white">{r.win_rate.toFixed(1)}%</td>
-                        <td className="px-4 py-3 text-right text-gray-300">{r.total_trades}</td>
-                        <td className="px-4 py-3 text-right text-gray-300">{r.sharpe_ratio.toFixed(2)}</td>
+                        <td style={{ ...S.tableCell, color: '#ef5350' }}>{r.max_drawdown.toFixed(2)}%</td>
+                        <td style={S.tableCell}>{r.profit_factor.toFixed(2)}</td>
+                        <td style={S.tableCell}>{r.win_rate.toFixed(1)}%</td>
+                        <td style={S.tableCell}>{r.total_trades}</td>
+                        <td style={S.tableCell}>{r.sharpe_ratio.toFixed(2)}</td>
                       </tr>
                     )
                   })}
@@ -732,55 +675,63 @@ export default function OptimizePage() {
           </div>
         )}
 
-        {/* ── Selected Result Detail ── */}
+        {/* -- Selected Result Detail -- */}
         {selectedResult && (
-          <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 p-6 space-y-5">
-            <div className="flex items-center justify-between">
-              <h3 className="text-white font-semibold flex items-center gap-2">
-                <TrendingUp className="w-5 h-5 text-purple-400" />
-                第 {selectedResult.rank} 名詳細分析
-              </h3>
-              <button
-                onClick={copyOptimizedCode}
-                className="flex items-center gap-2 px-4 py-2 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/30 rounded-xl text-emerald-400 text-sm font-medium transition-colors"
-              >
-                {copiedCode ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-                {copiedCode ? '已複製！' : '一鍵複製優化代碼'}
-              </button>
-            </div>
+          <div style={S.card}>
+            <div style={{ padding: '20px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 600, color: '#d1d4dc' }}>
+                  <TrendingUp style={{ width: '15px', height: '15px', color: '#2962ff' }} />
+                  第 {selectedResult.rank} 名詳細分析
+                </div>
+                <button onClick={copyOptimizedCode} style={S.btnSecondary}>
+                  {copiedCode
+                    ? <><Check style={{ width: '13px', height: '13px' }} /> 已複製！</>
+                    : <><Copy style={{ width: '13px', height: '13px' }} /> 複製優化代碼</>}
+                </button>
+              </div>
 
-            {/* Metrics grid */}
-            <div className="grid grid-cols-4 md:grid-cols-8 gap-2">
-              <MetricBadge label="總盈利" value={`${selectedResult.profit_pct >= 0 ? '+' : ''}${selectedResult.profit_pct.toFixed(2)}%`} highlight={selectedResult.profit_pct > 0} />
-              <MetricBadge label="最終資產" value={`$${selectedResult.final_equity.toFixed(0)}`} />
-              <MetricBadge label="MDD" value={`${selectedResult.max_drawdown.toFixed(2)}%`} />
-              <MetricBadge label="盈虧比" value={selectedResult.profit_factor.toFixed(2)} highlight={selectedResult.profit_factor > 1.5} />
-              <MetricBadge label="勝率" value={`${selectedResult.win_rate.toFixed(1)}%`} highlight={selectedResult.win_rate > 50} />
-              <MetricBadge label="交易數" value={String(selectedResult.total_trades)} />
-              <MetricBadge label="夏普" value={selectedResult.sharpe_ratio.toFixed(2)} highlight={selectedResult.sharpe_ratio > 1} />
-              <MetricBadge label="毛利/毛損" value={`${selectedResult.gross_profit.toFixed(0)}/${selectedResult.gross_loss.toFixed(0)}`} />
-            </div>
+              {/* Metrics */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px', marginBottom: '16px' }}>
+                {[
+                  { label: '總盈利', value: `${selectedResult.profit_pct >= 0 ? '+' : ''}${selectedResult.profit_pct.toFixed(2)}%`, color: selectedResult.profit_pct >= 0 ? '#26a69a' : '#ef5350' },
+                  { label: '最終資產', value: `$${selectedResult.final_equity.toFixed(0)}`, color: '#d1d4dc' },
+                  { label: 'MDD', value: `${selectedResult.max_drawdown.toFixed(2)}%`, color: '#ef5350' },
+                  { label: '盈虧比', value: selectedResult.profit_factor.toFixed(2), color: selectedResult.profit_factor > 1.5 ? '#26a69a' : '#d1d4dc' },
+                  { label: '勝率', value: `${selectedResult.win_rate.toFixed(1)}%`, color: selectedResult.win_rate > 50 ? '#26a69a' : '#d1d4dc' },
+                  { label: '交易數', value: String(selectedResult.total_trades), color: '#d1d4dc' },
+                  { label: '夏普', value: selectedResult.sharpe_ratio.toFixed(2), color: selectedResult.sharpe_ratio > 1 ? '#26a69a' : '#d1d4dc' },
+                  { label: '毛利/毛損', value: `${selectedResult.gross_profit.toFixed(0)}/${selectedResult.gross_loss.toFixed(0)}`, color: '#d1d4dc' },
+                ].map(({ label, value, color }) => (
+                  <div key={label} style={S.metricBox}>
+                    <div style={S.metricLabel}>{label}</div>
+                    <div style={{ ...S.metricValue, color }}>{value}</div>
+                  </div>
+                ))}
+              </div>
 
-            {/* Equity curve (pure SVG, no external lib) */}
-            <EquityCurve curve={selectedResult.equity_curve} />
+              {/* Equity curve */}
+              <div style={{ marginBottom: '4px', fontSize: '11px', color: '#848e9c', fontWeight: 600, textTransform: 'uppercase' }}>資產曲線</div>
+              <EquityChart data={selectedResult.equity_curve} />
 
-            {/* Monthly PnL */}
-            <MonthlyBarChart data={selectedResult.monthly_pnl} />
+              {/* Monthly PnL */}
+              <MonthlyBarChart data={selectedResult.monthly_pnl} />
 
-            {/* Optimized params */}
-            <div>
-              <div className="text-xs text-gray-400 mb-2 font-medium">最佳參數值</div>
-              <div className="flex flex-wrap gap-2">
-                {Object.entries(selectedResult.params)
-                  .filter(([k]) => !k.startsWith('_'))
-                  .map(([k, v]) => (
-                    <div key={k} className="px-3 py-2 bg-purple-500/20 border border-purple-500/30 rounded-lg">
-                      <span className="text-gray-400 text-xs">{k}: </span>
-                      <span className="text-white font-semibold text-sm">
-                        {typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(4)) : String(v)}
-                      </span>
-                    </div>
-                  ))}
+              {/* Best params */}
+              <div style={{ marginTop: '16px' }}>
+                <div style={{ fontSize: '11px', color: '#848e9c', fontWeight: 600, textTransform: 'uppercase', marginBottom: '8px' }}>最佳參數值</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                  {Object.entries(selectedResult.params)
+                    .filter(([k]) => !k.startsWith('_'))
+                    .map(([k, v]) => (
+                      <div key={k} style={{ padding: '8px 14px', background: 'rgba(41,98,255,0.12)', border: '1px solid rgba(41,98,255,0.3)', borderRadius: '8px' }}>
+                        <span style={{ color: '#848e9c', fontSize: '11px' }}>{k}: </span>
+                        <span style={{ color: '#d1d4dc', fontWeight: 700, fontSize: '13px' }}>
+                          {typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(4)) : String(v)}
+                        </span>
+                      </div>
+                    ))}
+                </div>
               </div>
             </div>
           </div>
