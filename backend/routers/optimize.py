@@ -2,12 +2,8 @@
 # 修改歷程記錄
 # -----------------------------------------------------------------------------
 # v1.0.0 - 2026-02-26 - 初始版本
-#   - Pine Script input 參數自動解析（input.int / input.float / input.bool）
-#   - Gemini AI 轉譯層：動態將 Pine Script 邏輯轉為 Python 回測函式
-#   - Optuna TPE sampler 優化引擎，SSE 串流進度回報
-#   - 技術指標對齊 TradingView：SMA/EMA/SMMA/ATR/RSI/MACD/BB
-#   - 防止偷看未來：ta.highest/lowest 強制使用 shift(1)
-#   - var 狀態跨 K 線正確處理，position_size 追蹤
+# v1.1.0 - 2026-02-26 - initial_capital/commission/quantity 改從 Pine Script
+#           strategy() 呼叫自動解析，不再由前端傳入
 # =============================================================================
 
 import re
@@ -47,9 +43,6 @@ class OptimizeRequest(BaseModel):
     source: str = "binance"
     start_date: str = "2023-01-01"
     end_date: str = "2024-01-01"
-    initial_capital: float = 10000.0
-    commission: float = 0.001
-    quantity: float = 1.0
     param_ranges: list[ParamRange]
     sort_by: str = "profit_pct"
     n_trials: int = 100
@@ -57,6 +50,62 @@ class OptimizeRequest(BaseModel):
 
 class ParseRequest(BaseModel):
     pine_script: str
+
+# ---------------------------------------------------------------------------
+# Pine Script strategy() config parser
+# ---------------------------------------------------------------------------
+
+def parse_strategy_config(pine_script: str) -> dict:
+    """Extract initial_capital, commission, default_qty_value from strategy() call."""
+    config = {
+        "initial_capital": 10000.0,
+        "commission": 0.001,
+        "quantity": 1.0,
+    }
+
+    # Match strategy(...) possibly spanning multiple lines
+    strat_match = re.search(r'strategy\s*\(([^)]+)\)', pine_script, re.DOTALL | re.IGNORECASE)
+    if not strat_match:
+        return config
+
+    args = strat_match.group(1)
+
+    def get_named(key: str):
+        pat = re.compile(rf'{key}\s*=\s*([^\s,)]+)', re.IGNORECASE)
+        m = pat.search(args)
+        return m.group(1).strip() if m else None
+
+    ic = get_named('initial_capital')
+    if ic:
+        try:
+            config['initial_capital'] = float(ic)
+        except ValueError:
+            pass
+
+    # commission_type=strategy.commission.percent means value is in percent (e.g. 0.1 = 0.1%)
+    # commission_type=strategy.commission.cash_per_contract means absolute value
+    # We always store as decimal fraction for internal use
+    comm_val = get_named('commission_value')
+    comm_type = get_named('commission_type') or ''
+    if comm_val:
+        try:
+            cv = float(comm_val)
+            if 'percent' in comm_type.lower() or comm_type == '':
+                # TradingView default: percent, e.g. 0.1 means 0.1% -> 0.001
+                config['commission'] = cv / 100.0
+            else:
+                config['commission'] = cv
+        except ValueError:
+            pass
+
+    qty = get_named('default_qty_value')
+    if qty:
+        try:
+            config['quantity'] = float(qty)
+        except ValueError:
+            pass
+
+    return config
 
 # ---------------------------------------------------------------------------
 # Pine Script input parser
@@ -81,9 +130,9 @@ def parse_pine_inputs(pine_script: str) -> list[dict]:
             continue
         seen.add(var_name)
 
-        def get_named(key: str, default=None):
+        def get_named(key: str, default=None, _args=args_str):
             pat = re.compile(rf'{key}\s*=\s*([^,\)]+)', re.IGNORECASE)
-            found = pat.search(args_str)
+            found = pat.search(_args)
             if found:
                 return found.group(1).strip().strip('"\'')
             return default
@@ -175,6 +224,11 @@ Each trade dict:
 
 equity_curve: list of portfolio value at each bar (same length as df)
 
+Use _commission and _capital and _quantity from params for trade calculations:
+  capital = params.get('_capital', 10000.0)
+  commission = params.get('_commission', 0.001)
+  qty = params.get('_quantity', 1.0)
+
 Technical indicators:
 - SMA(src, n): src.rolling(n).mean()
 - EMA(src, n): src.ewm(span=n, adjust=False).mean()
@@ -186,14 +240,16 @@ Technical indicators:
 Output ONLY the Python function, no markdown."""
 
 async def translate_with_gemini(pine_script: str) -> str:
-    """Use Gemini Flash (free tier) to translate Pine Script to Python."""
+    """Use Gemini Flash to translate Pine Script to Python."""
     try:
         import google.generativeai as genai
 
         api_key = os.environ.get("GEMINI_API_KEY", "")
         if not api_key:
-            logger.warning("GEMINI_API_KEY not set, using fallback strategy")
-            return _get_fallback_strategy()
+            raise HTTPException(
+                status_code=503,
+                detail="GEMINI_API_KEY environment variable is not set. Please configure it on the server."
+            )
 
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
@@ -212,74 +268,10 @@ async def translate_with_gemini(pine_script: str) -> str:
 
         return code.strip()
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning(f"Gemini translation failed: {e}, using fallback")
-        return _get_fallback_strategy()
-
-def _get_fallback_strategy() -> str:
-    return '''def run_strategy(df: pd.DataFrame, **params) -> dict:
-    fast = int(params.get("fastLength", params.get("fast_length", 9)))
-    slow = int(params.get("slowLength", params.get("slow_length", 21)))
-    qty = float(params.get("quantity", 1.0))
-    commission = float(params.get("_commission", 0.001))
-    capital = float(params.get("_capital", 10000.0))
-
-    close = df["close"]
-    fast_ema = close.ewm(span=fast, adjust=False).mean()
-    slow_ema = close.ewm(span=slow, adjust=False).mean()
-
-    position = 0
-    entry_price = 0.0
-    entry_time = None
-    trades = []
-    equity = capital
-    equity_curve = []
-
-    for i in range(len(df)):
-        if i < slow:
-            equity_curve.append(equity)
-            continue
-
-        prev_f = fast_ema.iloc[i - 1]
-        prev_s = slow_ema.iloc[i - 1]
-        curr_f = fast_ema.iloc[i]
-        curr_s = slow_ema.iloc[i]
-        price = close.iloc[i]
-        ts = str(df.index[i])
-
-        if prev_f <= prev_s and curr_f > curr_s and position == 0:
-            position = 1
-            entry_price = price
-            entry_time = ts
-
-        elif prev_f >= prev_s and curr_f < curr_s and position == 1:
-            pnl = (price - entry_price) * qty - (entry_price + price) * qty * commission
-            equity += pnl
-            trades.append({
-                "entry_time": entry_time, "exit_time": ts,
-                "entry_price": round(entry_price, 4), "exit_price": round(price, 4),
-                "side": "long", "pnl": round(pnl, 4),
-                "pnl_pct": round((price - entry_price) / entry_price * 100, 4)
-            })
-            position = 0
-
-        equity_curve.append(equity)
-
-    if position != 0 and entry_price > 0:
-        price = close.iloc[-1]
-        ts = str(df.index[-1])
-        mult = 1 if position == 1 else -1
-        pnl = (price - entry_price) * qty * mult - (entry_price + price) * qty * commission
-        equity += pnl
-        trades.append({
-            "entry_time": entry_time, "exit_time": ts,
-            "entry_price": round(entry_price, 4), "exit_price": round(price, 4),
-            "side": "long" if position == 1 else "short", "pnl": round(pnl, 4),
-            "pnl_pct": round((price - entry_price) / entry_price * 100 * mult, 4)
-        })
-
-    return {"trades": trades, "equity_curve": equity_curve}
-'''
+        raise HTTPException(status_code=502, detail=f"Gemini translation failed: {e}")
 
 # ---------------------------------------------------------------------------
 # Metrics calculator
@@ -386,9 +378,9 @@ async def fetch_candles(symbol: str, interval: str, source: str, start_date: str
     if not all_candles:
         raise HTTPException(status_code=404, detail="No candle data found")
 
-    df = pd.DataFrame(all_candles, columns=[\
-        "timestamp", "open", "high", "low", "close", "volume",\
-        "close_time", "quote_vol", "trades", "taker_base", "taker_quote", "ignore"\
+    df = pd.DataFrame(all_candles, columns=[
+        "timestamp", "open", "high", "low", "close", "volume",
+        "close_time", "quote_vol", "trades", "taker_base", "taker_quote", "ignore"
     ])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     df = df.set_index("timestamp")
@@ -438,7 +430,11 @@ async def run_optuna_optimization(
                 val = trial.suggest_float(pr.name, pr.min_val, pr.max_val, step=pr.step if pr.step > 0 else None)
             trial_params[pr.name] = val
 
-        trial_params.update({"_commission": commission, "_capital": initial_capital, "quantity": quantity})
+        trial_params.update({
+            "_commission": commission,
+            "_capital": initial_capital,
+            "_quantity": quantity,
+        })
 
         try:
             raw = execute_strategy(strategy_code, df.copy(), trial_params)
@@ -487,13 +483,24 @@ async def run_optuna_optimization(
 
 @router.post("/parse")
 async def parse_inputs(req: ParseRequest):
-    """Auto-detect all input parameters from Pine Script."""
+    """Auto-detect all input parameters and strategy config from Pine Script."""
     params = parse_pine_inputs(req.pine_script)
-    return {"params": params, "count": len(params)}
+    strategy_config = parse_strategy_config(req.pine_script)
+    return {
+        "params": params,
+        "count": len(params),
+        "strategy_config": strategy_config,
+    }
 
 @router.post("/run")
 async def run_optimization(req: OptimizeRequest):
     """Run Optuna optimization with SSE progress streaming."""
+    # Parse strategy config from the pine script itself
+    strategy_config = parse_strategy_config(req.pine_script)
+    initial_capital = strategy_config["initial_capital"]
+    commission = strategy_config["commission"]
+    quantity = strategy_config["quantity"]
+
     try:
         df = await fetch_candles(req.symbol, req.interval, req.source, req.start_date, req.end_date)
     except Exception as e:
@@ -502,10 +509,7 @@ async def run_optimization(req: OptimizeRequest):
     if len(df) < 50:
         raise HTTPException(status_code=400, detail="Insufficient data (< 50 bars)")
 
-    try:
-        strategy_code = await translate_with_gemini(req.pine_script)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
+    strategy_code = await translate_with_gemini(req.pine_script)
 
     try:
         compile(strategy_code, "<strategy>", "exec")
@@ -516,9 +520,13 @@ async def run_optimization(req: OptimizeRequest):
         try:
             async for chunk in run_optuna_optimization(
                 strategy_code=strategy_code, df=df,
-                param_ranges=req.param_ranges, initial_capital=req.initial_capital,
-                commission=req.commission, quantity=req.quantity,
-                sort_by=req.sort_by, n_trials=req.n_trials, top_n=req.top_n,
+                param_ranges=req.param_ranges,
+                initial_capital=initial_capital,
+                commission=commission,
+                quantity=quantity,
+                sort_by=req.sort_by,
+                n_trials=req.n_trials,
+                top_n=req.top_n,
             ):
                 yield chunk
         except Exception as e:
