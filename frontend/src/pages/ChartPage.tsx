@@ -2,10 +2,15 @@
  * ChartPage v10
  *
  * Fix vs v9:
- * - IndicatorTag: child span onMouseLeave now calls e.stopPropagation()
- *   so parent's setHov(false) is NOT triggered when mouse moves onto icon buttons.
- *   This means 👁 ⚙ ✕ stay visible while hovering over them.
- * - IndicatorRow gear icon: same fix.
+ * - IndicatorTag: COMPLETELY rewritten hover logic.
+ *   Root cause: React onMouseLeave fires when mouse moves FROM parent TO child
+ *   (even though child is inside parent). stopPropagation() does NOT fix this
+ *   because onMouseLeave doesn't bubble — it fires on the element itself.
+ *   Solution: keep all icon buttons always in DOM (opacity:0), toggle opacity
+ *   via direct DOM ref (no React re-render). Use relatedTarget check on the
+ *   parent's onMouseLeave to only hide when mouse truly left the group.
+ * - IndicatorRow: same approach for gear icon — always in DOM when isOn,
+ *   opacity toggled via ref + relatedTarget check.
  *
  * Key changes vs v8:
  * 1. MA/EMA now support multiple periods (like Binance/TradingView).
@@ -225,8 +230,12 @@ function mainIndLabel(ind: ActiveIndicator): string {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IndicatorTag — shown in the interval toolbar row (above chart).
-// Plain text always visible. 👁 ⚙ ✕ only appear on hover.
-// The controls appear to the RIGHT of the label text, no background.
+// Plain text always visible. 👁 ⚙ ✕ always rendered but hidden via opacity=0
+// until the parent is hovered. We use a group ref + CSS class trick:
+// the parent sets data-hov="true" on mouseenter/leave via direct DOM mutation
+// (no React re-render) and child buttons read it via CSS sibling selector.
+// Because we can't use CSS classes with inline styles, we use a simpler trick:
+// render all buttons always, but set their opacity via a ref on the parent.
 // ─────────────────────────────────────────────────────────────────────────────
 function IndicatorTag({
   label, visible, onToggleVisible, onSettings, onRemove,
@@ -234,53 +243,60 @@ function IndicatorTag({
   label: string; visible: boolean
   onToggleVisible: () => void; onSettings: () => void; onRemove: () => void
 }) {
-  const [hov, setHov] = useState(false)
+  const groupRef = useRef<HTMLSpanElement>(null)
+  const iconsRef = useRef<HTMLSpanElement>(null)
+
+  const showIcons  = () => { if (iconsRef.current) iconsRef.current.style.opacity = '1' }
+  const hideIcons  = () => { if (iconsRef.current) iconsRef.current.style.opacity = '0' }
+
   return (
     <span
-      onMouseEnter={() => setHov(true)}
-      onMouseLeave={() => setHov(false)}
+      ref={groupRef}
+      onMouseEnter={showIcons}
+      onMouseLeave={e => {
+        // Only hide if the mouse truly left the whole group (not just moved to a child)
+        if (!groupRef.current?.contains(e.relatedTarget as Node)) hideIcons()
+      }}
       style={{
         display: 'inline-flex', alignItems: 'center', gap: 2,
         fontSize: 11, lineHeight: '18px',
         color: visible ? '#848e9c' : '#444',
         cursor: 'default', userSelect: 'none',
         padding: '0 3px', borderRadius: 3,
-        background: hov ? 'rgba(255,255,255,0.04)' : 'transparent',
       }}
     >
       <span style={{ fontWeight: 500 }}>{label}</span>
 
-      {hov && (
-        <>
-          <span
-            role="button" title={visible ? '隱藏' : '顯示'}
-            onClick={e => { e.stopPropagation(); onToggleVisible() }}
-            onMouseLeave={e => e.stopPropagation()}
-            style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: '0 1px' }}
-            onMouseEnter={e => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.color = '#d1d4dc' }}
-          >
-            {visible ? <Eye size={10} /> : <EyeOff size={10} />}
-          </span>
-          <span
-            role="button" title="設定"
-            onClick={e => { e.stopPropagation(); onSettings() }}
-            onMouseLeave={e => e.stopPropagation()}
-            style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: '0 1px' }}
-            onMouseEnter={e => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.color = '#d1d4dc' }}
-          >
-            <Settings size={10} />
-          </span>
-          <span
-            role="button" title="移除"
-            onClick={e => { e.stopPropagation(); onRemove() }}
-            onMouseLeave={e => e.stopPropagation()}
-            style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: '0 1px' }}
-            onMouseEnter={e => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.color = '#ef5350' }}
-          >
-            <X size={10} />
-          </span>
-        </>
-      )}
+      {/* Icons always in DOM, opacity toggled via ref — no re-render flicker */}
+      <span ref={iconsRef} style={{ display: 'inline-flex', alignItems: 'center', gap: 1, opacity: 0, transition: 'opacity 0.1s' }}>
+        <span
+          role="button" title={visible ? '隱藏' : '顯示'}
+          onClick={e => { e.stopPropagation(); onToggleVisible() }}
+          style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: '0 1px' }}
+          onMouseEnter={e => (e.currentTarget.style.color = '#d1d4dc')}
+          onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
+        >
+          {visible ? <Eye size={10} /> : <EyeOff size={10} />}
+        </span>
+        <span
+          role="button" title="設定"
+          onClick={e => { e.stopPropagation(); onSettings() }}
+          style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: '0 1px' }}
+          onMouseEnter={e => (e.currentTarget.style.color = '#d1d4dc')}
+          onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
+        >
+          <Settings size={10} />
+        </span>
+        <span
+          role="button" title="移除"
+          onClick={e => { e.stopPropagation(); onRemove() }}
+          style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: '0 1px' }}
+          onMouseEnter={e => (e.currentTarget.style.color = '#ef5350')}
+          onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
+        >
+          <X size={10} />
+        </span>
+      </span>
     </span>
   )
 }
@@ -449,12 +465,22 @@ function SettingsModal({ indicator, def, onClose, onApply }: {
 function IndicatorRow({ def, isOn, onToggle, onSettings }: {
   def: IndicatorDef; isOn: boolean; onToggle: () => void; onSettings: () => void
 }) {
-  const [hov, setHov] = useState(false)
+  const rowRef     = useRef<HTMLDivElement>(null)
+  const gearRef    = useRef<HTMLSpanElement>(null)
+
+  const showGear = () => { if (isOn && gearRef.current) gearRef.current.style.opacity = '1' }
+  const hideGear = (e: React.MouseEvent) => {
+    if (!rowRef.current?.contains(e.relatedTarget as Node) && gearRef.current) {
+      gearRef.current.style.opacity = '0'
+    }
+  }
+
   return (
     <div
-      onMouseEnter={() => setHov(true)}
-      onMouseLeave={() => setHov(false)}
-      style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', cursor: 'pointer', background: hov ? '#2b2b43' : 'transparent' }}
+      ref={rowRef}
+      onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = '#2b2b43'; showGear() }}
+      onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'transparent'; hideGear(e) }}
+      style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', cursor: 'pointer', background: 'transparent' }}
     >
       <div
         onClick={onToggle}
@@ -470,14 +496,16 @@ function IndicatorRow({ def, isOn, onToggle, onSettings }: {
 
       <span onClick={onToggle} style={{ fontSize: 12, color: '#d1d4dc', flex: 1 }}>{def.label}</span>
 
-      {isOn && hov && (
+      {/* Gear icon: always in DOM when isOn, opacity toggled via ref */}
+      {isOn && (
         <span
+          ref={gearRef}
           role="button"
           onClick={e => { e.stopPropagation(); onSettings() }}
           title="設定"
-          style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: 1, flexShrink: 0 }}
-          onMouseEnter={e => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.color = '#d1d4dc' }}
-          onMouseLeave={e => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.color = '#848e9c' }}
+          style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', color: '#848e9c', padding: 1, flexShrink: 0, opacity: 0, transition: 'opacity 0.1s' }}
+          onMouseEnter={e => (e.currentTarget.style.color = '#d1d4dc')}
+          onMouseLeave={e => (e.currentTarget.style.color = '#848e9c')}
         >
           <Settings size={12} />
         </span>
