@@ -1,19 +1,16 @@
 // =============================================================================
-// OptimizePage v2.5.0
+// OptimizePage v2.6.0
 // -----------------------------------------------------------------------------
-// v2.5.0 - 2026-02-27
-//   - 移除 lightweight-charts（純 SVG 資產曲線，零依賴）
-//   - 移除 SOURCES / source state / 資料來源選單（固定抓幣安）
-//   - fetch 改用 import.meta.env.VITE_API_URL 完整路徑（修正 Railway production 打到前端問題）
-//   - 「AI 建議參數範圍」按鈕呼叫 POST /suggest（Gemini 分析建議值）
-//   - 貼入 Pine Script 後 debounce 800ms 自動呼叫 /parse
-//   - 完全對齊 ChartPage inline style（#131722 / #1e222d / #2b2b43 / #f0b90b）
+// v2.6.0 - 2026-02-27
+//   - 新增即時日誌窗格（消費 SSE type:'log' 事件，顯示優化進度訊息）
+//   - 新增清除 Pine Script 按鈕（一鍵清空輸入區）
+//   - 後端 Binance 451 修正（api.binance.vision）
 // =============================================================================
 
 import { useState, useRef, useEffect, useCallback } from 'react'
 import {
   Play, Sparkles, Settings2, Copy, Check,
-  TrendingUp, BarChart2, Zap, AlertCircle, RefreshCw, Target
+  TrendingUp, BarChart2, Zap, AlertCircle, RefreshCw, Target, X, Terminal
 } from 'lucide-react'
 import PageHeader from '../components/PageHeader'
 
@@ -194,7 +191,18 @@ export default function OptimizePage() {
   const [copiedCode,     setCopiedCode]     = useState(false)
   const [errorMsg,       setErrorMsg]       = useState('')
 
+  // 即時日誌
+  const [logs, setLogs] = useState<string[]>([])
+  const logEndRef = useRef<HTMLDivElement>(null)
+
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // 日誌自動捲到底
+  useEffect(() => {
+    if (logEndRef.current) {
+      logEndRef.current.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [logs])
 
   // ---------------------------------------------------------------------------
   // Auto-parse on Pine Script change (debounce 800ms)
@@ -256,6 +264,15 @@ export default function OptimizePage() {
     }
   }
 
+  // 清除 Pine Script
+  const clearScript = () => {
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    setPineScript('')
+    setDetectedParams([])
+    setParamRanges([])
+    setParseError('')
+  }
+
   useEffect(() => () => { if (debounceRef.current) clearTimeout(debounceRef.current) }, [])
 
   // ---------------------------------------------------------------------------
@@ -273,7 +290,6 @@ export default function OptimizePage() {
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      // data.ranges: Array of { name, min_val, max_val, step, is_int }
       setParamRanges(prev => prev.map(p => {
         const suggestion = (data.ranges ?? data.suggestions)?.find((r: any) => r.name === p.name)
         if (!suggestion) return p
@@ -309,6 +325,7 @@ export default function OptimizePage() {
 
     setIsRunning(true); setProgress(0); setProgressText('正在初始化...')
     setResults([]); setSelectedResult(null); setErrorMsg('')
+    setLogs(['▶ 開始策略優化...'])
 
     try {
       const res = await fetch(`${API_BASE}/api/optimize/run`, {
@@ -347,9 +364,12 @@ export default function OptimizePage() {
             if (data.type === 'progress') {
               setProgress(data.progress)
               setProgressText(`已完成 ${data.completed} / ${data.total} 次試驗`)
+            } else if (data.type === 'log') {
+              setLogs(prev => [...prev, data.message])
             } else if (data.type === 'result') {
               setResults(data.results); setProgress(100)
               setProgressText(`優化完成！共 ${data.results.length} 個最佳組合`)
+              setLogs(prev => [...prev, `✅ 優化完成，回傳 ${data.results.length} 個最佳組合`])
             } else if (data.type === 'error') {
               throw new Error(data.message)
             }
@@ -358,6 +378,7 @@ export default function OptimizePage() {
       }
     } catch (err: any) {
       setErrorMsg(`優化失敗：${err.message}`)
+      setLogs(prev => [...prev, `❌ 錯誤：${err.message}`])
     } finally {
       setIsRunning(false)
     }
@@ -394,9 +415,9 @@ export default function OptimizePage() {
 
       <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px 16px', display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-        {/* ── Pine Script Input ───────────────────────────────────────── */}
+        {/* ── Pine Script Input ────────────────────────────────────────── */}
         <div style={{ background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 8 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 16px', borderBottom: '1px solid #2b2b43' }}>
+          <div style={{ padding: '12px 16px', borderBottom: '1px solid #2b2b43', display: 'flex', alignItems: 'center', gap: 8 }}>
             <Zap size={15} color="#f0b90b" />
             <span style={{ fontWeight: 700, fontSize: 13 }}>貼入 Pine Script</span>
             {isParsing && (
@@ -408,6 +429,21 @@ export default function OptimizePage() {
               <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 10, background: 'rgba(38,166,154,0.15)', color: '#26a69a', border: '1px solid rgba(38,166,154,0.3)' }}>
                 偵測到 {paramRanges.length} 個可優化參數
               </span>
+            )}
+            {/* 清除按鈕 */}
+            {pineScript && (
+              <button
+                onClick={clearScript}
+                title="清除 Pine Script"
+                style={{
+                  marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 4,
+                  padding: '4px 10px', borderRadius: 4, border: '1px solid rgba(239,83,80,0.35)',
+                  background: 'rgba(239,83,80,0.1)', color: '#ef5350',
+                  fontSize: 11, cursor: 'pointer', fontWeight: 600,
+                }}
+              >
+                <X size={11} /> 清除
+              </button>
             )}
           </div>
           <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -437,7 +473,6 @@ export default function OptimizePage() {
               <Settings2 size={14} color="#f0b90b" />
               <span style={{ fontWeight: 700, fontSize: 13 }}>參數優化設定</span>
               <span style={{ fontSize: 11, color: '#848e9c' }}>勾選要優化的參數並設定範圍</span>
-              {/* AI 建議參數範圍按鈕 */}
               <button
                 onClick={suggestParamRanges}
                 disabled={isSuggesting}
@@ -515,14 +550,12 @@ export default function OptimizePage() {
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12, marginBottom: 12 }}>
-            {/* Symbol */}
             <div>
               <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>交易對（幣安）</div>
               <select value={symbol} onChange={(e) => setSymbol(e.target.value)} style={selectStyle}>
                 {POPULAR_SYMBOLS.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
             </div>
-            {/* Interval */}
             <div>
               <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>時間框架</div>
               <select value={intervalVal} onChange={(e) => setIntervalVal(e.target.value)} style={selectStyle}>
@@ -581,23 +614,59 @@ export default function OptimizePage() {
         {isRunning && (
           <div>
             <div style={{ width: '100%', height: 4, background: '#2b2b43', borderRadius: 2, overflow: 'hidden' }}>
-              <div style={{ height: '100%', width: `${progress}%`, background: '#f0b90b', transition: 'width 0.3s', borderRadius: 2 }} />
+              <div style={{ height: '100%', width: `${progress}%`, background: '#f0b90b', borderRadius: 2, transition: 'width 0.3s ease' }} />
             </div>
-            <div style={{ textAlign: 'center', fontSize: 11, color: '#848e9c', marginTop: 6 }}>{progressText}</div>
+            <div style={{ fontSize: 11, color: '#848e9c', marginTop: 6, textAlign: 'center' }}>{progressText}</div>
+          </div>
+        )}
+
+        {/* ── 即時日誌窗格 ─────────────────────────────────────────────── */}
+        {logs.length > 0 && (
+          <div style={{ background: '#0d1017', border: '1px solid #2b2b43', borderRadius: 8, overflow: 'hidden' }}>
+            <div style={{
+              padding: '8px 14px', borderBottom: '1px solid #2b2b43',
+              display: 'flex', alignItems: 'center', gap: 8,
+            }}>
+              <Terminal size={13} color="#848e9c" />
+              <span style={{ fontSize: 12, color: '#848e9c', fontWeight: 600 }}>優化日誌</span>
+              <button
+                onClick={() => setLogs([])}
+                style={{
+                  marginLeft: 'auto', fontSize: 10, color: '#555', background: 'none',
+                  border: 'none', cursor: 'pointer', padding: '2px 6px',
+                }}
+              >
+                清除
+              </button>
+            </div>
+            <div style={{
+              height: 180, overflowY: 'auto', padding: '10px 14px',
+              fontFamily: 'monospace', fontSize: 11, lineHeight: 1.7,
+              display: 'flex', flexDirection: 'column', gap: 1,
+            }}>
+              {logs.map((log, i) => (
+                <div key={i} style={{
+                  color: log.startsWith('❌') ? '#ef5350'
+                       : log.startsWith('✅') ? '#26a69a'
+                       : log.startsWith('▶')  ? '#f0b90b'
+                       : '#848e9c',
+                }}>
+                  {log}
+                </div>
+              ))}
+              <div ref={logEndRef} />
+            </div>
           </div>
         )}
 
         {/* ── Results Table ────────────────────────────────────────────── */}
         {results.length > 0 && (
           <div style={{ background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 8, overflow: 'hidden' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', borderBottom: '1px solid #2b2b43' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <BarChart2 size={14} color="#f0b90b" />
-                <span style={{ fontWeight: 700, fontSize: 13 }}>前 {results.length} 名最佳參數組合</span>
-              </div>
-              <span style={{ fontSize: 11, color: '#848e9c' }}>點擊列查看詳細</span>
+            <div style={{ padding: '12px 16px', borderBottom: '1px solid #2b2b43', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <BarChart2 size={14} color="#f0b90b" />
+              <span style={{ fontWeight: 700, fontSize: 13 }}>優化結果排行</span>
+              <span style={{ fontSize: 11, color: '#848e9c' }}>點選查看詳細分析</span>
             </div>
-
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
