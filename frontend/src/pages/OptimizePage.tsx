@@ -1,16 +1,76 @@
-import { useState, useEffect } from 'react'
-import { Play, Sparkles, Plus, Trash2, ChevronDown, ChevronUp, Settings2 } from 'lucide-react'
+// =============================================================================
+// 修改歷程記錄
+// -----------------------------------------------------------------------------
+// v2.0.0 - 2026-02-26 - 策略優化頁面（全新重寫）
+//   - 頁面標題改為「策略優化」
+//   - 新增 Pine Script 貼入區塊，支援 AI 自動解析 input 參數
+//   - 動態參數偵測 UI：自動顯示參數列表，可勾選/設定優化範圍
+//   - Gemini AI 轉譯 + Optuna 優化後端串接
+//   - 前 10 名結果列表：顯示總盈虧、MDD、盈虧比、勝率等
+//   - 點擊結果連動：Lightweight Charts 顯示對應回測圖表
+//   - 每月績效柱狀圖
+//   - 一鍵複製優化代碼功能
+// =============================================================================
+
+import { useState, useRef, useEffect, useCallback } from 'react'
+import {
+  Play, Sparkles, ChevronDown, ChevronUp, Settings2,
+  Copy, Check, TrendingUp, TrendingDown, BarChart2,
+  Zap, AlertCircle, RefreshCw, Target
+} from 'lucide-react'
 import PageHeader from '../components/PageHeader'
-import LoadingSpinner from '../components/LoadingSpinner'
-import { useStrategyStore } from '../store/strategyStore'
-import { backtestApi } from '../services/api'
+import { createChart, ColorType, IChartApi, ISeriesApi, CandlestickData, HistogramData } from 'lightweight-charts'
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface DetectedParam {
+  name: string
+  title: string
+  type: 'int' | 'float' | 'bool' | 'string'
+  default: number | boolean | string
+  min_val?: number
+  max_val?: number
+  step?: number
+}
 
 interface ParamRange {
-  id: string
   name: string
+  title: string
+  enabled: boolean
   min_val: number
   max_val: number
   step: number
+  is_int: boolean
+  default_val: number
+}
+
+interface OptimizeResult {
+  rank: number
+  params: Record<string, number>
+  total_trades: number
+  win_rate: number
+  profit_pct: number
+  profit_factor: number
+  max_drawdown: number
+  sharpe_ratio: number
+  final_equity: number
+  gross_profit: number
+  gross_loss: number
+  monthly_pnl: Record<string, number>
+  trades: Trade[]
+  equity_curve: number[]
+}
+
+interface Trade {
+  entry_time: string
+  exit_time: string
+  entry_price: number
+  exit_price: number
+  side: 'long' | 'short'
+  pnl: number
+  pnl_pct: number
 }
 
 const SORT_OPTIONS = [
@@ -18,40 +78,77 @@ const SORT_OPTIONS = [
   { value: 'win_rate', label: '最高勝率' },
   { value: 'profit_factor', label: '最高盈虧比' },
   { value: 'max_drawdown', label: '最低 MDD' },
+  { value: 'sharpe_ratio', label: '最高夏普比率' },
   { value: 'total_trades', label: '最多交易筆數' },
 ]
 
-const INTERVALS = ['1m','5m','15m','30m','1h','4h','1d','1w']
-const SOURCES = ['binance','coingecko','coincap']
-
+const INTERVALS = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w']
+const SOURCES = ['binance', 'coingecko', 'coincap']
 const POPULAR_SYMBOLS = [
-  'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','DOGEUSDT','AVAXUSDT','DOTUSDT','MATICUSDT'
+  'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+  'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT'
 ]
 
-const AI_PRESETS: Record<string, ParamRange[]> = {
-  'EMA Cross': [
-    { id: '1', name: 'fastLength', min_val: 5, max_val: 20, step: 1 },
-    { id: '2', name: 'slowLength', min_val: 15, max_val: 50, step: 5 },
-  ],
-  'RSI': [
-    { id: '1', name: 'rsiLength', min_val: 7, max_val: 21, step: 7 },
-    { id: '2', name: 'overbought', min_val: 65, max_val: 80, step: 5 },
-    { id: '3', name: 'oversold', min_val: 20, max_val: 35, step: 5 },
-  ],
-  'MACD': [
-    { id: '1', name: 'fastLength', min_val: 8, max_val: 16, step: 4 },
-    { id: '2', name: 'slowLength', min_val: 20, max_val: 32, step: 4 },
-    { id: '3', name: 'signalLength', min_val: 7, max_val: 11, step: 2 },
-  ],
-  'Bollinger Bands': [
-    { id: '1', name: 'length', min_val: 10, max_val: 30, step: 5 },
-    { id: '2', name: 'mult', min_val: 1.5, max_val: 3.0, step: 0.5 },
-  ],
+// ---------------------------------------------------------------------------
+// Sub-components
+// ---------------------------------------------------------------------------
+
+function MetricBadge({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {
+  return (
+    <div className={`text-center px-3 py-2 rounded-lg ${highlight ? 'bg-emerald-500/20' : 'bg-white/5'}`}>
+      <div className={`text-xs font-medium ${highlight ? 'text-emerald-400' : 'text-gray-400'}`}>{label}</div>
+      <div className={`text-sm font-bold mt-0.5 ${highlight ? 'text-emerald-300' : 'text-white'}`}>{value}</div>
+    </div>
+  )
 }
 
+function MonthlyBarChart({ data }: { data: Record<string, number> }) {
+  const entries = Object.entries(data).sort(([a], [b]) => a.localeCompare(b))
+  if (!entries.length) return null
+
+  const vals = entries.map(([, v]) => v)
+  const maxAbs = Math.max(...vals.map(Math.abs), 1)
+
+  return (
+    <div className="mt-4">
+      <div className="text-xs text-gray-400 mb-2 font-medium">每月績效</div>
+      <div className="flex items-end gap-1 h-24 overflow-x-auto pb-1">
+        {entries.map(([month, pnl]) => {
+          const pct = (pnl / maxAbs) * 100
+          const isPos = pnl >= 0
+          return (
+            <div key={month} className="flex flex-col items-center min-w-[32px]">
+              <div className="relative w-full flex items-end justify-center" style={{ height: '64px' }}>
+                <div
+                  className={`w-6 rounded-sm transition-all ${isPos ? 'bg-emerald-500' : 'bg-rose-500'}`}
+                  style={{ height: `${Math.max(4, Math.abs(pct) * 0.64)}px` }}
+                  title={`${month}: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`}
+                />
+              </div>
+              <div className="text-gray-500 mt-1" style={{ fontSize: '9px' }}>
+                {month.slice(5)}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Main Component
+// ---------------------------------------------------------------------------
+
 export default function OptimizePage() {
-  const { strategies, fetchStrategies, setOptimizeResults } = useStrategyStore()
-  const [selectedStrategyId, setSelectedStrategyId] = useState('')
+  // Pine Script
+  const [pineScript, setPineScript] = useState('')
+  const [isParsing, setIsParsing] = useState(false)
+  const [detectedParams, setDetectedParams] = useState<DetectedParam[]>([])
+  const [paramRanges, setParamRanges] = useState<ParamRange[]>([])
+  const [parseError, setParseError] = useState('')
+
+  // Market settings
   const [symbol, setSymbol] = useState('BTCUSDT')
   const [interval, setIntervalVal] = useState('1h')
   const [source, setSource] = useState('binance')
@@ -61,273 +158,645 @@ export default function OptimizePage() {
   const [commission, setCommission] = useState(0.001)
   const [quantity, setQuantity] = useState(1)
   const [sortBy, setSortBy] = useState('profit_pct')
-  const [maxCombinations, setMaxCombinations] = useState(200)
-  const [params, setParams] = useState<ParamRange[]>([
-    { id: '1', name: 'fastLength', min_val: 5, max_val: 20, step: 1 },
-    { id: '2', name: 'slowLength', min_val: 15, max_val: 50, step: 5 },
-  ])
+  const [nTrials, setNTrials] = useState(100)
+
+  // Optimization state
   const [isRunning, setIsRunning] = useState(false)
   const [progress, setProgress] = useState(0)
-  const [showAiMenu, setShowAiMenu] = useState(false)
-  const [resultCount, setResultCount] = useState<number | null>(null)
-  const [error, setError] = useState('')
+  const [progressText, setProgressText] = useState('')
+  const [results, setResults] = useState<OptimizeResult[]>([])
+  const [selectedResult, setSelectedResult] = useState<OptimizeResult | null>(null)
+  const [copiedCode, setCopiedCode] = useState(false)
+  const [errorMsg, setErrorMsg] = useState('')
 
-  useEffect(() => { fetchStrategies() }, [])
-  useEffect(() => {
-    if (strategies.length > 0 && !selectedStrategyId) {
-      setSelectedStrategyId(strategies[0].id)
+  // UI state
+  const [showSettings, setShowSettings] = useState(true)
+  const [showScript, setShowScript] = useState(true)
+
+  // Chart refs
+  const equityChartRef = useRef<HTMLDivElement>(null)
+  const equityChartApi = useRef<IChartApi | null>(null)
+  const equitySeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
+
+  // ---------------------------------------------------------------------------
+  // Parse Pine Script inputs
+  // ---------------------------------------------------------------------------
+
+  const parsePineScript = useCallback(async () => {
+    if (!pineScript.trim()) {
+      setParseError('請先貼入 Pine Script 代碼')
+      return
     }
-  }, [strategies])
 
-  const addParam = () => {
-    const id = Date.now().toString()
-    setParams(prev => [...prev, { id, name: 'newParam', min_val: 1, max_val: 10, step: 1 }])
-  }
-
-  const removeParam = (id: string) => setParams(prev => prev.filter(p => p.id !== id))
-
-  const updateParam = (id: string, field: keyof ParamRange, value: string | number) => {
-    setParams(prev => prev.map(p => p.id === id ? { ...p, [field]: field === 'name' ? value : Number(value) } : p))
-  }
-
-  const applyAiPreset = (presetName: string) => {
-    setParams(AI_PRESETS[presetName].map((p, i) => ({ ...p, id: String(i + 1) })))
-    setShowAiMenu(false)
-  }
-
-  const estimateCombinations = () => {
-    return params.reduce((total, p) => {
-      const count = Math.floor((p.max_val - p.min_val) / p.step) + 1
-      return total * count
-    }, 1)
-  }
-
-  const handleRun = async () => {
-    if (!selectedStrategyId) { setError('請選擇策略'); return }
-    if (params.length === 0) { setError('請至少設定一個參數範圍'); return }
-    setError('')
-    setIsRunning(true)
-    setProgress(0)
-    setResultCount(null)
-
-    const ticker = setInterval(() => {
-      setProgress(prev => Math.min(prev + Math.random() * 8, 90))
-    }, 500)
+    setIsParsing(true)
+    setParseError('')
 
     try {
-      const res = await backtestApi.optimize({
-        strategy_id: selectedStrategyId,
-        symbol, interval,
-        start_date: startDate,
-        end_date: endDate,
-        initial_capital: initialCapital,
-        commission,
-        quantity,
-        data_source: source,
-        params: params.map(p => ({ name: p.name, min_val: p.min_val, max_val: p.max_val, step: p.step })),
-        max_combinations: maxCombinations,
-        sort_by: sortBy,
+      const res = await fetch('/api/optimize/parse', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pine_script: pineScript }),
       })
-      setProgress(100)
-      const results = res.data.results || []
-      setOptimizeResults(results)
-      setResultCount(results.length)
-    } catch (e: any) {
-      setError(e.response?.data?.detail || e.message || '優化失敗')
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+
+      setDetectedParams(data.params)
+
+      // Build param ranges from detected params (only int/float)
+      const ranges: ParamRange[] = data.params
+        .filter((p: DetectedParam) => p.type === 'int' || p.type === 'float')
+        .map((p: DetectedParam) => {
+          const defVal = typeof p.default === 'number' ? p.default : 1
+          return {
+            name: p.name,
+            title: p.title,
+            enabled: true,
+            min_val: p.min_val ?? Math.max(1, Math.floor(defVal * 0.5)),
+            max_val: p.max_val ?? Math.ceil(defVal * 2),
+            step: p.step ?? (p.type === 'int' ? 1 : 0.1),
+            is_int: p.type === 'int',
+            default_val: defVal,
+          }
+        })
+
+      setParamRanges(ranges)
+
+      if (data.params.length === 0) {
+        setParseError('未偵測到任何 input 參數，請確認 Pine Script 包含 input.int / input.float 等宣告')
+      }
+    } catch (err: any) {
+      setParseError(`解析失敗：${err.message}`)
     } finally {
-      clearInterval(ticker)
+      setIsParsing(false)
+    }
+  }, [pineScript])
+
+  // ---------------------------------------------------------------------------
+  // Update param range
+  // ---------------------------------------------------------------------------
+
+  const updateRange = (name: string, field: keyof ParamRange, value: any) => {
+    setParamRanges(prev => prev.map(p => p.name === name ? { ...p, [field]: value } : p))
+  }
+
+  // ---------------------------------------------------------------------------
+  // Run optimization
+  // ---------------------------------------------------------------------------
+
+  const runOptimization = async () => {
+    if (!pineScript.trim()) {
+      setErrorMsg('請先貼入 Pine Script 代碼並解析參數')
+      return
+    }
+
+    const enabledRanges = paramRanges.filter(p => p.enabled)
+    if (enabledRanges.length === 0) {
+      setErrorMsg('請至少勾選一個參數進行優化')
+      return
+    }
+
+    setIsRunning(true)
+    setProgress(0)
+    setProgressText('正在初始化...')
+    setResults([])
+    setSelectedResult(null)
+    setErrorMsg('')
+
+    try {
+      const res = await fetch('/api/optimize/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          pine_script: pineScript,
+          symbol, interval, source,
+          start_date: startDate,
+          end_date: endDate,
+          initial_capital: initialCapital,
+          commission,
+          quantity,
+          param_ranges: enabledRanges.map(p => ({
+            name: p.name,
+            min_val: p.min_val,
+            max_val: p.max_val,
+            step: p.step,
+            is_int: p.is_int,
+          })),
+          sort_by: sortBy,
+          n_trials: nTrials,
+          top_n: 10,
+        }),
+      })
+
+      if (!res.ok) {
+        const err = await res.json()
+        throw new Error(err.detail || '優化請求失敗')
+      }
+
+      const reader = res.body?.getReader()
+      if (!reader) throw new Error('無法讀取串流回應')
+
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const payload = line.slice(6).trim()
+          if (!payload) continue
+
+          try {
+            const data = JSON.parse(payload)
+            if (data.type === 'progress') {
+              setProgress(data.progress)
+              setProgressText(`已完成 ${data.completed} / ${data.total} 次試驗`)
+            } else if (data.type === 'result') {
+              setResults(data.results)
+              setProgress(100)
+              setProgressText(`優化完成！共 ${data.results.length} 個最佳組合`)
+            } else if (data.type === 'error') {
+              throw new Error(data.message)
+            }
+          } catch (parseErr) {
+            // ignore malformed SSE lines
+          }
+        }
+      }
+    } catch (err: any) {
+      setErrorMsg(`優化失敗：${err.message}`)
+    } finally {
       setIsRunning(false)
     }
   }
 
-  const estimated = estimateCombinations()
+  // ---------------------------------------------------------------------------
+  // Equity curve chart
+  // ---------------------------------------------------------------------------
+
+  useEffect(() => {
+    if (!equityChartRef.current) return
+
+    if (equityChartApi.current) {
+      equityChartApi.current.remove()
+      equityChartApi.current = null
+    }
+
+    const chart = createChart(equityChartRef.current, {
+      layout: { background: { type: ColorType.Solid, color: 'transparent' }, textColor: '#9ca3af' },
+      grid: { vertLines: { color: 'rgba(255,255,255,0.05)' }, horzLines: { color: 'rgba(255,255,255,0.05)' } },
+      width: equityChartRef.current.clientWidth,
+      height: 220,
+      rightPriceScale: { borderColor: 'rgba(255,255,255,0.1)' },
+      timeScale: { borderColor: 'rgba(255,255,255,0.1)', timeVisible: true },
+    })
+
+    const series = chart.addLineSeries({
+      color: '#8b5cf6',
+      lineWidth: 2,
+      priceFormat: { type: 'price', precision: 2 },
+    })
+
+    equityChartApi.current = chart
+    equitySeriesRef.current = series
+
+    const resizeObserver = new ResizeObserver(() => {
+      if (equityChartRef.current) {
+        chart.applyOptions({ width: equityChartRef.current.clientWidth })
+      }
+    })
+    resizeObserver.observe(equityChartRef.current)
+    return () => { resizeObserver.disconnect(); chart.remove() }
+  }, [])
+
+  useEffect(() => {
+    if (!selectedResult || !equitySeriesRef.current) return
+    const eq = selectedResult.equity_curve
+    if (!eq || eq.length === 0) return
+
+    const chartData = eq.map((val, i) => ({
+      time: Math.floor(Date.now() / 1000) - (eq.length - i) * 3600,
+      value: val,
+    }))
+    equitySeriesRef.current.setData(chartData as any)
+    equityChartApi.current?.timeScale().fitContent()
+  }, [selectedResult])
+
+  // ---------------------------------------------------------------------------
+  // Copy optimized code
+  // ---------------------------------------------------------------------------
+
+  const copyOptimizedCode = useCallback(() => {
+    if (!selectedResult) return
+    let code = pineScript
+    Object.entries(selectedResult.params).forEach(([name, val]) => {
+      // Replace input.int/float default value for this param
+      const pattern = new RegExp(`(${name}\\s*=\\s*input\\.(?:int|float)\\s*\\()[^)]*\\)`, 'g')
+      code = code.replace(pattern, (match) => {
+        return match.replace(/defval\s*=\s*[\d.]+|^(\s*\()[\d.]+/, (m) => {
+          if (m.includes('defval')) return `defval = ${val}`
+          return m.replace(/[\d.]+/, String(val))
+        })
+      })
+    })
+    navigator.clipboard.writeText(code).then(() => {
+      setCopiedCode(true)
+      setTimeout(() => setCopiedCode(false), 2500)
+    })
+  }, [selectedResult, pineScript])
+
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
 
   return (
-    <div className="flex flex-col h-full overflow-hidden">
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 p-4 md:p-8">
       <PageHeader
-        title="參數優化"
-        subtitle="設定參數範圍，自動尋找最佳策略組合"
-        actions={
-          <button
-            onClick={handleRun}
-            disabled={isRunning || !selectedStrategyId}
-            className="flex items-center gap-2 btn-success px-4 py-2 text-sm"
-          >
-            {isRunning ? <LoadingSpinner size={16} /> : <Play size={16} />}
-            {isRunning ? '優化中...' : '開始優化'}
-          </button>
-        }
+        title="策略優化"
+        subtitle="AI 自動解析 Pine Script 參數，Optuna 智能搜尋最佳組合"
+        icon={<Target className="w-8 h-8" />}
       />
 
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {error && (
-          <div className="bg-[#ef5350]/10 border border-[#ef5350]/30 rounded-lg px-4 py-3 text-[#ef5350] text-sm">
-            {error}
-          </div>
-        )}
+      <div className="max-w-7xl mx-auto mt-6 space-y-5">
 
-        {isRunning && (
-          <div className="card">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-[#787b86] text-sm">優化進度</span>
-              <span className="text-white text-sm font-mono">{Math.round(progress)}%</span>
+        {/* ── Pine Script Input ── */}
+        <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 overflow-hidden">
+          <button
+            onClick={() => setShowScript(!showScript)}
+            className="w-full px-6 py-4 flex items-center justify-between hover:bg-white/5 transition-colors"
+          >
+            <div className="flex items-center gap-3">
+              <Zap className="w-5 h-5 text-yellow-400" />
+              <span className="text-white font-medium">貼入 Pine Script</span>
+              {detectedParams.length > 0 && (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400">
+                  已偵測 {detectedParams.filter(p => p.type === 'int' || p.type === 'float').length} 個可優化參數
+                </span>
+              )}
             </div>
-            <div className="h-2 bg-[#2a2e39] rounded-full overflow-hidden">
-              <div className="h-full bg-[#2196f3] rounded-full transition-all duration-300" style={{ width: `${progress}%` }} />
-            </div>
-            <p className="text-[#787b86] text-xs mt-2">正在測試參數組合，請稍候...</p>
-          </div>
-        )}
+            {showScript ? <ChevronUp className="w-5 h-5 text-white" /> : <ChevronDown className="w-5 h-5 text-white" />}
+          </button>
 
-        {resultCount !== null && !isRunning && (
-          <div className="bg-[#26a69a]/10 border border-[#26a69a]/30 rounded-lg px-4 py-3 flex items-center justify-between">
-            <span className="text-[#26a69a] text-sm font-medium">優化完成！找到 {resultCount} 個結果</span>
-            <a href="/results" className="text-[#2196f3] text-sm hover:underline">查看結果 →</a>
-          </div>
-        )}
+          {showScript && (
+            <div className="p-6 border-t border-white/10 space-y-4">
+              <textarea
+                value={pineScript}
+                onChange={(e) => { setPineScript(e.target.value); setDetectedParams([]); setParamRanges([]) }}
+                placeholder={`//@version=5\nstrategy("My Strategy", overlay=true)\nfastLength = input.int(9, title="Fast EMA", minval=2, maxval=50)\nslowLength = input.int(21, title="Slow EMA", minval=5, maxval=100)\n// ... 策略邏輯`}
+                className="w-full h-48 px-4 py-3 bg-black/30 border border-white/10 rounded-xl text-green-300 font-mono text-sm focus:ring-2 focus:ring-purple-500 focus:border-transparent resize-y placeholder-gray-600"
+              />
 
-        <div className="card space-y-4">
-          <h2 className="text-white font-semibold text-sm flex items-center gap-2">
-            <Settings2 size={16} className="text-[#2196f3]" /> 基本設定
-          </h2>
-          <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-            <div>
-              <label className="block text-xs text-[#787b86] mb-1.5">選擇策略</label>
-              <select value={selectedStrategyId} onChange={e => setSelectedStrategyId(e.target.value)} className="select-field w-full">
-                {strategies.length === 0 && <option value="">-- 無策略，請先新增 --</option>}
-                {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs text-[#787b86] mb-1.5">交易對</label>
-              <input list="symbols-list" value={symbol} onChange={e => setSymbol(e.target.value.toUpperCase())} className="input-field" placeholder="BTCUSDT" />
-              <datalist id="symbols-list">{POPULAR_SYMBOLS.map(s => <option key={s} value={s} />)}</datalist>
-            </div>
-            <div>
-              <label className="block text-xs text-[#787b86] mb-1.5">時間週期</label>
-              <select value={interval} onChange={e => setIntervalVal(e.target.value)} className="select-field w-full">
-                {INTERVALS.map(iv => <option key={iv} value={iv}>{iv}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs text-[#787b86] mb-1.5">開始日期</label>
-              <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} className="input-field" />
-            </div>
-            <div>
-              <label className="block text-xs text-[#787b86] mb-1.5">結束日期</label>
-              <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} className="input-field" />
-            </div>
-            <div>
-              <label className="block text-xs text-[#787b86] mb-1.5">數據來源</label>
-              <select value={source} onChange={e => setSource(e.target.value)} className="select-field w-full">
-                {SOURCES.map(s => <option key={s} value={s}>{s.charAt(0).toUpperCase() + s.slice(1)}</option>)}
-              </select>
-            </div>
-          </div>
-        </div>
-
-        <div className="card space-y-4">
-          <h2 className="text-white font-semibold text-sm">交易設定</h2>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            <div>
-              <label className="block text-xs text-[#787b86] mb-1.5">初始資金 (USD)</label>
-              <input type="number" value={initialCapital} onChange={e => setInitialCapital(Number(e.target.value))} className="input-field" min={100} />
-            </div>
-            <div>
-              <label className="block text-xs text-[#787b86] mb-1.5">手續費率</label>
-              <input type="number" value={commission} onChange={e => setCommission(Number(e.target.value))} className="input-field" min={0} max={0.1} step={0.0001} />
-            </div>
-            <div>
-              <label className="block text-xs text-[#787b86] mb-1.5">下單口數</label>
-              <input type="number" value={quantity} onChange={e => setQuantity(Number(e.target.value))} className="input-field" min={0.001} step={0.001} />
-            </div>
-            <div>
-              <label className="block text-xs text-[#787b86] mb-1.5">最大組合數</label>
-              <input type="number" value={maxCombinations} onChange={e => setMaxCombinations(Number(e.target.value))} className="input-field" min={10} max={2000} />
-            </div>
-          </div>
-        </div>
-
-        <div className="card space-y-3">
-          <h2 className="text-white font-semibold text-sm">回測結果排序</h2>
-          <div className="flex flex-wrap gap-2">
-            {SORT_OPTIONS.map(opt => (
-              <button
-                key={opt.value}
-                onClick={() => setSortBy(opt.value)}
-                className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${
-                  sortBy === opt.value
-                    ? 'bg-[#2196f3]/15 border-[#2196f3]/40 text-[#2196f3]'
-                    : 'bg-[#131722] border-[#2a2e39] text-[#787b86] hover:text-white hover:border-[#363a45]'
-                }`}
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="card space-y-3">
-          <div className="flex items-center justify-between">
-            <div>
-              <h2 className="text-white font-semibold text-sm">參數範圍設定</h2>
-              <p className="text-[#787b86] text-xs mt-0.5">
-                預估組合數：<span className={estimated > maxCombinations ? 'text-[#ef5350]' : 'text-[#26a69a]'}>{estimated.toLocaleString()}</span>
-                {estimated > maxCombinations && <span className="text-[#ef5350]"> (將隨機抽樣 {maxCombinations} 組)</span>}
-              </p>
-            </div>
-            <div className="flex gap-2">
-              <div className="relative">
-                <button onClick={() => setShowAiMenu(!showAiMenu)} className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-[#7c3aed]/20 to-[#2196f3]/20 border border-[#7c3aed]/30 rounded-lg text-xs text-[#a78bfa] hover:border-[#7c3aed]/60 transition-colors">
-                  <Sparkles size={13} /> AI 快速設定
-                </button>
-                {showAiMenu && (
-                  <div className="absolute right-0 top-full mt-1 bg-[#1e2328] border border-[#2a2e39] rounded-lg shadow-xl z-50 min-w-[160px]">
-                    <div className="px-3 py-1.5 border-b border-[#2a2e39]"><span className="text-[#787b86] text-xs">選擇策略類型</span></div>
-                    {Object.keys(AI_PRESETS).map(name => (
-                      <button key={name} onClick={() => applyAiPreset(name)} className="w-full text-left px-3 py-2 text-sm text-[#d1d4dc] hover:bg-[#2a2e39] transition-colors">{name}</button>
-                    ))}
-                  </div>
-                )}
-              </div>
-              <button onClick={addParam} className="flex items-center gap-1 px-3 py-1.5 bg-[#2a2e39] hover:bg-[#363a45] rounded-lg text-xs text-[#d1d4dc] transition-colors">
-                <Plus size={13} /> 新增參數
-              </button>
-            </div>
-          </div>
-
-          {params.length === 0 ? (
-            <div className="text-center py-8 text-[#787b86] text-sm">尚未設定參數範圍，點擊「新增參數」或使用「AI 快速設定」</div>
-          ) : (
-            <div className="space-y-2">
-              <div className="grid grid-cols-12 gap-2 px-2 text-xs text-[#787b86] font-medium">
-                <div className="col-span-3">參數名稱</div>
-                <div className="col-span-3">最小值</div>
-                <div className="col-span-3">最大值</div>
-                <div className="col-span-2">步長</div>
-                <div className="col-span-1"></div>
-              </div>
-              {params.map(p => (
-                <div key={p.id} className="grid grid-cols-12 gap-2 items-center bg-[#131722] rounded-lg p-2 border border-[#2a2e39]">
-                  <div className="col-span-3"><input value={p.name} onChange={e => updateParam(p.id, 'name', e.target.value)} className="input-field py-1.5 text-xs font-mono" /></div>
-                  <div className="col-span-3"><input type="number" value={p.min_val} onChange={e => updateParam(p.id, 'min_val', e.target.value)} className="input-field py-1.5 text-xs" /></div>
-                  <div className="col-span-3"><input type="number" value={p.max_val} onChange={e => updateParam(p.id, 'max_val', e.target.value)} className="input-field py-1.5 text-xs" /></div>
-                  <div className="col-span-2"><input type="number" value={p.step} onChange={e => updateParam(p.id, 'step', e.target.value)} className="input-field py-1.5 text-xs" min={0.001} step={0.001} /></div>
-                  <div className="col-span-1 flex justify-center">
-                    <button onClick={() => removeParam(p.id)} className="p-1 rounded hover:bg-[#ef5350]/20 text-[#787b86] hover:text-[#ef5350] transition-colors"><Trash2 size={13} /></button>
-                  </div>
+              {parseError && (
+                <div className="flex items-center gap-2 text-rose-400 text-sm">
+                  <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                  {parseError}
                 </div>
-              ))}
+              )}
+
+              <button
+                onClick={parsePineScript}
+                disabled={isParsing || !pineScript.trim()}
+                className="flex items-center gap-2 px-5 py-2.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-xl font-medium transition-colors"
+              >
+                {isParsing ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                {isParsing ? '解析中...' : 'AI 自動解析參數'}
+              </button>
             </div>
           )}
         </div>
 
-        <div className="flex justify-end pb-4">
-          <button onClick={handleRun} disabled={isRunning || !selectedStrategyId} className="flex items-center gap-2 btn-success px-6 py-2.5 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed">
-            {isRunning ? <LoadingSpinner size={18} /> : <Play size={18} />}
-            {isRunning ? '優化中...' : '開始優化'}
+        {/* ── Detected Params ── */}
+        {paramRanges.length > 0 && (
+          <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 p-6">
+            <h3 className="text-white font-semibold mb-4 flex items-center gap-2">
+              <Settings2 className="w-5 h-5 text-purple-400" />
+              參數優化設定
+              <span className="text-xs text-gray-400 font-normal">（勾選要優化的參數並設定範圍）</span>
+            </h3>
+
+            <div className="space-y-3">
+              {paramRanges.map((p) => (
+                <div key={p.name} className={`p-4 rounded-xl border transition-colors ${p.enabled ? 'bg-purple-500/10 border-purple-500/30' : 'bg-white/5 border-white/10'}`}>
+                  <div className="flex items-center gap-3 mb-3">
+                    <input
+                      type="checkbox"
+                      checked={p.enabled}
+                      onChange={(e) => updateRange(p.name, 'enabled', e.target.checked)}
+                      className="w-4 h-4 rounded accent-purple-500"
+                    />
+                    <div>
+                      <span className="text-white font-medium">{p.title}</span>
+                      <span className="text-gray-500 text-xs ml-2">({p.name})</span>
+                    </div>
+                    <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-white/10 text-gray-300">
+                      預設: {p.default_val}
+                    </span>
+                  </div>
+
+                  {p.enabled && (
+                    <div className="grid grid-cols-3 gap-3 mt-2">
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">最小值</label>
+                        <input
+                          type="number"
+                          value={p.min_val}
+                          step={p.is_int ? 1 : 0.01}
+                          onChange={(e) => updateRange(p.name, 'min_val', parseFloat(e.target.value))}
+                          className="w-full px-3 py-2 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:ring-1 focus:ring-purple-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">最大值</label>
+                        <input
+                          type="number"
+                          value={p.max_val}
+                          step={p.is_int ? 1 : 0.01}
+                          onChange={(e) => updateRange(p.name, 'max_val', parseFloat(e.target.value))}
+                          className="w-full px-3 py-2 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:ring-1 focus:ring-purple-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">步長</label>
+                        <input
+                          type="number"
+                          value={p.step}
+                          step={p.is_int ? 1 : 0.01}
+                          min={p.is_int ? 1 : 0.01}
+                          onChange={(e) => updateRange(p.name, 'step', parseFloat(e.target.value))}
+                          className="w-full px-3 py-2 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:ring-1 focus:ring-purple-500"
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ── Market & Optimize Settings ── */}
+        <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 overflow-hidden">
+          <button
+            onClick={() => setShowSettings(!showSettings)}
+            className="w-full px-6 py-4 flex items-center justify-between hover:bg-white/5 transition-colors"
+          >
+            <div className="flex items-center gap-3">
+              <Settings2 className="w-5 h-5 text-purple-400" />
+              <span className="text-white font-medium">市場與優化設定</span>
+            </div>
+            {showSettings ? <ChevronUp className="w-5 h-5 text-white" /> : <ChevronDown className="w-5 h-5 text-white" />}
           </button>
+
+          {showSettings && (
+            <div className="p-6 border-t border-white/10 space-y-5">
+              {/* Symbol / Interval / Source */}
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">交易對</label>
+                  <select value={symbol} onChange={(e) => setSymbol(e.target.value)}
+                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500">
+                    {POPULAR_SYMBOLS.map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">時間框架</label>
+                  <select value={interval} onChange={(e) => setIntervalVal(e.target.value)}
+                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500">
+                    {INTERVALS.map(i => <option key={i} value={i}>{i}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">資料來源</label>
+                  <select value={source} onChange={(e) => setSource(e.target.value)}
+                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500">
+                    {SOURCES.map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                </div>
+              </div>
+
+              {/* Date range */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">開始日期</label>
+                  <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)}
+                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">結束日期</label>
+                  <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)}
+                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
+                </div>
+              </div>
+
+              {/* Capital / Commission / Quantity */}
+              <div className="grid grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">初始資金</label>
+                  <input type="number" value={initialCapital} min={100} onChange={(e) => setInitialCapital(Number(e.target.value))}
+                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">手續費率</label>
+                  <input type="number" value={commission} step={0.0001} min={0} onChange={(e) => setCommission(Number(e.target.value))}
+                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">倉位數量</label>
+                  <input type="number" value={quantity} min={0.01} step={0.01} onChange={(e) => setQuantity(Number(e.target.value))}
+                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
+                </div>
+              </div>
+
+              {/* Sort / Trials */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">優化目標</label>
+                  <select value={sortBy} onChange={(e) => setSortBy(e.target.value)}
+                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500">
+                    {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">試驗次數 (Trials)</label>
+                  <input type="number" value={nTrials} min={10} max={2000} step={10} onChange={(e) => setNTrials(Number(e.target.value))}
+                    className="w-full px-3 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white focus:ring-2 focus:ring-purple-500" />
+                </div>
+              </div>
+            </div>
+          )}
         </div>
+
+        {/* ── Run Button ── */}
+        {errorMsg && (
+          <div className="flex items-center gap-2 px-4 py-3 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-400 text-sm">
+            <AlertCircle className="w-4 h-4 flex-shrink-0" />
+            {errorMsg}
+          </div>
+        )}
+
+        <button
+          onClick={runOptimization}
+          disabled={isRunning}
+          className="w-full py-4 bg-gradient-to-r from-purple-600 to-violet-600 hover:from-purple-700 hover:to-violet-700 disabled:opacity-50 text-white rounded-2xl font-semibold text-lg flex items-center justify-center gap-3 transition-all shadow-lg shadow-purple-900/30"
+        >
+          {isRunning ? (
+            <>
+              <RefreshCw className="w-5 h-5 animate-spin" />
+              優化中... {progress}%
+            </>
+          ) : (
+            <>
+              <Play className="w-5 h-5" />
+              開始策略優化
+            </>
+          )}
+        </button>
+
+        {/* ── Progress Bar ── */}
+        {isRunning && (
+          <div className="space-y-2">
+            <div className="w-full bg-white/10 rounded-full h-2 overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-purple-500 to-violet-500 transition-all duration-300 rounded-full"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+            <p className="text-center text-sm text-gray-400">{progressText}</p>
+          </div>
+        )}
+
+        {/* ── Results Table ── */}
+        {results.length > 0 && (
+          <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 overflow-hidden">
+            <div className="px-6 py-4 border-b border-white/10 flex items-center justify-between">
+              <h3 className="text-white font-semibold flex items-center gap-2">
+                <BarChart2 className="w-5 h-5 text-purple-400" />
+                前 {results.length} 名最佳參數組合
+              </h3>
+              <span className="text-xs text-gray-400">點擊任一列查看詳細圖表</span>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-white/10">
+                    <th className="px-4 py-3 text-left text-gray-400 font-medium">排名</th>
+                    <th className="px-4 py-3 text-left text-gray-400 font-medium">參數</th>
+                    <th className="px-4 py-3 text-right text-gray-400 font-medium">總盈利%</th>
+                    <th className="px-4 py-3 text-right text-gray-400 font-medium">MDD%</th>
+                    <th className="px-4 py-3 text-right text-gray-400 font-medium">盈虧比</th>
+                    <th className="px-4 py-3 text-right text-gray-400 font-medium">勝率%</th>
+                    <th className="px-4 py-3 text-right text-gray-400 font-medium">交易數</th>
+                    <th className="px-4 py-3 text-right text-gray-400 font-medium">夏普</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {results.map((r) => {
+                    const isSelected = selectedResult?.rank === r.rank
+                    return (
+                      <tr
+                        key={r.rank}
+                        onClick={() => setSelectedResult(r)}
+                        className={`border-b border-white/5 cursor-pointer transition-colors ${
+                          isSelected ? 'bg-purple-500/20' : 'hover:bg-white/5'
+                        }`}
+                      >
+                        <td className="px-4 py-3">
+                          <span className={`inline-flex items-center justify-center w-7 h-7 rounded-full text-xs font-bold ${
+                            r.rank === 1 ? 'bg-yellow-500 text-black' :
+                            r.rank === 2 ? 'bg-gray-400 text-black' :
+                            r.rank === 3 ? 'bg-amber-700 text-white' :
+                            'bg-white/10 text-gray-300'
+                          }`}>{r.rank}</span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex flex-wrap gap-1">
+                            {Object.entries(r.params).filter(([k]) => !k.startsWith('_') && k !== 'quantity').map(([k, v]) => (
+                              <span key={k} className="text-xs px-2 py-0.5 rounded-md bg-white/10 text-gray-300">
+                                {k}: {typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(3)) : v}
+                              </span>
+                            ))}
+                          </div>
+                        </td>
+                        <td className={`px-4 py-3 text-right font-semibold ${r.profit_pct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          {r.profit_pct >= 0 ? '+' : ''}{r.profit_pct.toFixed(2)}%
+                        </td>
+                        <td className="px-4 py-3 text-right text-rose-400">{r.max_drawdown.toFixed(2)}%</td>
+                        <td className="px-4 py-3 text-right text-white">{r.profit_factor.toFixed(2)}</td>
+                        <td className="px-4 py-3 text-right text-white">{r.win_rate.toFixed(1)}%</td>
+                        <td className="px-4 py-3 text-right text-gray-300">{r.total_trades}</td>
+                        <td className="px-4 py-3 text-right text-gray-300">{r.sharpe_ratio.toFixed(2)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* ── Selected Result Detail ── */}
+        {selectedResult && (
+          <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 p-6 space-y-5">
+            <div className="flex items-center justify-between">
+              <h3 className="text-white font-semibold flex items-center gap-2">
+                <TrendingUp className="w-5 h-5 text-purple-400" />
+                第 {selectedResult.rank} 名詳細分析
+              </h3>
+              <button
+                onClick={copyOptimizedCode}
+                className="flex items-center gap-2 px-4 py-2 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/30 rounded-xl text-emerald-400 text-sm font-medium transition-colors"
+              >
+                {copiedCode ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                {copiedCode ? '已複製！' : '一鍵複製優化代碼'}
+              </button>
+            </div>
+
+            {/* Metrics grid */}
+            <div className="grid grid-cols-4 md:grid-cols-8 gap-2">
+              <MetricBadge label="總盈利" value={`${selectedResult.profit_pct >= 0 ? '+' : ''}${selectedResult.profit_pct.toFixed(2)}%`} highlight={selectedResult.profit_pct > 0} />
+              <MetricBadge label="最終資產" value={`$${selectedResult.final_equity.toFixed(0)}`} />
+              <MetricBadge label="MDD" value={`${selectedResult.max_drawdown.toFixed(2)}%`} />
+              <MetricBadge label="盈虧比" value={selectedResult.profit_factor.toFixed(2)} highlight={selectedResult.profit_factor > 1.5} />
+              <MetricBadge label="勝率" value={`${selectedResult.win_rate.toFixed(1)}%`} highlight={selectedResult.win_rate > 50} />
+              <MetricBadge label="交易數" value={String(selectedResult.total_trades)} />
+              <MetricBadge label="夏普" value={selectedResult.sharpe_ratio.toFixed(2)} highlight={selectedResult.sharpe_ratio > 1} />
+              <MetricBadge label="毛利/毛損" value={`${selectedResult.gross_profit.toFixed(0)}/${selectedResult.gross_loss.toFixed(0)}`} />
+            </div>
+
+            {/* Equity curve */}
+            <div>
+              <div className="text-xs text-gray-400 mb-2 font-medium">資產曲線</div>
+              <div ref={equityChartRef} className="w-full rounded-xl overflow-hidden" />
+            </div>
+
+            {/* Monthly PnL */}
+            <MonthlyBarChart data={selectedResult.monthly_pnl} />
+
+            {/* Optimized params */}
+            <div>
+              <div className="text-xs text-gray-400 mb-2 font-medium">最佳參數值</div>
+              <div className="flex flex-wrap gap-2">
+                {Object.entries(selectedResult.params)
+                  .filter(([k]) => !k.startsWith('_') && k !== 'quantity')
+                  .map(([k, v]) => (
+                    <div key={k} className="px-3 py-2 bg-purple-500/20 border border-purple-500/30 rounded-lg">
+                      <span className="text-gray-400 text-xs">{k}: </span>
+                      <span className="text-white font-semibold text-sm">
+                        {typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(4)) : String(v)}
+                      </span>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
