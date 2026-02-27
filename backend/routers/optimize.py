@@ -762,9 +762,7 @@ async def run_optimization(req: OptimizeRequest):
         raise HTTPException(status_code=400, detail="Insufficient data (< 50 bars)")
 
     try:
-        yield "data: " + json.dumps({"type": "status", "message": "正在轉譯 Pine Script..."}) + "\n\n"
         strategy_code = await translate_with_gemini(req.pine_script)
-        yield "data: " + json.dumps({"type": "status", "message": "轉譯完成，開始最佳化..."}) + "\n\n"
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
@@ -776,6 +774,8 @@ async def run_optimization(req: OptimizeRequest):
         raise HTTPException(status_code=422, detail=f"Generated code syntax error: {e}")
 
     async def event_stream():
+        yield "data: " + json.dumps({"type": "status", "message": "正在轉譯 Pine Script..."}) + "\n\n"
+        yield "data: " + json.dumps({"type": "status", "message": "轉譯完成，開始最佳化..."}) + "\n\n"
         try:
             async for chunk in run_optuna_optimization(
                 strategy_code=strategy_code, df=df,
