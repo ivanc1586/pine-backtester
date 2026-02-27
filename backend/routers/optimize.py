@@ -32,7 +32,7 @@ from pydantic import BaseModel
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/optimize", tags=["optimize"])
+router = APIRouter(tags=["optimize"])
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -93,7 +93,7 @@ def parse_pine_inputs(pine_script: str) -> list[dict]:
             pat = re.compile(rf'{key}\s*=\s*([^,\)]+)', re.IGNORECASE)
             found = pat.search(args_str)
             if found:
-                return found.group(1).strip().strip('"\')
+                return found.group(1).strip().strip('"\'')
             return default
 
         positional = re.split(r',(?![^(]*\))', args_str)
@@ -205,7 +205,7 @@ async def translate_with_gemini(pine_script: str) -> str:
 
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-2.0-flash",
             system_instruction=GEMINI_SYSTEM_PROMPT
         )
 
@@ -328,7 +328,7 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
 
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-2.0-flash",
             system_instruction=SUGGEST_SYSTEM_PROMPT
         )
 
@@ -506,10 +506,10 @@ async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) 
                 current_start = last_ts + 1
         if not all_candles:
             raise ValueError("No candles from Binance.US")
-        df = pd.DataFrame(all_candles, columns=[
-            "timestamp","open","high","low","close","volume",
-            "close_time","quote_volume","trades","taker_buy_base",
-            "taker_buy_quote","ignore"
+        df = pd.DataFrame(all_candles, columns=[\
+            "timestamp","open","high","low","close","volume",\
+            "close_time","quote_volume","trades","taker_buy_base",\
+            "taker_buy_quote","ignore"\
         ])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         for col in ["open","high","low","close","volume"]:
