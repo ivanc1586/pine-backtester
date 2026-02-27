@@ -67,6 +67,15 @@ class SuggestRequest(BaseModel):
 # Pine Script input parser
 # ---------------------------------------------------------------------------
 
+# Pre-compiled regex cache for named-argument lookups (keyed by argument name)
+_named_patterns: dict[str, re.Pattern] = {}
+
+def _get_named_pattern(key: str) -> re.Pattern:
+    """Return a cached compiled regex for the given named-argument key."""
+    if key not in _named_patterns:
+        _named_patterns[key] = re.compile(rf'{key}\s*=\s*([^,\)]+)', re.IGNORECASE)
+    return _named_patterns[key]
+
 def parse_pine_inputs(pine_script: str) -> list[dict]:
     """Extract all input declarations from Pine Script."""
     params = []
@@ -86,9 +95,8 @@ def parse_pine_inputs(pine_script: str) -> list[dict]:
             continue
         seen.add(var_name)
 
-        def get_named(key: str, default=None):
-            pat = re.compile(rf'{key}\s*=\s*([^,\)]+)', re.IGNORECASE)
-            found = pat.search(args_str)
+        def get_named(key: str, default=None, _args=args_str):
+            found = _get_named_pattern(key).search(_args)
             if found:
                 return found.group(1).strip().strip('"\'')
             return default
@@ -168,7 +176,7 @@ def _is_quota_error(e: Exception) -> bool:
 
 _gemini_lock = asyncio.Lock()
 _gemini_last_call_time: float = 0.0
-_GEMINI_MIN_INTERVAL = 2.0  # minimum seconds between consecutive Gemini API calls
+_GEMINI_MIN_INTERVAL = 0.5  # minimum seconds between consecutive Gemini API calls
 
 async def _call_gemini_with_retry(model, prompt: str, max_retries: int = 3) -> str:
     """
@@ -660,7 +668,8 @@ async def run_optuna_optimization(
         trial_params.update({"_commission": commission, "_capital": initial_capital, "quantity": quantity})
 
         try:
-            raw = execute_strategy(strategy_code, df.copy(), trial_params)
+            # df is read-only inside execute_strategy — no copy needed
+            raw = execute_strategy(strategy_code, df, trial_params)
             metrics = calc_metrics(raw, initial_capital)
         except Exception as e:
             logger.debug(f"Trial failed: {e}")
@@ -686,7 +695,7 @@ async def run_optuna_optimization(
     loop = asyncio.get_event_loop()
     study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=42))
 
-    chunk_size = 10  # fixed chunk size
+    chunk_size = 50  # larger chunks = fewer run_in_executor round-trips
     remaining = n_trials
 
     yield f"data: {json.dumps({'type': 'log', 'message': f'開始優化：{n_trials} 次試驗，目標 {sort_by}' })}\n\n"
