@@ -259,7 +259,7 @@ async def translate_with_gemini(pine_script: str) -> str:
 
     except Exception as e:
         if _is_quota_error(e):
-            raise RuntimeError(f"Gemini 配額已耗盡，請稍後再試（429 / quota exceeded）: {e}")
+            raise RuntimeError("優化失敗：Gemini 配額已耗盡，請稍後再試")
         logger.warning(f"Gemini translation failed: {e}, using fallback")
         return _get_fallback_strategy()
 
@@ -414,7 +414,7 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
 
     except Exception as e:
         if _is_quota_error(e):
-            raise RuntimeError(f"Gemini 配額已耗盡，請稍後再試（429 / quota exceeded）: {e}")
+            raise RuntimeError("優化失敗：Gemini 配額已耗盡，請稍後再試")
         logger.warning(f"Gemini suggest failed: {e}, using fallback")
         return _fallback_suggest(pine_script)
 
