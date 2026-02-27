@@ -12,10 +12,10 @@
 #   - 新增 POST /optimize/suggest：Gemini 分析 Pine Script，回傳每個參數的建議範圍
 #   - SSE 事件新增 log 類型，前端可即時顯示優化日誌
 #   - 幣安 K 線分頁抓取（已有），確認 fallback 路徑正確
-# v1.2.0 - 2026-02-27 - 修正 prefix 重複 + Gemini 2.0 + Binance.US fallback
-#   - 移除 APIRouter prefix="/optimize"（main.py 已有），避免路由 prefix 404）
-#   - Gemini model 更新為 gemini-2.0-flash
-#   - fetch_candles 改用 Binance.US ➜ Kraken fallback（解決 Railway 部署 451）
+# v1.2.0 - 2026-02-27 - 效能優化 + SSE 穩定性
+#   - df.copy() 移至 objective 外部，整個優化只複製一次 DataFrame
+#   - strategy exec/compile 移至 objective 外部，只 compile 一次
+#   - chunk_size 固定為 10 trials，SSE 推送更頻繁避免 Railway timeout
 # =============================================================================
 
 import re
@@ -510,10 +510,10 @@ async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) 
                 current_start = last_ts + 1
         if not all_candles:
             raise ValueError("No candles from Binance.US")
-        df = pd.DataFrame(all_candles, columns=[
-            "timestamp","open","high","low","close","volume",
-            "close_time","quote_volume","trades","taker_buy_base",
-            "taker_buy_quote","ignore"
+        df = pd.DataFrame(all_candles, columns=[\
+            "timestamp","open","high","low","close","volume",\
+            "close_time","quote_volume","trades","taker_buy_base",\
+            "taker_buy_quote","ignore"\
         ])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         for col in ["open","high","low","close","volume"]:
@@ -564,17 +564,21 @@ async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) 
 # Strategy executor
 # ---------------------------------------------------------------------------
 
-def execute_strategy(strategy_code: str, df: pd.DataFrame, params: dict) -> dict:
-    namespace = {"pd": pd, "np": np, "df": df}
+def execute_strategy(run_fn, df: pd.DataFrame, params: dict) -> dict:
+    """Call the pre-compiled run_strategy function directly."""
+    return run_fn(df, **params)
+
+def compile_strategy(strategy_code: str):
+    """Compile strategy code once and return the run_strategy function."""
+    namespace = {"pd": pd, "np": np}
     try:
         exec(compile(strategy_code, "<strategy>", "exec"), namespace)
     except SyntaxError as e:
         raise ValueError(f"Strategy syntax error: {e}")
-
     run_fn = namespace.get("run_strategy")
     if not run_fn:
         raise ValueError("run_strategy function not found in translated code")
-    return run_fn(df, **params)
+    return run_fn
 
 # ---------------------------------------------------------------------------
 # Optuna optimization (with log SSE events)
@@ -594,6 +598,12 @@ async def run_optuna_optimization(
     minimize_metrics = {"max_drawdown"}
     direction = "minimize" if sort_by in minimize_metrics else "maximize"
 
+    # Compile strategy ONCE outside objective
+    run_fn = compile_strategy(strategy_code)
+
+    # Copy DataFrame ONCE outside objective
+    df_frozen = df.copy()
+
     def objective(trial: optuna.Trial) -> float:
         trial_params = {}
         for pr in param_ranges:
@@ -606,7 +616,7 @@ async def run_optuna_optimization(
         trial_params.update({"_commission": commission, "_capital": initial_capital, "quantity": quantity})
 
         try:
-            raw = execute_strategy(strategy_code, df.copy(), trial_params)
+            raw = execute_strategy(run_fn, df_frozen, trial_params)
             metrics = calc_metrics(raw, initial_capital)
         except Exception as e:
             logger.debug(f"Trial failed: {e}")
@@ -632,7 +642,7 @@ async def run_optuna_optimization(
     loop = asyncio.get_event_loop()
     study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=42))
 
-    chunk_size = max(1, n_trials // 20)
+    chunk_size = 10
     remaining = n_trials
 
     yield f"data: {json.dumps({'type': 'log', 'message': f'開始優化：{n_trials} 次試驗，目標 {sort_by}' })}\n\n"
