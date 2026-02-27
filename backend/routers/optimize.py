@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logger = logging.getLogger(__name__)
-DEFAULT_MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME", "gemini-2.0-flash")
+DEFAULT_MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME", "gemini-2.5-flash-lite")
 
 router = APIRouter(tags=["optimize"])
 
@@ -567,10 +567,10 @@ async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) 
                 current_start = last_ts + 1
         if not all_candles:
             raise ValueError("No candles from Binance.US")
-        df = pd.DataFrame(all_candles, columns=[
-            "timestamp","open","high","low","close","volume",
-            "close_time","quote_volume","trades","taker_buy_base",
-            "taker_buy_quote","ignore"
+        df = pd.DataFrame(all_candles, columns=[\
+            "timestamp","open","high","low","close","volume",\
+            "close_time","quote_volume","trades","taker_buy_base",\
+            "taker_buy_quote","ignore"\
         ])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         for col in ["open","high","low","close","volume"]:
