@@ -13,14 +13,21 @@
 #   - SSE 事件新增 log 類型，前端可即時顯示優化日誌
 #   - 幣安 K 線分頁抓取（已有），確認 fallback 路徑正確
 # v1.2.0 - 2026-02-27 - 修正 prefix 重複 + Gemini 2.0 + Binance.US fallback
-#   - 移除 APIRouter prefix="/optimize"（main.py 已有），避免路由 prefix 404）
+#   - 移除 APIRouter prefix="/optimize"（main.py 已有），避免路由 prefix 404
 #   - Gemini model 更新為 gemini-2.0-flash
-#   - fetch_candles 改用 Binance.US ➜ Kraken fallback（解決 Railway 部署 451）
+#   - fetch_candles 改用 Binance.US -> Kraken fallback（解決 Railway 部署 451）
+# v1.3.1 - 2026-02-27 - Strategy Cache + chunk_size 固定 10 + 429 明確報錯
+#   - _translate_cache / _suggest_cache：md5 hash 為 key，同一份 Pine Script
+#     整個 session 只打 Gemini 一次
+#   - chunk_size 從動態 n_trials // 20 改為固定 10
+#   - _is_quota_error()：偵測 429 / quota / ResourceExhausted，
+#     translate_with_gemini / suggest_param_ranges_with_gemini 遇到配額錯誤時
+#     直接 raise，讓 API endpoint 回傳 HTTP 503，不再靜默 fallback
 # =============================================================================
-# (re-deploy trigger)
 
 import re
 import json
+import hashlib
 import asyncio
 import logging
 import os
@@ -38,6 +45,16 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["optimize"])
+
+# ---------------------------------------------------------------------------
+# In-memory caches  (md5(pine_script) -> result)
+# ---------------------------------------------------------------------------
+
+_translate_cache: dict[str, str] = {}
+_suggest_cache: dict[str, list] = {}
+
+def _script_hash(pine_script: str) -> str:
+    return hashlib.md5(pine_script.encode("utf-8")).hexdigest()
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -162,6 +179,15 @@ def parse_pine_inputs(pine_script: str) -> list[dict]:
     return params
 
 # ---------------------------------------------------------------------------
+# Quota error detection
+# ---------------------------------------------------------------------------
+
+def _is_quota_error(e: Exception) -> bool:
+    """Return True if the exception indicates a Gemini quota / rate-limit error."""
+    msg = str(e).lower()
+    return any(k in msg for k in ("429", "quota", "resourceexhausted", "rate limit", "too many requests"))
+
+# ---------------------------------------------------------------------------
 # Gemini AI translator
 # ---------------------------------------------------------------------------
 
@@ -199,15 +225,19 @@ Technical indicators:
 Output ONLY the Python function, no markdown."""
 
 async def translate_with_gemini(pine_script: str) -> str:
-    """Use Gemini Flash (free tier) to translate Pine Script to Python."""
+    """Use Gemini Flash to translate Pine Script to Python. Cached by md5 hash."""
+    key = _script_hash(pine_script)
+    if key in _translate_cache:
+        logger.info("translate_with_gemini: cache hit")
+        return _translate_cache[key]
+
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        logger.warning("GEMINI_API_KEY not set, using fallback strategy")
+        return _get_fallback_strategy()
+
     try:
         import google.generativeai as genai
-
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-        if not api_key:
-            logger.warning("GEMINI_API_KEY not set, using fallback strategy")
-            return _get_fallback_strategy()
-
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
             model_name="gemini-2.0-flash",
@@ -222,10 +252,14 @@ async def translate_with_gemini(pine_script: str) -> str:
         code = re.sub(r'^```python\s*\n?', '', code, flags=re.MULTILINE)
         code = re.sub(r'^```\s*\n?', '', code, flags=re.MULTILINE)
         code = re.sub(r'\n?```$', '', code.strip())
+        code = code.strip()
 
-        return code.strip()
+        _translate_cache[key] = code
+        return code
 
     except Exception as e:
+        if _is_quota_error(e):
+            raise RuntimeError(f"Gemini 配額已耗盡，請稍後再試（429 / quota exceeded）: {e}")
         logger.warning(f"Gemini translation failed: {e}, using fallback")
         return _get_fallback_strategy()
 
@@ -322,15 +356,19 @@ Rules:
 Return ONLY valid JSON array, no markdown, no explanation outside JSON."""
 
 async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
-    """Use Gemini to suggest intelligent parameter ranges for optimization."""
+    """Use Gemini to suggest intelligent parameter ranges. Cached by md5 hash."""
+    key = _script_hash(pine_script)
+    if key in _suggest_cache:
+        logger.info("suggest_param_ranges_with_gemini: cache hit")
+        return _suggest_cache[key]
+
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        logger.warning("GEMINI_API_KEY not set, falling back to regex parse")
+        return _fallback_suggest(pine_script)
+
     try:
         import google.generativeai as genai
-
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-        if not api_key:
-            logger.warning("GEMINI_API_KEY not set, falling back to regex parse")
-            return _fallback_suggest(pine_script)
-
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
             model_name="gemini-2.0-flash",
@@ -370,9 +408,13 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
                 "step": s.get("step", 1),
                 "reasoning": str(s.get("reasoning", "")),
             })
+
+        _suggest_cache[key] = result
         return result
 
     except Exception as e:
+        if _is_quota_error(e):
+            raise RuntimeError(f"Gemini 配額已耗盡，請稍後再試（429 / quota exceeded）: {e}")
         logger.warning(f"Gemini suggest failed: {e}, using fallback")
         return _fallback_suggest(pine_script)
 
@@ -485,7 +527,6 @@ INTERVAL_TO_MINUTES = {
 async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     """Fetch OHLCV candles using Binance.US first, then Kraken as fallback."""
 
-    # --- Binance.US (no region block) ---
     async def _try_binance_us() -> pd.DataFrame:
         url = "https://api.binance.us/api/v3/klines"
         all_candles = []
@@ -511,17 +552,16 @@ async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) 
                 current_start = last_ts + 1
         if not all_candles:
             raise ValueError("No candles from Binance.US")
-        df = pd.DataFrame(all_candles, columns=[\
-            "timestamp","open","high","low","close","volume",\
-            "close_time","quote_volume","trades","taker_buy_base",\
-            "taker_buy_quote","ignore"\
+        df = pd.DataFrame(all_candles, columns=[
+            "timestamp","open","high","low","close","volume",
+            "close_time","quote_volume","trades","taker_buy_base",
+            "taker_buy_quote","ignore"
         ])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         for col in ["open","high","low","close","volume"]:
             df[col] = df[col].astype(float)
         return df.set_index("timestamp")
 
-    # --- Kraken fallback ---
     async def _try_kraken() -> pd.DataFrame:
         kraken_pair = KRAKEN_PAIR_MAP.get(symbol)
         if not kraken_pair:
@@ -554,7 +594,6 @@ async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) 
             df[col] = df[col].astype(float)
         return df.set_index("timestamp")
 
-    # Try Binance.US first, then Kraken
     try:
         return await _try_binance_us()
     except Exception as e:
@@ -578,7 +617,7 @@ def execute_strategy(strategy_code: str, df: pd.DataFrame, params: dict) -> dict
     return run_fn(df, **params)
 
 # ---------------------------------------------------------------------------
-# Optuna optimization (with log SSE events)
+# Optuna optimization (with SSE log events)
 # ---------------------------------------------------------------------------
 
 async def run_optuna_optimization(
@@ -633,7 +672,7 @@ async def run_optuna_optimization(
     loop = asyncio.get_event_loop()
     study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=42))
 
-    chunk_size = max(1, n_trials // 20)
+    chunk_size = 10  # fixed chunk size
     remaining = n_trials
 
     yield f"data: {json.dumps({'type': 'log', 'message': f'開始優化：{n_trials} 次試驗，目標 {sort_by}' })}\n\n"
@@ -684,7 +723,10 @@ async def suggest_ranges(req: SuggestRequest):
     if not req.pine_script.strip():
         raise HTTPException(status_code=400, detail="pine_script is required")
 
-    suggestions = await suggest_param_ranges_with_gemini(req.pine_script)
+    try:
+        suggestions = await suggest_param_ranges_with_gemini(req.pine_script)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     return {"suggestions": suggestions, "count": len(suggestions)}
 
 @router.post("/run")
@@ -702,6 +744,8 @@ async def run_optimization(req: OptimizeRequest):
 
     try:
         strategy_code = await translate_with_gemini(req.pine_script)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
 
