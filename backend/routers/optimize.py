@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logger = logging.getLogger(__name__)
+DEFAULT_MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME", "gemini-2.0-flash")
 
 router = APIRouter(tags=["optimize"])
 
@@ -167,28 +168,25 @@ def _is_quota_error(e: Exception) -> bool:
 # ---------------------------------------------------------------------------
 
 _gemini_lock = asyncio.Lock()
-_gemini_last_call: list[float] = [0.0]
-_GEMINI_MIN_INTERVAL = 4.0  # minimum seconds between consecutive Gemini API calls
+_gemini_last_call_time: float = 0.0
+_GEMINI_MIN_INTERVAL = 2.0  # minimum seconds between consecutive Gemini API calls
 
-async def _call_gemini_with_retry(model, prompt: str, max_retries: int = 3, _lock: asyncio.Lock = None, _last_call: list = None) -> str:
+async def _call_gemini_with_retry(model, prompt: str, max_retries: int = 3) -> str:
     """
     Call model.generate_content(prompt) with:
-      - Per-endpoint rate limiting (_GEMINI_MIN_INTERVAL seconds between calls)
+      - Inter-call rate limiting (_GEMINI_MIN_INTERVAL seconds between calls)
       - Exponential backoff + jitter on 429 / RESOURCE_EXHAUSTED (up to max_retries)
     Returns response.text on success, raises RuntimeError on persistent rate-limit failure.
     """
-    if _lock is None:
-        _lock = _gemini_lock
-    if _last_call is None:
-        _last_call = _gemini_last_call
+    global _gemini_last_call_time
 
     for attempt in range(max_retries + 1):
-        async with _lock:
+        async with _gemini_lock:
             now = time.monotonic()
-            elapsed = now - _last_call[0]
+            elapsed = now - _gemini_last_call_time
             if elapsed < _GEMINI_MIN_INTERVAL:
                 await asyncio.sleep(_GEMINI_MIN_INTERVAL - elapsed)
-            _last_call[0] = time.monotonic()
+            _gemini_last_call_time = time.monotonic()
 
         try:
             loop = asyncio.get_event_loop()
@@ -259,12 +257,12 @@ async def translate_with_gemini(pine_script: str) -> str:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
+            model_name=DEFAULT_MODEL_NAME,
             system_instruction=GEMINI_SYSTEM_PROMPT
         )
 
         prompt = f"Translate this Pine Script strategy to Python:\n\n```pinescript\n{pine_script}\n```\n\nReturn ONLY the Python function."
-        code = (await _call_gemini_with_retry(model, prompt, _lock=_gemini_lock, _last_call=_gemini_last_call)).strip()
+        code = (await _call_gemini_with_retry(model, prompt)).strip()
 
         # Strip markdown fences
         code = re.sub(r'^```python\s*\n?', '', code, flags=re.MULTILINE)
@@ -389,7 +387,7 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
+            model_name=DEFAULT_MODEL_NAME,
             system_instruction=SUGGEST_SYSTEM_PROMPT
         )
 
@@ -398,7 +396,7 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
             f"```pinescript\n{pine_script}\n```\n\n"
             f"Return ONLY a JSON array."
         )
-        raw = (await _call_gemini_with_retry(model, prompt, _lock=_gemini_lock, _last_call=_gemini_last_call)).strip()
+        raw = (await _call_gemini_with_retry(model, prompt)).strip()
 
         # Strip markdown fences if present
         raw = re.sub(r'^```json\s*\n?', '', raw, flags=re.MULTILINE)
@@ -638,7 +636,7 @@ def execute_strategy(strategy_code: str, df: pd.DataFrame, params: dict) -> dict
 # ---------------------------------------------------------------------------
 
 async def run_optuna_optimization(
-    run_fn, df: pd.DataFrame,
+    strategy_code: str, df: pd.DataFrame,
     param_ranges: list[ParamRange], initial_capital: float,
     commission: float, quantity: float,
     sort_by: str, n_trials: int, top_n: int
@@ -663,7 +661,7 @@ async def run_optuna_optimization(
         trial_params.update({"_commission": commission, "_capital": initial_capital, "quantity": quantity})
 
         try:
-            raw = run_fn(df, **trial_params)
+            raw = execute_strategy(strategy_code, df.copy(), trial_params)
             metrics = calc_metrics(raw, initial_capital)
         except Exception as e:
             logger.debug(f"Trial failed: {e}")
@@ -697,7 +695,7 @@ async def run_optuna_optimization(
 
     while remaining > 0:
         batch = min(chunk_size, remaining)
-        await loop.run_in_executor(None, lambda b=batch: study.optimize(objective, n_trials=b, n_jobs=-1, show_progress_bar=False))
+        await loop.run_in_executor(None, lambda b=batch: study.optimize(objective, n_trials=b, show_progress_bar=False))
         remaining -= batch
         progress = min(99, int((completed[0] / n_trials) * 100))
 
@@ -767,26 +765,14 @@ async def run_optimization(req: OptimizeRequest):
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
 
     try:
-        compiled = compile(strategy_code, "<strategy>", "exec")
+        compile(strategy_code, "<strategy>", "exec")
     except SyntaxError as e:
         raise HTTPException(status_code=422, detail=f"Generated code syntax error: {e}")
 
-    namespace = {"pd": pd, "np": np}
-    try:
-        exec(compiled, namespace)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Strategy execution error: {e}")
-
-    run_fn = namespace.get("run_strategy")
-    if not run_fn:
-        raise HTTPException(status_code=422, detail="run_strategy function not found in translated code")
-
     async def event_stream():
-        yield "data: " + json.dumps({"type": "status", "message": "正在轉譯 Pine Script..."}) + "\n\n"
-        yield "data: " + json.dumps({"type": "status", "message": "轉譯完成，開始最佳化..."}) + "\n\n"
         try:
             async for chunk in run_optuna_optimization(
-                run_fn=run_fn, df=df,
+                strategy_code=strategy_code, df=df,
                 param_ranges=req.param_ranges, initial_capital=req.initial_capital,
                 commission=req.commission, quantity=req.quantity,
                 sort_by=req.sort_by, n_trials=req.n_trials, top_n=req.top_n,
