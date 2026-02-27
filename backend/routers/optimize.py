@@ -1,4 +1,5 @@
 import re
+import gc
 import json
 import hashlib
 import asyncio
@@ -58,6 +59,7 @@ class OptimizeRequest(BaseModel):
     sort_by: str = "profit_pct"
     n_trials: int = 100
     top_n: int = 10
+    bypass_cache: bool = False
 
 class ParseRequest(BaseModel):
     pine_script: str
@@ -217,7 +219,13 @@ Convert the Pine Script strategy to a Python function with these STRICT rules:
 
 1. Function signature: def run_strategy(df: pd.DataFrame, **params) -> dict
 2. df columns: open, high, low, close, volume (float64, datetime index)
-3. Use params dict for all input variables: params.get('fastLength', 9)
+3. MANDATORY PARAMETER RULE — IRON LAW: ALL numeric input variables MUST be read from params.
+   - CORRECT:   fast = int(params.get('fastLength', 9))
+   - CORRECT:   sl_mult = float(params.get('slMult', 1.5))
+   - FORBIDDEN: fast = 9          # hardcoded literal — this is a CRITICAL bug
+   - FORBIDDEN: sl_mult = 1.5     # hardcoded literal — this is a CRITICAL bug
+   If ANY input variable is hardcoded as a literal instead of read via params.get(),
+   the translation is INVALID and will be rejected. Every. Single. Parameter. Must use params.get().
 4. NEVER use future data: ta.highest/lowest MUST use .shift(1) before rolling
 5. SMMA: first value = SMA, then smma = (smma_prev*(length-1) + close) / length
 6. ATR: Wilder smoothing (same formula as SMMA), NOT simple EMA
@@ -245,11 +253,14 @@ Technical indicators:
 
 Output ONLY the Python function, no markdown."""
 
-async def translate_with_gemini(pine_script: str) -> str:
+async def translate_with_gemini(pine_script: str, bypass_cache: bool = False) -> str:
     """Use Gemini Flash to translate Pine Script to Python. Cached by md5 hash."""
     key = _script_hash(pine_script)
+    if bypass_cache and key in _translate_cache:
+        del _translate_cache[key]
+        logger.info(f"Bypass Cache: 強制重新轉譯 (key={key[:8]}...)")
     if key in _translate_cache:
-        logger.info("translate_with_gemini: cache hit")
+        logger.info(f"Cache Hit: translate key={key[:8]}...")
         return _translate_cache[key]
 
     api_key = os.environ.get("GEMINI_API_KEY", "")
@@ -646,14 +657,28 @@ async def run_optuna_optimization(
     sort_by: str, n_trials: int, top_n: int
 ) -> AsyncGenerator[str, None]:
 
-    results_store = []
+    # results_store 只存摘要指標，不存完整 trades/equity_curve (OOM 防護)
+    results_store = []   # list of {params, metrics_summary}
+    # 菁英緩衝區：top_n 完整資料 (trades + equity_curve)
+    elite_store = []     # list of full result_entry, 保持有序、長度 <= top_n
+
     completed = [0]
     best_value = [None]
+    trial_times = []     # 每個 trial 耗時 (秒)
 
     minimize_metrics = {"max_drawdown"}
     direction = "minimize" if sort_by in minimize_metrics else "maximize"
 
+    def _is_better(a, b):
+        if direction == "maximize":
+            return a > b
+        return a < b
+
     def objective(trial: optuna.Trial) -> float:
+        # 1b: 執行緒安全 — 每個 trial 使用獨立 DataFrame 副本
+        local_df = df.copy()
+        t_start = time.monotonic()
+
         trial_params = {}
         for pr in param_ranges:
             if pr.is_int:
@@ -665,41 +690,75 @@ async def run_optuna_optimization(
         trial_params.update({"_commission": commission, "_capital": initial_capital, "quantity": quantity})
 
         try:
-            raw = run_fn(df, **trial_params)
+            raw = run_fn(local_df, **trial_params)
             metrics = calc_metrics(raw, initial_capital)
         except Exception as e:
             logger.debug(f"Trial failed: {e}")
+            # 2b: 釋放資源
+            del local_df
+            gc.collect()
             return float("inf") if direction == "minimize" else float("-inf")
 
-        result_entry = {
+        current_val = metrics.get(sort_by, 0.0)
+
+        # 2a: 摘要資料（不含完整 trades/equity_curve）
+        summary_entry = {
             "params": {k: v for k, v in trial_params.items() if not k.startswith("_")},
-            **metrics,
+            "total_trades": metrics["total_trades"],
+            "win_rate": metrics["win_rate"],
+            "profit_pct": metrics["profit_pct"],
+            "profit_factor": metrics["profit_factor"],
+            "max_drawdown": metrics["max_drawdown"],
+            "sharpe_ratio": metrics["sharpe_ratio"],
+            "final_equity": metrics["final_equity"],
+            "gross_profit": metrics["gross_profit"],
+            "gross_loss": metrics["gross_loss"],
+            "monthly_pnl": metrics["monthly_pnl"],
         }
-        results_store.append(result_entry)
+        results_store.append(summary_entry)
+
+        # 2a: 菁英緩衝區 — 保留 top_n 完整資料
+        full_entry = {**summary_entry, "trades": metrics["trades"], "equity_curve": metrics["equity_curve"]}
+        elite_store.append((current_val, full_entry))
+        elite_store.sort(key=lambda x: x[0], reverse=(direction == "maximize"))
+        if len(elite_store) > top_n:
+            # 移除排名最差的，釋放記憶體
+            removed = elite_store.pop()
+            del removed
+
         completed[0] += 1
 
-        current_val = metrics.get(sort_by, 0.0)
-        if best_value[0] is None:
+        # 記錄耗時
+        t_elapsed = time.monotonic() - t_start
+        trial_times.append(t_elapsed)
+
+        if best_value[0] is None or _is_better(current_val, best_value[0]):
             best_value[0] = current_val
-        elif direction == "maximize" and current_val > best_value[0]:
-            best_value[0] = current_val
-        elif direction == "minimize" and current_val < best_value[0]:
-            best_value[0] = current_val
+
+        # 2b: 釋放 local_df
+        del local_df
+        gc.collect()
 
         return current_val
 
     loop = asyncio.get_event_loop()
-    study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=42))
+    # 3a: 啟用 MedianPruner 剪枝
+    study = optuna.create_study(
+        direction=direction,
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=0)
+    )
 
-    chunk_size = 10  # fixed chunk size
+    chunk_size = 10
     remaining = n_trials
 
-    yield f"data: {json.dumps({'type': 'log', 'message': f'開始優化：{n_trials} 次試驗，目標 {sort_by}' })}\n\n"
+    yield f"data: {json.dumps({'type': 'log', 'message': f'開始優化：{n_trials} 次試驗，目標 {sort_by}'})}\n\n"
     yield f"data: {json.dumps({'type': 'log', 'message': f'載入 K 線資料：{len(df)} 根 K 線'})}\n\n"
 
     while remaining > 0:
         batch = min(chunk_size, remaining)
-        await loop.run_in_executor(None, lambda b=batch: study.optimize(objective, n_trials=b, n_jobs=-1, show_progress_bar=False))
+        # 1b: n_jobs=1 確保執行緒安全（已有 local_df.copy() 雙重保護）
+        await loop.run_in_executor(None, lambda b=batch: study.optimize(objective, n_trials=b, n_jobs=1, show_progress_bar=False))
         remaining -= batch
         progress = min(99, int((completed[0] / n_trials) * 100))
 
@@ -712,10 +771,14 @@ async def run_optuna_optimization(
         yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'completed': completed[0], 'total': n_trials})}\n\n"
         yield f"data: {json.dumps({'type': 'log', 'message': log_msg})}\n\n"
 
-    reverse = sort_by not in minimize_metrics
-    sorted_results = sorted(results_store, key=lambda x: x.get(sort_by, 0), reverse=reverse)
-    top_results = sorted_results[:top_n]
+    # 3b: 平均 Trial 耗時診斷日誌
+    if trial_times:
+        avg_ms = sum(trial_times) / len(trial_times) * 1000
+        logger.info(f"優化完成：共 {completed[0]} 個 Trial，平均耗時 {avg_ms:.1f} ms/trial")
+        yield f"data: {json.dumps({'type': 'log', 'message': f'平均每個 Trial 運算耗時：{avg_ms:.1f} ms'})}\n\n"
 
+    # 從菁英緩衝區取完整資料，補上 rank
+    top_results = [entry for _, entry in elite_store[:top_n]]
     summary_results = []
     for i, r in enumerate(top_results):
         entry = {k: v for k, v in r.items()}
@@ -762,7 +825,7 @@ async def run_optimization(req: OptimizeRequest):
         raise HTTPException(status_code=400, detail="Insufficient data (< 50 bars)")
 
     try:
-        strategy_code = await translate_with_gemini(req.pine_script)
+        strategy_code = await translate_with_gemini(req.pine_script, bypass_cache=req.bypass_cache)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
