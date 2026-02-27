@@ -16,20 +16,12 @@
 #   - 移除 APIRouter prefix="/optimize"（main.py 已有），避免路由 prefix 404）
 #   - Gemini model 更新為 gemini-2.0-flash
 #   - fetch_candles 改用 Binance.US ➜ Kraken fallback（解決 Railway 部署 451）
-# v1.3.0 - 2026-02-27 - 效能優化：df_frozen + exec 外移 + chunk_size 固定
-#   - df.copy() 移到 Optuna 迴圈外，所有 trial 共用 df_frozen，減少記憶體複製
-#   - exec() / compile 移到 objective 外，run_fn 共用，避免每次 trial 重新 compile
-#   - chunk_size 從動態 n_trials // 20 改為固定 10，SSE 每 10 trials 推送一次
-# v1.3.1 - 2026-02-27 - Strategy Cache + joblib Parallel + 429 明確報錯
-#   - _translate_cache / _suggest_cache：md5 hash 為 key，同一份 Pine Script session 內只打 Gemini 一次
-#   - joblib Parallel：_run_single_trial() 獨立函式，Parallel(n_jobs=-1, prefer="threads") 並行跑 chunk trials
-#   - _is_quota_error()：偵測 429/quota/ResourceExhausted，回傳 HTTP 503 中文訊息，不再靜默 fallback
 # =============================================================================
+# (re-deploy trigger)
 
 import re
 import json
 import asyncio
-import hashlib
 import logging
 import os
 from typing import AsyncGenerator
@@ -40,23 +32,12 @@ import pandas as pd
 import numpy as np
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from joblib import Parallel, delayed
 from pydantic import BaseModel
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["optimize"])
-
-# ---------------------------------------------------------------------------
-# Strategy Cache（module-level，整個 session 共用）
-# ---------------------------------------------------------------------------
-
-_translate_cache: dict[str, str] = {}   # md5(pine_script) → python code
-_suggest_cache: dict[str, list] = {}     # md5(pine_script) → suggestions
-
-def _md5(text: str) -> str:
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -117,7 +98,7 @@ def parse_pine_inputs(pine_script: str) -> list[dict]:
             pat = re.compile(rf'{key}\s*=\s*([^,\)]+)', re.IGNORECASE)
             found = pat.search(args_str)
             if found:
-                return found.group(1).strip().strip('"\')
+                return found.group(1).strip().strip('"\'')
             return default
 
         positional = re.split(r',(?![^(]*\))', args_str)
