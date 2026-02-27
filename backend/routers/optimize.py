@@ -1,36 +1,11 @@
-# =============================================================================
-# 修改歷程記錄
-# -----------------------------------------------------------------------------
-# v1.0.0 - 2026-02-26 - 初始版本
-#   - Pine Script input 參數自動解析（input.int / input.float / input.bool）
-#   - Gemini AI 轉譯層：動態將 Pine Script 邏輯轉為 Python 回測函式
-#   - Optuna TPE sampler 優化引擎，SSE 串流進度回報
-#   - 技術指標對齊 TradingView：SMA/EMA/SMMA/ATR/RSI/MACD/BB
-#   - 防止偷看未來：ta.highest/lowest 強制使用 shift(1)
-#   - var 狀態跨 K 線正確處理，position_size 追蹤
-# v1.1.0 - 2026-02-26 - AI 建議參數範圍 + SSE 日誌串流
-#   - 新增 POST /optimize/suggest：Gemini 分析 Pine Script，回傳每個參數的建議範圍
-#   - SSE 事件新增 log 類型，前端可即時顯示優化日誌
-#   - 幣安 K 線分頁抓取（已有），確認 fallback 路徑正確
-# v1.2.0 - 2026-02-27 - 修正 prefix 重複 + Gemini 2.0 + Binance.US fallback
-#   - 移除 APIRouter prefix="/optimize"（main.py 已有），避免路由 prefix 404
-#   - Gemini model 更新為 gemini-2.0-flash
-#   - fetch_candles 改用 Binance.US -> Kraken fallback（解決 Railway 部署 451）
-# v1.3.1 - 2026-02-27 - Strategy Cache + chunk_size 固定 10 + 429 明確報錯
-#   - _translate_cache / _suggest_cache：md5 hash 為 key，同一份 Pine Script
-#     整個 session 只打 Gemini 一次
-#   - chunk_size 從動態 n_trials // 20 改為固定 10
-#   - _is_quota_error()：偵測 429 / quota / ResourceExhausted，
-#     translate_with_gemini / suggest_param_ranges_with_gemini 遇到配額錯誤時
-#     直接 raise，讓 API endpoint 回傳 HTTP 503，不再靜默 fallback
-# =============================================================================
-
 import re
 import json
 import hashlib
 import asyncio
 import logging
 import os
+import time
+import random
 from typing import AsyncGenerator
 
 import httpx
@@ -174,8 +149,6 @@ def parse_pine_inputs(pine_script: str) -> list[dict]:
             except Exception:
                 pass
 
-        params.append(param)
-
     return params
 
 # ---------------------------------------------------------------------------
@@ -186,6 +159,47 @@ def _is_quota_error(e: Exception) -> bool:
     """Return True if the exception indicates a Gemini quota / rate-limit error."""
     msg = str(e).lower()
     return any(k in msg for k in ("429", "quota", "resourceexhausted", "rate limit", "too many requests"))
+
+# ---------------------------------------------------------------------------
+# Gemini rate limiter — prevent concurrent calls within the same second
+# ---------------------------------------------------------------------------
+
+_gemini_lock = asyncio.Lock()
+_gemini_last_call_time: float = 0.0
+_GEMINI_MIN_INTERVAL = 2.0  # minimum seconds between consecutive Gemini API calls
+
+async def _call_gemini_with_retry(model, prompt: str, max_retries: int = 3) -> str:
+    """
+    Call model.generate_content(prompt) with:
+      - Inter-call rate limiting (_GEMINI_MIN_INTERVAL seconds between calls)
+      - Exponential backoff + jitter on 429 / RESOURCE_EXHAUSTED (up to max_retries)
+    Returns response.text on success, raises RuntimeError on persistent rate-limit failure.
+    """
+    global _gemini_last_call_time
+
+    for attempt in range(max_retries + 1):
+        async with _gemini_lock:
+            now = time.monotonic()
+            elapsed = now - _gemini_last_call_time
+            if elapsed < _GEMINI_MIN_INTERVAL:
+                await asyncio.sleep(_GEMINI_MIN_INTERVAL - elapsed)
+            _gemini_last_call_time = time.monotonic()
+
+        try:
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, lambda: model.generate_content(prompt))
+            return response.text
+        except Exception as e:
+            if _is_quota_error(e):
+                if attempt >= max_retries:
+                    raise RuntimeError(
+                        f"優化失敗：Gemini 請求過於頻繁，已重試 {max_retries} 次仍失敗，請稍後再試"
+                    )
+                wait = (2 ** attempt) + random.uniform(0.5, 1.5)
+                logger.warning(f"Gemini 429/rate-limit (attempt {attempt + 1}/{max_retries}), retrying in {wait:.1f}s...")
+                await asyncio.sleep(wait)
+            else:
+                raise
 
 # ---------------------------------------------------------------------------
 # Gemini AI translator
@@ -245,8 +259,7 @@ async def translate_with_gemini(pine_script: str) -> str:
         )
 
         prompt = f"Translate this Pine Script strategy to Python:\n\n```pinescript\n{pine_script}\n```\n\nReturn ONLY the Python function."
-        response = model.generate_content(prompt)
-        code = response.text.strip()
+        code = (await _call_gemini_with_retry(model, prompt)).strip()
 
         # Strip markdown fences
         code = re.sub(r'^```python\s*\n?', '', code, flags=re.MULTILINE)
@@ -380,8 +393,7 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
             f"```pinescript\n{pine_script}\n```\n\n"
             f"Return ONLY a JSON array."
         )
-        response = model.generate_content(prompt)
-        raw = response.text.strip()
+        raw = (await _call_gemini_with_retry(model, prompt)).strip()
 
         # Strip markdown fences if present
         raw = re.sub(r'^```json\s*\n?', '', raw, flags=re.MULTILINE)
@@ -552,10 +564,10 @@ async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) 
                 current_start = last_ts + 1
         if not all_candles:
             raise ValueError("No candles from Binance.US")
-        df = pd.DataFrame(all_candles, columns=[
-            "timestamp","open","high","low","close","volume",
-            "close_time","quote_volume","trades","taker_buy_base",
-            "taker_buy_quote","ignore"
+        df = pd.DataFrame(all_candles, columns=[\
+            "timestamp","open","high","low","close","volume",\
+            "close_time","quote_volume","trades","taker_buy_base",\
+            "taker_buy_quote","ignore"\
         ])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         for col in ["open","high","low","close","volume"]:
