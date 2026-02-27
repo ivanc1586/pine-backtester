@@ -12,10 +12,10 @@
 #   - 新增 POST /optimize/suggest：Gemini 分析 Pine Script，回傳每個參數的建議範圍
 #   - SSE 事件新增 log 類型，前端可即時顯示優化日誌
 #   - 幣安 K 線分頁抓取（已有），確認 fallback 路徑正確
-# v1.2.0 - 2026-02-27 - 移除 prefix 修復 + Gemini 2.0 + Binance.US fallback
-#   - 移除 APIRouter prefix="/optimize"（main.py 已設，避免重複 prefix 404）
+# v1.2.0 - 2026-02-27 - 修復 prefix 缺失 + Gemini 2.0 + Binance.US fallback
+#   - 修復 APIRouter prefix="/optimize"（main.py 已移，避免重複 prefix 404）
 #   - Gemini model 升級為 gemini-2.0-flash
-#   - fetch_candles 改用 Binance.US → Kraken fallback（解決區域封鎖 451）
+#   - fetch_candles 改用 Binance.US ➜ Kraken fallback（解決 Railway 部署 451）
 # =============================================================================
 
 import re
@@ -36,7 +36,7 @@ from pydantic import BaseModel
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["optimize"])
+router = APIRouter(prefix="/optimize", tags=["optimize"])
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -209,7 +209,7 @@ async def translate_with_gemini(pine_script: str) -> str:
 
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-2.0-flash",
             system_instruction=GEMINI_SYSTEM_PROMPT
         )
 
@@ -332,7 +332,7 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
 
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-2.0-flash",
             system_instruction=SUGGEST_SYSTEM_PROMPT
         )
 
