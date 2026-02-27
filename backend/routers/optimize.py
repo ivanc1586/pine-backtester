@@ -12,10 +12,10 @@
 #   - 新增 POST /optimize/suggest：Gemini 分析 Pine Script，回傳每個參數的建議範圍
 #   - SSE 事件新增 log 類型，前端可即時顯示優化日誌
 #   - 幣安 K 線分頁抓取（已有），確認 fallback 路徑正確
-# v1.2.0 - 2026-02-27 - 修正 prefix 重複 + Gemini 2.0 + Binance.US fallback
-#   - 移除 APIRouter prefix="/optimize"（main.py 已有），避免路由 prefix 404）
-#   - Gemini model 更新為 gemini-2.0-flash
-#   - fetch_candles 改用 Binance.US ➜ Kraken fallback（解決 Railway 部署 451）
+# v1.2.0 - 2026-02-27 - 移除 prefix 衝突 + Gemini 2.0 + Binance.US fallback
+#   - 移除 APIRouter prefix="/optimize"（main.py 已有），避免路由變成雙重 /api/optimize/optimize/ → 404）
+#   - Gemini model 版本升級為 gemini-2.0-flash
+#   - fetch_candles 改用 Binance.US ⟶ Kraken fallback（解決 Railway 環境 451）
 # =============================================================================
 
 import re
@@ -97,7 +97,7 @@ def parse_pine_inputs(pine_script: str) -> list[dict]:
             pat = re.compile(rf'{key}\s*=\s*([^,\)]+)', re.IGNORECASE)
             found = pat.search(args_str)
             if found:
-                return found.group(1).strip().strip('"\'')
+                return found.group(1).strip().strip('"\')
             return default
 
         positional = re.split(r',(?![^(]*\))', args_str)
