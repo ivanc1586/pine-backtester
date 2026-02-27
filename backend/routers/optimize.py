@@ -149,6 +149,8 @@ def parse_pine_inputs(pine_script: str) -> list[dict]:
             except Exception:
                 pass
 
+        params.append(param)
+
     return params
 
 # ---------------------------------------------------------------------------
