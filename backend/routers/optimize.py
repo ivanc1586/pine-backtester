@@ -163,35 +163,34 @@ def _is_quota_error(e: Exception) -> bool:
     return any(k in msg for k in ("429", "quota", "resourceexhausted", "rate limit", "too many requests"))
 
 # ---------------------------------------------------------------------------
-# Gemini rate limiter - prevent concurrent calls within the same second
+# Gemini rate limiter — prevent concurrent calls within the same second
 # ---------------------------------------------------------------------------
 
 _gemini_translate_lock = asyncio.Lock()
 _gemini_suggest_lock = asyncio.Lock()
-_gemini_translate_last_call: list = [0.0]
-_gemini_suggest_last_call: list = [0.0]
-_GEMINI_MIN_INTERVAL = 2.0  # minimum seconds between consecutive Gemini API calls
+_gemini_translate_last_call: list[float] = [0.0]
+_gemini_suggest_last_call: list[float] = [0.0]
+_GEMINI_MIN_INTERVAL = 0.5  # minimum seconds between consecutive Gemini API calls (per endpoint)
 
-async def _call_gemini_with_retry(
-    model,
-    prompt: str,
-    lock: asyncio.Lock,
-    last_call_ref: list,   # [float] — mutable container so we can update in-place
-    max_retries: int = 3,
-) -> str:
+async def _call_gemini_with_retry(model, prompt: str, max_retries: int = 3, _lock: asyncio.Lock = None, _last_call: list = None) -> str:
     """
     Call model.generate_content(prompt) with:
-      - Inter-call rate limiting (_GEMINI_MIN_INTERVAL seconds between calls)
+      - Per-endpoint rate limiting (_GEMINI_MIN_INTERVAL seconds between calls)
       - Exponential backoff + jitter on 429 / RESOURCE_EXHAUSTED (up to max_retries)
     Returns response.text on success, raises RuntimeError on persistent rate-limit failure.
     """
+    if _lock is None:
+        _lock = _gemini_translate_lock
+    if _last_call is None:
+        _last_call = _gemini_translate_last_call
+
     for attempt in range(max_retries + 1):
-        async with lock:
+        async with _lock:
             now = time.monotonic()
-            wait = _GEMINI_MIN_INTERVAL - (now - last_call_ref[0])
-            if wait > 0:
-                await asyncio.sleep(wait)
-            last_call_ref[0] = time.monotonic()
+            elapsed = now - _last_call[0]
+            if elapsed < _GEMINI_MIN_INTERVAL:
+                await asyncio.sleep(_GEMINI_MIN_INTERVAL - elapsed)
+            _last_call[0] = time.monotonic()
 
         try:
             loop = asyncio.get_event_loop()
@@ -201,7 +200,7 @@ async def _call_gemini_with_retry(
             if _is_quota_error(e):
                 if attempt >= max_retries:
                     raise RuntimeError(
-                        f"\u512a\u5316\u5931\u6557\uff1aGemini \u8acb\u6c42\u904e\u65bc\u983b\u7e41\uff0c\u5df2\u91cd\u8a66 {max_retries} \u6b21\u4ed3\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u518d\u8a66"
+                        f"優化失敗：Gemini 請求過於頻繁，已重試 {max_retries} 次仍失敗，請稍後再試"
                     )
                 wait = (2 ** attempt) + random.uniform(0.5, 1.5)
                 logger.warning(f"Gemini 429/rate-limit (attempt {attempt + 1}/{max_retries}), retrying in {wait:.1f}s...")
@@ -267,7 +266,7 @@ async def translate_with_gemini(pine_script: str) -> str:
         )
 
         prompt = f"Translate this Pine Script strategy to Python:\n\n```pinescript\n{pine_script}\n```\n\nReturn ONLY the Python function."
-        code = (await _call_gemini_with_retry(model, prompt, _gemini_translate_lock, _gemini_translate_last_call)).strip()
+        code = (await _call_gemini_with_retry(model, prompt, _lock=_gemini_translate_lock, _last_call=_gemini_translate_last_call)).strip()
 
         # Strip markdown fences
         code = re.sub(r'^```python\s*\n?', '', code, flags=re.MULTILINE)
@@ -280,7 +279,7 @@ async def translate_with_gemini(pine_script: str) -> str:
 
     except Exception as e:
         if _is_quota_error(e):
-            raise RuntimeError("\u512a\u5316\u5931\u6557\uff1aGemini \u914d\u984d\u5df2\u8017\u76e1\uff0c\u8acb\u7a0d\u5f8c\u518d\u8a66")
+            raise RuntimeError("優化失敗：Gemini 配額已耗盡，請稍後再試")
         logger.warning(f"Gemini translation failed: {e}, using fallback")
         return _get_fallback_strategy()
 
@@ -401,7 +400,7 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
             f"```pinescript\n{pine_script}\n```\n\n"
             f"Return ONLY a JSON array."
         )
-        raw = (await _call_gemini_with_retry(model, prompt, _gemini_suggest_lock, _gemini_suggest_last_call)).strip()
+        raw = (await _call_gemini_with_retry(model, prompt, _lock=_gemini_suggest_lock, _last_call=_gemini_suggest_last_call)).strip()
 
         # Strip markdown fences if present
         raw = re.sub(r'^```json\s*\n?', '', raw, flags=re.MULTILINE)
@@ -434,7 +433,7 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
 
     except Exception as e:
         if _is_quota_error(e):
-            raise RuntimeError("\u512a\u5316\u5931\u6557\uff1aGemini \u914d\u984d\u5df2\u8017\u76e1\uff0c\u8acb\u7a0d\u5f8c\u518d\u8a66")
+            raise RuntimeError("優化失敗：Gemini 配額已耗盡，請稍後再試")
         logger.warning(f"Gemini suggest failed: {e}, using fallback")
         return _fallback_suggest(pine_script)
 
@@ -695,8 +694,8 @@ async def run_optuna_optimization(
     chunk_size = 10  # fixed chunk size
     remaining = n_trials
 
-    yield f"data: {json.dumps({'type': 'log', 'message': f'n_trials={n_trials}, sort_by={sort_by}'})}\n\n"
-    yield f"data: {json.dumps({'type': 'log', 'message': f'bars={len(df)}'})}\n\n"
+    yield f"data: {json.dumps({'type': 'log', 'message': f'開始優化：{n_trials} 次試驗，目標 {sort_by}' })}\n\n"
+    yield f"data: {json.dumps({'type': 'log', 'message': f'載入 K 線資料：{len(df)} 根 K 線'})}\n\n"
 
     while remaining > 0:
         batch = min(chunk_size, remaining)
@@ -706,9 +705,9 @@ async def run_optuna_optimization(
 
         best_str = ""
         if best_value[0] is not None:
-            best_str = f", best {sort_by}={best_value[0]:.4f}"
+            best_str = f"，目前最佳 {sort_by}={best_value[0]:.4f}"
 
-        log_msg = f"[{progress:3d}%] completed {completed[0]}/{n_trials}{best_str}"
+        log_msg = f"[{progress:3d}%] 已完成 {completed[0]}/{n_trials} 次試驗{best_str}"
 
         yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'completed': completed[0], 'total': n_trials})}\n\n"
         yield f"data: {json.dumps({'type': 'log', 'message': log_msg})}\n\n"
@@ -723,7 +722,7 @@ async def run_optuna_optimization(
         entry["rank"] = i + 1
         summary_results.append(entry)
 
-    yield f"data: {json.dumps({'type': 'log', 'message': f'done: {len(results_store)} combos, top {len(summary_results)}'})}\n\n"
+    yield f"data: {json.dumps({'type': 'log', 'message': f'優化完成！共找到 {len(results_store)} 個有效組合，回傳前 {len(summary_results)} 名'})}\n\n"
     yield f"data: {json.dumps({'type': 'result', 'results': summary_results})}\n\n"
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
@@ -762,15 +761,22 @@ async def run_optimization(req: OptimizeRequest):
     if len(df) < 50:
         raise HTTPException(status_code=400, detail="Insufficient data (< 50 bars)")
 
+    try:
+        yield "data: " + json.dumps({"type": "status", "message": "正在轉譯 Pine Script..."}) + "\n\n"
+        strategy_code = await translate_with_gemini(req.pine_script)
+        yield "data: " + json.dumps({"type": "status", "message": "轉譯完成，開始最佳化..."}) + "\n\n"
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
+
+    try:
+        compile(strategy_code, "<strategy>", "exec")
+    except SyntaxError as e:
+        raise HTTPException(status_code=422, detail=f"Generated code syntax error: {e}")
+
     async def event_stream():
         try:
-            yield "data: " + json.dumps({"type": "status", "message": "正在轉譯 Pine Script..."}) + "\n\n"
-            strategy_code = await translate_with_gemini(req.pine_script)
-            if not strategy_code:
-                yield "data: " + json.dumps({"type": "error", "message": "Pine Script 轉譯失敗"}) + "\n\n"
-                return
-            yield "data: " + json.dumps({"type": "status", "message": "轉譯完成，開始最佳化..."}) + "\n\n"
-
             async for chunk in run_optuna_optimization(
                 strategy_code=strategy_code, df=df,
                 param_ranges=req.param_ranges, initial_capital=req.initial_capital,
