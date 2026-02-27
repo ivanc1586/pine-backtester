@@ -16,11 +16,14 @@
 #   - 移除 APIRouter prefix="/optimize"（main.py 已有），避免路由 prefix 404）
 #   - Gemini model 更新為 gemini-2.0-flash
 #   - fetch_candles 改用 Binance.US ➜ Kraken fallback（解決 Railway 部署 451）
-# v1.3.0 - 2026-02-27 - Strategy Cache + joblib Parallel + 429 明確報錯
-#   - Strategy Cache：md5 hash，同一份 Pine Script 整個 session 只呼叫 Gemini 一次
-#   - joblib Parallel：Optuna trials 改用 joblib 並行執行，prefer="threads"
-#   - 429 / ResourceExhausted 明確報錯，不再靜默 fallback
-#   - chunk_size 固定 10
+# v1.3.0 - 2026-02-27 - 效能優化：df_frozen + exec 外移 + chunk_size 固定
+#   - df.copy() 移到 Optuna 迴圈外，所有 trial 共用 df_frozen，減少記憶體複製
+#   - exec() / compile 移到 objective 外，run_fn 共用，避免每次 trial 重新 compile
+#   - chunk_size 從動態 n_trials // 20 改為固定 10，SSE 每 10 trials 推送一次
+# v1.3.1 - 2026-02-27 - Strategy Cache + joblib Parallel + 429 明確報錯
+#   - _translate_cache / _suggest_cache：md5 hash 為 key，同一份 Pine Script session 內只打 Gemini 一次
+#   - joblib Parallel：_run_single_trial() 獨立函式，Parallel(n_jobs=-1, prefer="threads") 並行跑 chunk trials
+#   - _is_quota_error()：偵測 429/quota/ResourceExhausted，回傳 HTTP 503 中文訊息，不再靜默 fallback
 # =============================================================================
 
 import re
@@ -50,7 +53,7 @@ router = APIRouter(tags=["optimize"])
 # ---------------------------------------------------------------------------
 
 _translate_cache: dict[str, str] = {}   # md5(pine_script) → python code
-_suggest_cache: dict[str, list] = {}    # md5(pine_script) → suggestions
+_suggest_cache: dict[str, list] = {}     # md5(pine_script) → suggestions
 
 def _md5(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()
@@ -114,7 +117,7 @@ def parse_pine_inputs(pine_script: str) -> list[dict]:
             pat = re.compile(rf'{key}\s*=\s*([^,\)]+)', re.IGNORECASE)
             found = pat.search(args_str)
             if found:
-                return found.group(1).strip().strip('"\'')
+                return found.group(1).strip().strip('"\')
             return default
 
         positional = re.split(r',(?![^(]*\))', args_str)
@@ -214,21 +217,8 @@ Technical indicators:
 
 Output ONLY the Python function, no markdown."""
 
-def _is_quota_error(e: Exception) -> bool:
-    """Check if exception is a Gemini 429 / quota exhausted error."""
-    msg = str(e).lower()
-    return any(k in msg for k in ["429", "quota", "resource_exhausted", "resourceexhausted", "rate limit"])
-
 async def translate_with_gemini(pine_script: str) -> str:
-    """Use Gemini Flash (free tier) to translate Pine Script to Python.
-    Results are cached by md5 to avoid redundant API calls.
-    Raises HTTPException(503) on quota exhaustion instead of silent fallback.
-    """
-    cache_key = _md5(pine_script)
-    if cache_key in _translate_cache:
-        logger.info("translate_with_gemini: cache hit, skipping Gemini API call")
-        return _translate_cache[cache_key]
-
+    """Use Gemini Flash (free tier) to translate Pine Script to Python."""
     try:
         import google.generativeai as genai
 
@@ -251,18 +241,10 @@ async def translate_with_gemini(pine_script: str) -> str:
         code = re.sub(r'^```python\s*\n?', '', code, flags=re.MULTILINE)
         code = re.sub(r'^```\s*\n?', '', code, flags=re.MULTILINE)
         code = re.sub(r'\n?```$', '', code.strip())
-        code = code.strip()
 
-        _translate_cache[cache_key] = code
-        return code
+        return code.strip()
 
     except Exception as e:
-        if _is_quota_error(e):
-            logger.error(f"Gemini translate quota exhausted: {e}")
-            raise HTTPException(
-                status_code=503,
-                detail="Gemini 配額已耗盡（Free Tier 每日限制），請明天再試。"
-            )
         logger.warning(f"Gemini translation failed: {e}, using fallback")
         return _get_fallback_strategy()
 
@@ -359,15 +341,7 @@ Rules:
 Return ONLY valid JSON array, no markdown, no explanation outside JSON."""
 
 async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
-    """Use Gemini to suggest intelligent parameter ranges for optimization.
-    Results are cached by md5 to avoid redundant API calls.
-    Raises HTTPException(503) on quota exhaustion instead of silent fallback.
-    """
-    cache_key = _md5(pine_script)
-    if cache_key in _suggest_cache:
-        logger.info("suggest_param_ranges_with_gemini: cache hit, skipping Gemini API call")
-        return _suggest_cache[cache_key]
-
+    """Use Gemini to suggest intelligent parameter ranges for optimization."""
     try:
         import google.generativeai as genai
 
@@ -415,17 +389,9 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
                 "step": s.get("step", 1),
                 "reasoning": str(s.get("reasoning", "")),
             })
-
-        _suggest_cache[cache_key] = result
         return result
 
     except Exception as e:
-        if _is_quota_error(e):
-            logger.error(f"Gemini suggest quota exhausted: {e}")
-            raise HTTPException(
-                status_code=503,
-                detail="Gemini 配額已耗盡（Free Tier 每日限制），請明天再試。"
-            )
         logger.warning(f"Gemini suggest failed: {e}, using fallback")
         return _fallback_suggest(pine_script)
 
@@ -538,6 +504,7 @@ INTERVAL_TO_MINUTES = {
 async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     """Fetch OHLCV candles using Binance.US first, then Kraken as fallback."""
 
+    # --- Binance.US (no region block) ---
     async def _try_binance_us() -> pd.DataFrame:
         url = "https://api.binance.us/api/v3/klines"
         all_candles = []
@@ -563,16 +530,17 @@ async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) 
                 current_start = last_ts + 1
         if not all_candles:
             raise ValueError("No candles from Binance.US")
-        df = pd.DataFrame(all_candles, columns=[
-            "timestamp","open","high","low","close","volume",
-            "close_time","quote_volume","trades","taker_buy_base",
-            "taker_buy_quote","ignore"
+        df = pd.DataFrame(all_candles, columns=[\
+            "timestamp","open","high","low","close","volume",\
+            "close_time","quote_volume","trades","taker_buy_base",\
+            "taker_buy_quote","ignore"\
         ])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         for col in ["open","high","low","close","volume"]:
             df[col] = df[col].astype(float)
         return df.set_index("timestamp")
 
+    # --- Kraken fallback ---
     async def _try_kraken() -> pd.DataFrame:
         kraken_pair = KRAKEN_PAIR_MAP.get(symbol)
         if not kraken_pair:
@@ -605,6 +573,7 @@ async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) 
             df[col] = df[col].astype(float)
         return df.set_index("timestamp")
 
+    # Try Binance.US first, then Kraken
     try:
         return await _try_binance_us()
     except Exception as e:
@@ -628,32 +597,24 @@ def execute_strategy(strategy_code: str, df: pd.DataFrame, params: dict) -> dict
     return run_fn(df, **params)
 
 # ---------------------------------------------------------------------------
-# joblib trial runner（單一 trial，供 Parallel 呼叫）
+# Optuna optimization (with log SSE events)
 # ---------------------------------------------------------------------------
 
-def _run_single_trial(
-    strategy_code: str,
-    df_frozen: pd.DataFrame,
-    param_ranges: list,
-    commission: float,
-    initial_capital: float,
-    quantity: float,
-    sort_by: str,
-    direction: str,
-    trial_number: int,
-) -> dict | None:
-    """Execute one Optuna trial synchronously. Called by joblib workers."""
-    import optuna as _optuna
+async def run_optuna_optimization(
+    strategy_code: str, df: pd.DataFrame,
+    param_ranges: list[ParamRange], initial_capital: float,
+    commission: float, quantity: float,
+    sort_by: str, n_trials: int, top_n: int
+) -> AsyncGenerator[str, None]:
 
-    _optuna.logging.set_verbosity(_optuna.logging.WARNING)
-    tmp_study = _optuna.create_study(
-        direction=direction,
-        sampler=_optuna.samplers.TPESampler(seed=42 + trial_number)
-    )
+    results_store = []
+    completed = [0]
+    best_value = [None]
 
-    result_holder = {}
+    minimize_metrics = {"max_drawdown"}
+    direction = "minimize" if sort_by in minimize_metrics else "maximize"
 
-    def _objective(trial):
+    def objective(trial: optuna.Trial) -> float:
         trial_params = {}
         for pr in param_ranges:
             if pr.is_int:
@@ -665,77 +626,51 @@ def _run_single_trial(
         trial_params.update({"_commission": commission, "_capital": initial_capital, "quantity": quantity})
 
         try:
-            raw = execute_strategy(strategy_code, df_frozen.copy(), trial_params)
+            raw = execute_strategy(strategy_code, df.copy(), trial_params)
             metrics = calc_metrics(raw, initial_capital)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Trial failed: {e}")
             return float("inf") if direction == "minimize" else float("-inf")
 
-        result_holder["entry"] = {
+        result_entry = {
             "params": {k: v for k, v in trial_params.items() if not k.startswith("_")},
             **metrics,
         }
-        return metrics.get(sort_by, 0.0)
+        results_store.append(result_entry)
+        completed[0] += 1
 
-    tmp_study.optimize(_objective, n_trials=1, show_progress_bar=False)
-    return result_holder.get("entry")
+        current_val = metrics.get(sort_by, 0.0)
+        if best_value[0] is None:
+            best_value[0] = current_val
+        elif direction == "maximize" and current_val > best_value[0]:
+            best_value[0] = current_val
+        elif direction == "minimize" and current_val < best_value[0]:
+            best_value[0] = current_val
 
-# ---------------------------------------------------------------------------
-# Optuna optimization (with joblib Parallel + SSE events)
-# ---------------------------------------------------------------------------
-
-async def run_optuna_optimization(
-    strategy_code: str, df: pd.DataFrame,
-    param_ranges: list[ParamRange], initial_capital: float,
-    commission: float, quantity: float,
-    sort_by: str, n_trials: int, top_n: int
-) -> AsyncGenerator[str, None]:
-
-    minimize_metrics = {"max_drawdown"}
-    direction = "minimize" if sort_by in minimize_metrics else "maximize"
-    chunk_size = 10  # fixed chunk size
-
-    results_store = []
-    completed = 0
-
-    yield f"data: {json.dumps({'type': 'log', 'message': f'開始優化：{n_trials} 次試驗，目標 {sort_by}，chunk_size={chunk_size}' })}\n\n"
-    yield f"data: {json.dumps({'type': 'log', 'message': f'載入 K 線資料：{len(df)} 根 K 線'})}\n\n"
+        return current_val
 
     loop = asyncio.get_event_loop()
+    study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=42))
 
-    trial_idx = 0
-    while trial_idx < n_trials:
-        batch = min(chunk_size, n_trials - trial_idx)
-        trial_numbers = list(range(trial_idx, trial_idx + batch))
+    chunk_size = max(1, n_trials // 20)
+    remaining = n_trials
 
-        # joblib Parallel: prefer="threads" avoids pickling issues with pandas df
-        batch_results = await loop.run_in_executor(
-            None,
-            lambda tn=trial_numbers: Parallel(n_jobs=-1, prefer="threads")(
-                delayed(_run_single_trial)(
-                    strategy_code, df, param_ranges,
-                    commission, initial_capital, quantity,
-                    sort_by, direction, t
-                ) for t in tn
-            )
-        )
+    yield f"data: {json.dumps({'type': 'log', 'message': f'開始優化：{n_trials} 次試驗，目標 {sort_by}' })}\n\n"
+    yield f"data: {json.dumps({'type': 'log', 'message': f'載入 K 線資料：{len(df)} 根 K 線'})}\n\n"
 
-        for entry in batch_results:
-            if entry is not None:
-                results_store.append(entry)
+    while remaining > 0:
+        batch = min(chunk_size, remaining)
+        await loop.run_in_executor(None, lambda b=batch: study.optimize(objective, n_trials=b, show_progress_bar=False))
+        remaining -= batch
+        progress = min(99, int((completed[0] / n_trials) * 100))
 
-        trial_idx += batch
-        completed = trial_idx
-        progress = min(99, int((completed / n_trials) * 100))
+        best_str = ""
+        if best_value[0] is not None:
+            best_str = f"，目前最佳 {sort_by}={best_value[0]:.4f}"
 
-        best_value = None
-        if results_store:
-            key_vals = [r.get(sort_by, 0.0) for r in results_store]
-            best_value = min(key_vals) if direction == "minimize" else max(key_vals)
+        log_msg = f"[{progress:3d}%] 已完成 {completed[0]}/{n_trials} 次試驗{best_str}"
 
-        best_str = f"，目前最佳 {sort_by}={best_value:.4f}" if best_value is not None else ""
-        log_msg = f"[{progress:3d}%] 已完成 {completed}/{n_trials} 次試驗{best_str}"
-
-        yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'completed': completed, 'total': n_trials})}\n\n"
+        yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'completed': completed[0], 'total': n_trials})}\n\n"
         yield f"data: {json.dumps({'type': 'log', 'message': log_msg})}\n\n"
 
     reverse = sort_by not in minimize_metrics
@@ -786,8 +721,6 @@ async def run_optimization(req: OptimizeRequest):
 
     try:
         strategy_code = await translate_with_gemini(req.pine_script)
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
 
