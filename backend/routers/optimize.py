@@ -12,10 +12,14 @@
 #   - 新增 POST /optimize/suggest：Gemini 分析 Pine Script，回傳每個參數的建議範圍
 #   - SSE 事件新增 log 類型，前端可即時顯示優化日誌
 #   - 幣安 K 線分頁抓取（已有），確認 fallback 路徑正確
-# v1.2.0 - 2026-02-27 - 效能優化 + SSE 穩定性
-#   - df.copy() 移至 objective 外部，整個優化只複製一次 DataFrame
-#   - strategy exec/compile 移至 objective 外部，只 compile 一次
-#   - chunk_size 固定為 10 trials，SSE 推送更頻繁避免 Railway timeout
+# v1.2.0 - 2026-02-27 - 修正 prefix 重複 + Gemini 2.0 + Binance.US fallback
+#   - 移除 APIRouter prefix="/optimize"（main.py 已有），避免路由 prefix 404）
+#   - Gemini model 更新為 gemini-2.0-flash
+#   - fetch_candles 改用 Binance.US ➜ Kraken fallback（解決 Railway 部署 451）
+# v1.3.0 - 2026-02-27 - Strategy Cache + joblib 並行優化
+#   - 新增 in-memory strategy cache：md5(pine_script) 為 key，相同 script 不重複呼叫 Gemini + exec
+#   - run_optuna_optimization 改用 joblib.Parallel 並行執行每批 trial，利用多核加速
+#   - chunk_size 固定為 10，SSE 每 10 trials 推送一次進度，防止 Railway idle timeout
 # =============================================================================
 
 import re
@@ -23,12 +27,14 @@ import json
 import asyncio
 import logging
 import os
-from typing import AsyncGenerator
+import hashlib
+from typing import AsyncGenerator, Callable
 
 import httpx
 import optuna
 import pandas as pd
 import numpy as np
+from joblib import Parallel, delayed
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -37,6 +43,11 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["optimize"])
+
+# ---------------------------------------------------------------------------
+# In-memory strategy cache: md5(pine_script) -> compiled run_fn
+# ---------------------------------------------------------------------------
+_strategy_cache: dict[str, Callable] = {}
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -227,6 +238,32 @@ async def translate_with_gemini(pine_script: str) -> str:
     except Exception as e:
         logger.warning(f"Gemini translation failed: {e}, using fallback")
         return _get_fallback_strategy()
+
+async def get_cached_run_fn(pine_script: str) -> Callable:
+    """Return compiled run_fn from cache, or translate + compile + cache if miss."""
+    cache_key = hashlib.md5(pine_script.encode()).hexdigest()
+    if cache_key in _strategy_cache:
+        logger.info(f"Strategy cache HIT (key={cache_key[:8]})")
+        return _strategy_cache[cache_key]
+
+    logger.info(f"Strategy cache MISS (key={cache_key[:8]}), calling Gemini...")
+    strategy_code = await translate_with_gemini(pine_script)
+
+    # Validate syntax before caching
+    try:
+        compile(strategy_code, "<strategy>", "exec")
+    except SyntaxError as e:
+        raise ValueError(f"Generated code syntax error: {e}")
+
+    namespace = {"pd": pd, "np": np}
+    exec(compile(strategy_code, "<strategy>", "exec"), namespace)
+    run_fn = namespace.get("run_strategy")
+    if not run_fn:
+        raise ValueError("run_strategy function not found in translated code")
+
+    _strategy_cache[cache_key] = run_fn
+    logger.info(f"Strategy cached (key={cache_key[:8]}), cache size={len(_strategy_cache)}")
+    return run_fn
 
 def _get_fallback_strategy() -> str:
     return '''def run_strategy(df: pd.DataFrame, **params) -> dict:
@@ -564,47 +601,63 @@ async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) 
 # Strategy executor
 # ---------------------------------------------------------------------------
 
-def execute_strategy(run_fn, df: pd.DataFrame, params: dict) -> dict:
-    """Call the pre-compiled run_strategy function directly."""
-    return run_fn(df, **params)
-
-def compile_strategy(strategy_code: str):
-    """Compile strategy code once and return the run_strategy function."""
-    namespace = {"pd": pd, "np": np}
+def execute_strategy(strategy_code: str, df: pd.DataFrame, params: dict) -> dict:
+    namespace = {"pd": pd, "np": np, "df": df}
     try:
         exec(compile(strategy_code, "<strategy>", "exec"), namespace)
     except SyntaxError as e:
         raise ValueError(f"Strategy syntax error: {e}")
+
     run_fn = namespace.get("run_strategy")
     if not run_fn:
         raise ValueError("run_strategy function not found in translated code")
-    return run_fn
+    return run_fn(df, **params)
 
 # ---------------------------------------------------------------------------
 # Optuna optimization (with log SSE events)
 # ---------------------------------------------------------------------------
 
+def _run_single_trial(run_fn: Callable, df_frozen: pd.DataFrame, param_ranges: list,
+                      initial_capital: float, commission: float, quantity: float,
+                      direction: str, sort_by: str, trial_params: dict) -> dict | None:
+    """Execute a single trial synchronously. Used by joblib.Parallel."""
+    try:
+        raw = run_fn(df_frozen, **trial_params)
+        metrics = calc_metrics(raw, initial_capital)
+        return {
+            "params": {k: v for k, v in trial_params.items() if not k.startswith("_")},
+            "value": metrics.get(sort_by, 0.0),
+            **metrics,
+        }
+    except Exception as e:
+        logger.debug(f"Trial failed: {e}")
+        return None
+
 async def run_optuna_optimization(
-    strategy_code: str, df: pd.DataFrame,
+    pine_script: str, df: pd.DataFrame,
     param_ranges: list[ParamRange], initial_capital: float,
     commission: float, quantity: float,
     sort_by: str, n_trials: int, top_n: int
 ) -> AsyncGenerator[str, None]:
 
-    results_store = []
-    completed = [0]
-    best_value = [None]
-
     minimize_metrics = {"max_drawdown"}
     direction = "minimize" if sort_by in minimize_metrics else "maximize"
+    chunk_size = 10
+    results_store = []
+    completed = 0
+    best_value = None
 
-    # Compile strategy ONCE outside objective
-    run_fn = compile_strategy(strategy_code)
-
-    # Copy DataFrame ONCE outside objective
+    # Get cached run_fn (calls Gemini only on cache miss)
+    run_fn = await get_cached_run_fn(pine_script)
     df_frozen = df.copy()
 
-    def objective(trial: optuna.Trial) -> float:
+    yield f"data: {json.dumps({'type': 'log', 'message': f'\u958b\u59cb\u512a\u5316\uff1a{n_trials} \u6b21\u8a66\u9a57\uff0c\u76ee\u6a19 {sort_by}'})}\n\n"
+    yield f"data: {json.dumps({'type': 'log', 'message': f'\u8f09\u5165 K \u7dda\u8cc7\u6599\uff1a{len(df_frozen)} \u6839 K \u7dda'})}\n\n"
+
+    # Build all trial param sets upfront using Optuna TPE sampler
+    study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=42))
+
+    def _suggest_params(trial: optuna.Trial) -> dict:
         trial_params = {}
         for pr in param_ranges:
             if pr.is_int:
@@ -612,55 +665,57 @@ async def run_optuna_optimization(
             else:
                 val = trial.suggest_float(pr.name, pr.min_val, pr.max_val, step=pr.step if pr.step > 0 else None)
             trial_params[pr.name] = val
-
         trial_params.update({"_commission": commission, "_capital": initial_capital, "quantity": quantity})
-
-        try:
-            raw = execute_strategy(run_fn, df_frozen, trial_params)
-            metrics = calc_metrics(raw, initial_capital)
-        except Exception as e:
-            logger.debug(f"Trial failed: {e}")
-            return float("inf") if direction == "minimize" else float("-inf")
-
-        result_entry = {
-            "params": {k: v for k, v in trial_params.items() if not k.startswith("_")},
-            **metrics,
-        }
-        results_store.append(result_entry)
-        completed[0] += 1
-
-        current_val = metrics.get(sort_by, 0.0)
-        if best_value[0] is None:
-            best_value[0] = current_val
-        elif direction == "maximize" and current_val > best_value[0]:
-            best_value[0] = current_val
-        elif direction == "minimize" and current_val < best_value[0]:
-            best_value[0] = current_val
-
-        return current_val
+        return trial_params
 
     loop = asyncio.get_event_loop()
-    study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=42))
-
-    chunk_size = 10
     remaining = n_trials
-
-    yield f"data: {json.dumps({'type': 'log', 'message': f'開始優化：{n_trials} 次試驗，目標 {sort_by}' })}\n\n"
-    yield f"data: {json.dumps({'type': 'log', 'message': f'載入 K 線資料：{len(df)} 根 K 線'})}\n\n"
 
     while remaining > 0:
         batch = min(chunk_size, remaining)
-        await loop.run_in_executor(None, lambda b=batch: study.optimize(objective, n_trials=b, show_progress_bar=False))
+
+        # Generate param sets for this batch (sequential, TPE needs prior results)
+        batch_params = []
+        for _ in range(batch):
+            trial = study.ask()
+            params = _suggest_params(trial)
+            batch_params.append((trial, params))
+
+        # Run batch in parallel using joblib
+        batch_results = await loop.run_in_executor(
+            None,
+            lambda bp=batch_params: Parallel(n_jobs=-1, prefer="threads")(
+                delayed(_run_single_trial)(
+                    run_fn, df_frozen, param_ranges,
+                    initial_capital, commission, quantity,
+                    direction, sort_by, p
+                ) for _, p in bp
+            )
+        )
+
+        # Report results back to Optuna study + collect valid results
+        for (trial, params), result in zip(batch_params, batch_results):
+            if result is not None:
+                val = result["value"]
+                study.tell(trial, val)
+                results_store.append(result)
+                if best_value is None:
+                    best_value = val
+                elif direction == "maximize" and val > best_value:
+                    best_value = val
+                elif direction == "minimize" and val < best_value:
+                    best_value = val
+            else:
+                study.tell(trial, float("inf") if direction == "minimize" else float("-inf"))
+
+        completed += batch
         remaining -= batch
-        progress = min(99, int((completed[0] / n_trials) * 100))
+        progress = min(99, int(completed / n_trials * 100))
 
-        best_str = ""
-        if best_value[0] is not None:
-            best_str = f"，目前最佳 {sort_by}={best_value[0]:.4f}"
+        best_str = f"\uff0c\u76ee\u524d\u6700\u4f73 {sort_by}={best_value:.4f}" if best_value is not None else ""
+        log_msg = f"[{progress:3d}%] \u5df2\u5b8c\u6210 {completed}/{n_trials} \u6b21\u8a66\u9a57{best_str}"
 
-        log_msg = f"[{progress:3d}%] 已完成 {completed[0]}/{n_trials} 次試驗{best_str}"
-
-        yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'completed': completed[0], 'total': n_trials})}\n\n"
+        yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'completed': completed, 'total': n_trials})}\n\n"
         yield f"data: {json.dumps({'type': 'log', 'message': log_msg})}\n\n"
 
     reverse = sort_by not in minimize_metrics
@@ -670,10 +725,11 @@ async def run_optuna_optimization(
     summary_results = []
     for i, r in enumerate(top_results):
         entry = {k: v for k, v in r.items()}
+        entry.pop("value", None)
         entry["rank"] = i + 1
         summary_results.append(entry)
 
-    yield f"data: {json.dumps({'type': 'log', 'message': f'優化完成！共找到 {len(results_store)} 個有效組合，回傳前 {len(summary_results)} 名'})}\n\n"
+    yield f"data: {json.dumps({'type': 'log', 'message': f'\u512a\u5316\u5b8c\u6210\uff01\u5171\u627e\u5230 {len(results_store)} \u500b\u6709\u6548\u7d44\u5408\uff0c\u56de\u50b3\u524d {len(summary_results)} \u540d'})}\n\n"
     yield f"data: {json.dumps({'type': 'result', 'results': summary_results})}\n\n"
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
@@ -709,20 +765,10 @@ async def run_optimization(req: OptimizeRequest):
     if len(df) < 50:
         raise HTTPException(status_code=400, detail="Insufficient data (< 50 bars)")
 
-    try:
-        strategy_code = await translate_with_gemini(req.pine_script)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
-
-    try:
-        compile(strategy_code, "<strategy>", "exec")
-    except SyntaxError as e:
-        raise HTTPException(status_code=422, detail=f"Generated code syntax error: {e}")
-
     async def event_stream():
         try:
             async for chunk in run_optuna_optimization(
-                strategy_code=strategy_code, df=df,
+                pine_script=req.pine_script, df=df,
                 param_ranges=req.param_ranges, initial_capital=req.initial_capital,
                 commission=req.commission, quantity=req.quantity,
                 sort_by=req.sort_by, n_trials=req.n_trials, top_n=req.top_n,
