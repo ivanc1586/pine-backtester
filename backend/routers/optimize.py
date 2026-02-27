@@ -12,9 +12,9 @@
 #   - 新增 POST /optimize/suggest：Gemini 分析 Pine Script，回傳每個參數的建議範圍
 #   - SSE 事件新增 log 類型，前端可即時顯示優化日誌
 #   - 幣安 K 線分頁抓取（已有），確認 fallback 路徑正確
-# v1.2.0 - 2026-02-27 - 修復 prefix 缺失 + Gemini 2.0 + Binance.US fallback
-#   - 修復 APIRouter prefix="/optimize"（main.py 已移，避免重複 prefix 404）
-#   - Gemini model 升級為 gemini-2.0-flash
+# v1.2.0 - 2026-02-27 - 修正 prefix 重複 + Gemini 2.0 + Binance.US fallback
+#   - 移除 APIRouter prefix="/optimize"（main.py 已有），避免路由 prefix 404）
+#   - Gemini model 更新為 gemini-2.0-flash
 #   - fetch_candles 改用 Binance.US ➜ Kraken fallback（解決 Railway 部署 451）
 # =============================================================================
 
@@ -36,7 +36,7 @@ from pydantic import BaseModel
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/optimize", tags=["optimize"])
+router = APIRouter(tags=["optimize"])
 
 # ---------------------------------------------------------------------------
 # Pydantic models
