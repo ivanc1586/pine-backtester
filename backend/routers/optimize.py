@@ -12,6 +12,10 @@
 #   - 新增 POST /optimize/suggest：Gemini 分析 Pine Script，回傳每個參數的建議範圍
 #   - SSE 事件新增 log 類型，前端可即時顯示優化日誌
 #   - 幣安 K 線分頁抓取（已有），確認 fallback 路徑正確
+# v1.2.0 - 2026-02-27 - 修正 prefix 重複 + Gemini 2.0 + Binance.US fallback
+#   - 移除 APIRouter prefix="/optimize"（main.py 已加，避免雙重 prefix 404）
+#   - Gemini model 升級至 gemini-2.0-flash
+#   - fetch_candles 改用 Binance.US → Kraken fallback（避免台灣 451）
 # =============================================================================
 
 import re
@@ -480,7 +484,6 @@ INTERVAL_TO_MINUTES = {
 async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     """Fetch OHLCV candles using Binance.US first, then Kraken as fallback."""
 
-    # --- Binance.US (no region block) ---
     async def _try_binance_us() -> pd.DataFrame:
         url = "https://api.binance.us/api/v3/klines"
         all_candles = []
@@ -506,17 +509,16 @@ async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) 
                 current_start = last_ts + 1
         if not all_candles:
             raise ValueError("No candles from Binance.US")
-        df = pd.DataFrame(all_candles, columns=[\
-            "timestamp","open","high","low","close","volume",\
-            "close_time","quote_volume","trades","taker_buy_base",\
-            "taker_buy_quote","ignore"\
+        df = pd.DataFrame(all_candles, columns=[
+            "timestamp","open","high","low","close","volume",
+            "close_time","quote_volume","trades","taker_buy_base",
+            "taker_buy_quote","ignore"
         ])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         for col in ["open","high","low","close","volume"]:
             df[col] = df[col].astype(float)
         return df.set_index("timestamp")
 
-    # --- Kraken fallback ---
     async def _try_kraken() -> pd.DataFrame:
         kraken_pair = KRAKEN_PAIR_MAP.get(symbol)
         if not kraken_pair:
@@ -549,7 +551,6 @@ async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) 
             df[col] = df[col].astype(float)
         return df.set_index("timestamp")
 
-    # Try Binance.US first, then Kraken
     try:
         return await _try_binance_us()
     except Exception as e:
@@ -667,13 +668,13 @@ async def run_optuna_optimization(
 # API Endpoints
 # ---------------------------------------------------------------------------
 
-@router.post("/parse")
+@router.post("/optimize/parse")
 async def parse_inputs(req: ParseRequest):
     """Auto-detect all input parameters from Pine Script."""
     params = parse_pine_inputs(req.pine_script)
     return {"params": params, "count": len(params)}
 
-@router.post("/suggest")
+@router.post("/optimize/suggest")
 async def suggest_ranges(req: SuggestRequest):
     """Use Gemini AI to suggest intelligent optimization ranges for each parameter."""
     if not req.pine_script.strip():
@@ -682,7 +683,7 @@ async def suggest_ranges(req: SuggestRequest):
     suggestions = await suggest_param_ranges_with_gemini(req.pine_script)
     return {"suggestions": suggestions, "count": len(suggestions)}
 
-@router.post("/run")
+@router.post("/optimize/run")
 async def run_optimization(req: OptimizeRequest):
     """Run Optuna optimization with SSE progress streaming."""
     try:
