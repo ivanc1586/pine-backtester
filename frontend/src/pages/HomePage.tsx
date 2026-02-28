@@ -1,12 +1,15 @@
 // HomePage.tsx
-// v1.0.0 - 2026-02-28
-// 首頁：市場概覽（主流幣走勢+價格漲跌）、策略概覽、近期優化策略
+// v1.1.0 - 2026-02-28
+// 首頁：市場概覽（24h走勢 + 點擊跳全頁KLineChart）+ 策略概覽 + 近期優化報告
 
 import React, { useEffect, useState, useRef, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { useStrategyStore, Strategy } from '../store/strategyStore'
+import { Edit2, Trash2, Plus } from 'lucide-react'
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Types
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 interface Candle { t: number; o: number; h: number; l: number; c: number; v: number }
 interface MarketTicker {
   symbol: string
@@ -40,22 +43,20 @@ interface SavedReport {
   equity_curve?: number[]
 }
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Constants
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 const MARKET_SYMBOLS = [
-  { symbol: 'BTCUSDT', label: 'BTC' },
-  { symbol: 'ETHUSDT', label: 'ETH' },
-  { symbol: 'SOLUSDT', label: 'SOL' },
-  { symbol: 'BNBUSDT', label: 'BNB' },
-  { symbol: 'XRPUSDT', label: 'XRP' },
-  { symbol: 'DOGEUSDT', label: 'DOGE' },
+  { symbol: 'BTCUSDT', label: 'BTC / USD' },
+  { symbol: 'ETHUSDT', label: 'ETH / USD' },
+  { symbol: 'SOLUSDT', label: 'SOL / USD' },
+  { symbol: 'BNBUSDT', label: 'BNB / USD' },
 ]
 const API_BASE = ((import.meta as any).env?.VITE_API_URL ?? '') + '/api/optimize'
 
-// ---------------------------------------------------------------------------
-// Mini spark line chart
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Mini spark line chart (24h)
+// ----------------------------------------------------------------------------
 function SparkLine({ candles, color }: { candles: Candle[]; color: string }) {
   if (!candles || candles.length < 2) return <div className="h-12 w-full bg-gray-800 rounded animate-pulse" />
   const closes = candles.map(c => c.c)
@@ -65,398 +66,257 @@ function SparkLine({ candles, color }: { candles: Candle[]; color: string }) {
   const W = 160, H = 48
   const pts = closes.map((v, i) => `${(i / (closes.length - 1)) * W},${H - ((v - min) / range) * H}`).join(' ')
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-12 cursor-pointer">
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-12">
       <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" />
     </svg>
   )
 }
 
-// ---------------------------------------------------------------------------
-// K線圖元件（點進去顯示）
-// ---------------------------------------------------------------------------
-function CandlestickChart({ candles, symbol, onClose }: { candles: Candle[]; symbol: string; onClose: () => void }) {
-  if (!candles || candles.length === 0) return null
-  const W = 900, H = 360, PL = 60, PR = 20, PT = 20, PB = 40
-  const chartW = W - PL - PR
-  const chartH = H - PT - PB
-  const visibleCandles = candles.slice(-120)
-  const highs = visibleCandles.map(c => c.h)
-  const lows = visibleCandles.map(c => c.l)
-  const minP = Math.min(...lows)
-  const maxP = Math.max(...highs)
-  const range = maxP - minP || 1
-  const candleW = Math.max(3, Math.floor(chartW / visibleCandles.length) - 1)
-  const toX = (i: number) => PL + (i + 0.5) * (chartW / visibleCandles.length)
-  const toY = (v: number) => PT + (1 - (v - minP) / range) * chartH
-
-  // Y axis ticks
-  const yTicks = Array.from({ length: 6 }, (_, i) => {
-    const v = minP + (range * i) / 5
-    return { v, y: toY(v) }
-  })
-  // X axis ticks
-  const xStep = Math.max(1, Math.floor(visibleCandles.length / 8))
-  const xTicks = visibleCandles
-    .map((c, i) => ({ i, label: new Date(c.t).toLocaleDateString('zh-TW', { month: 'numeric', day: 'numeric' }) }))
-    .filter((_, i) => i % xStep === 0)
-
-  return (
-    <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={onClose}>
-      <div className="bg-gray-900 rounded-xl p-4 w-full max-w-5xl" onClick={e => e.stopPropagation()}>
-        <div className="flex justify-between items-center mb-3">
-          <h3 className="text-white font-bold text-lg">{symbol} K 線圖</h3>
-          <button onClick={onClose} className="text-gray-400 hover:text-white text-xl">✕</button>
-        </div>
-        <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ height: 360 }}>
-          {/* Grid */}
-          {yTicks.map(({ v, y }, i) => (
-            <g key={i}>
-              <line x1={PL} y1={y} x2={W - PR} y2={y} stroke="#1e1e2e" strokeWidth="1" />
-              <text x={PL - 4} y={y + 4} textAnchor="end" fontSize="10" fill="#666">
-                {v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(2)}
-              </text>
-            </g>
-          ))}
-          {/* Candles */}
-          {visibleCandles.map((c, i) => {
-            const x = toX(i)
-            const isUp = c.c >= c.o
-            const color = isUp ? '#26a69a' : '#ef5350'
-            const bodyTop = toY(Math.max(c.o, c.c))
-            const bodyH = Math.max(1, Math.abs(toY(c.o) - toY(c.c)))
-            return (
-              <g key={i}>
-                <line x1={x} y1={toY(c.h)} x2={x} y2={toY(c.l)} stroke={color} strokeWidth="1" />
-                <rect x={x - candleW / 2} y={bodyTop} width={candleW} height={bodyH} fill={color} />
-              </g>
-            )
-          })}
-          {/* X labels */}
-          {xTicks.map(({ i, label }) => (
-            <text key={i} x={toX(i)} y={H - 8} textAnchor="middle" fontSize="9" fill="#555">{label}</text>
-          ))}
-        </svg>
-      </div>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Mini equity curve for report card
-// ---------------------------------------------------------------------------
-function MiniEquity({ data }: { data?: number[] }) {
-  if (!data || data.length < 2) return <div className="h-8 bg-gray-800 rounded" />
-  const W = 120, H = 32
-  const min = Math.min(...data), max = Math.max(...data)
-  const range = max - min || 1
-  const pts = data.map((v, i) => `${(i / (data.length - 1)) * W},${H - ((v - min) / range) * H}`).join(' ')
-  const color = data[data.length - 1] >= data[0] ? '#26a69a' : '#ef5350'
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-8">
-      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" />
-    </svg>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Report Detail Modal (完整報告視窗)
-// ---------------------------------------------------------------------------
-function ReportModal({ report, onClose }: { report: SavedReport; onClose: () => void }) {
-  const metrics = [
-    { label: '盈利率', value: `${(report.profit_pct ?? 0).toFixed(2)}%`, color: (report.profit_pct ?? 0) >= 0 ? 'text-green-400' : 'text-red-400' },
-    { label: '勝率', value: `${((report.win_rate ?? 0) * 100).toFixed(1)}%`, color: 'text-blue-400' },
-    { label: 'MDD', value: `${((report.max_drawdown ?? 0) * 100).toFixed(2)}%`, color: 'text-red-400' },
-    { label: '夏普', value: (report.sharpe_ratio ?? 0).toFixed(3), color: 'text-yellow-400' },
-    { label: '交易次數', value: report.total_trades ?? 0, color: 'text-gray-300' },
-    { label: '盈利因子', value: (report.profit_factor ?? 0).toFixed(2), color: 'text-purple-400' },
-    { label: '最終資金', value: `$${(report.final_equity ?? 0).toLocaleString()}`, color: 'text-gray-300' },
-    { label: '總盈利', value: `$${(report.gross_profit ?? 0).toFixed(2)}`, color: 'text-green-400' },
-    { label: '總虧損', value: `$${(report.gross_loss ?? 0).toFixed(2)}`, color: 'text-red-400' },
-  ]
-
-  // Equity curve
-  const eq = report.equity_curve ?? []
-  const eqMin = eq.length > 0 ? Math.min(...eq) : 0
-  const eqMax = eq.length > 0 ? Math.max(...eq) : 1
-  const eqRange = eqMax - eqMin || 1
-  const EW = 800, EH = 160, EPL = 48, EPR = 8, EPT = 8, EPB = 24
-  const eqPts = eq.map((v, i) => `${EPL + (i / Math.max(eq.length - 1, 1)) * (EW - EPL - EPR)},${EPT + (1 - (v - eqMin) / eqRange) * (EH - EPT - EPB)}`).join(' ')
-  const eqColor = eq.length > 1 && eq[eq.length - 1] >= eq[0] ? '#26a69a' : '#ef5350'
-
-  return (
-    <div className="fixed inset-0 z-50 bg-black/80 overflow-y-auto" onClick={onClose}>
-      <div className="min-h-screen flex items-start justify-center p-4 py-8">
-        <div className="bg-gray-900 rounded-xl w-full max-w-4xl" onClick={e => e.stopPropagation()}>
-          {/* Header */}
-          <div className="flex justify-between items-center p-5 border-b border-gray-700">
-            <div>
-              <h2 className="text-white text-xl font-bold">{report.strategy_name || '策略報告'}</h2>
-              <p className="text-gray-400 text-sm mt-1">
-                {report.symbol} {report.market_type === 'futures' ? '永續合約' : '現貨'} · {report.interval} ·{' '}
-                {report.start_date} ~ {report.end_date}
-              </p>
-              {report.saved_at && (
-                <p className="text-gray-600 text-xs mt-0.5">儲存於 {new Date(report.saved_at).toLocaleString('zh-TW')}</p>
-              )}
-            </div>
-            <button onClick={onClose} className="text-gray-400 hover:text-white text-2xl">✕</button>
-          </div>
-
-          <div className="p-5 space-y-6">
-            {/* Metrics grid */}
-            <div className="grid grid-cols-3 gap-3">
-              {metrics.map(m => (
-                <div key={m.label} className="bg-gray-800 rounded-lg p-3">
-                  <div className="text-gray-500 text-xs mb-1">{m.label}</div>
-                  <div className={`text-lg font-bold ${m.color}`}>{m.value}</div>
-                </div>
-              ))}
-            </div>
-
-            {/* Equity curve */}
-            {eq.length > 1 && (
-              <div>
-                <h3 className="text-gray-300 text-sm font-semibold mb-2">資產曲線</h3>
-                <div className="bg-gray-800 rounded-lg p-3">
-                  <svg viewBox={`0 0 ${EW} ${EH}`} className="w-full" style={{ height: 160 }}>
-                    <polyline points={eqPts} fill="none" stroke={eqColor} strokeWidth="1.5" />
-                    <line x1={EPL} y1={EPT + (EH - EPT - EPB) / 2} x2={EW - EPR} y2={EPT + (EH - EPT - EPB) / 2}
-                      stroke="#444" strokeWidth="0.5" strokeDasharray="4,3" />
-                  </svg>
-                </div>
-              </div>
-            )}
-
-            {/* Monthly PnL */}
-            {report.monthly_pnl && Object.keys(report.monthly_pnl).length > 0 && (
-              <div>
-                <h3 className="text-gray-300 text-sm font-semibold mb-2">每月績效</h3>
-                <div className="bg-gray-800 rounded-lg p-3 overflow-x-auto">
-                  <div className="flex gap-1 min-w-max">
-                    {Object.entries(report.monthly_pnl).sort(([a], [b]) => a.localeCompare(b)).map(([month, val]) => {
-                      const isPos = val >= 0
-                      return (
-                        <div key={month} className="flex flex-col items-center gap-0.5" title={`${month}: ${val >= 0 ? '+' : ''}${val.toFixed(2)}`}>
-                          <div className={`text-xs ${isPos ? 'text-green-400' : 'text-red-400'}`}>
-                            {isPos ? '+' : ''}{val.toFixed(0)}
-                          </div>
-                          <div className={`w-6 rounded-sm ${isPos ? 'bg-green-500' : 'bg-red-500'}`}
-                            style={{ height: `${Math.max(4, Math.abs(val) / Math.max(...Object.values(report.monthly_pnl!).map(Math.abs), 1) * 40)}px` }} />
-                          <div className="text-gray-600 text-xs">{month.slice(5)}</div>
-                          <div className="text-gray-700 text-xs">{month.slice(0, 4)}</div>
-                        </div>
-                      )
-                    })}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Parameters */}
-            {report.params && Object.keys(report.params).length > 0 && (
-              <div>
-                <h3 className="text-gray-300 text-sm font-semibold mb-2">最佳參數</h3>
-                <div className="bg-gray-800 rounded-lg p-3 grid grid-cols-2 gap-2">
-                  {Object.entries(report.params).map(([k, v]) => (
-                    <div key={k} className="flex justify-between items-center">
-                      <span className="text-gray-400 text-sm">{k}</span>
-                      <span className="text-white font-mono text-sm">{typeof v === 'number' ? v.toFixed(Number.isInteger(v) ? 0 : 4) : String(v)}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* TV-style detailed stats */}
-            <div>
-              <h3 className="text-gray-300 text-sm font-semibold mb-2">詳細統計</h3>
-              <div className="bg-gray-800 rounded-lg divide-y divide-gray-700">
-                {[
-                  ['淨利潤', `$${((report.final_equity ?? 10000) - 10000).toFixed(2)}`],
-                  ['總盈利', `$${(report.gross_profit ?? 0).toFixed(2)}`],
-                  ['總虧損', `$${(report.gross_loss ?? 0).toFixed(2)}`],
-                  ['盈利因子', (report.profit_factor ?? 0).toFixed(3)],
-                  ['最大回撤', `${((report.max_drawdown ?? 0) * 100).toFixed(2)}%`],
-                  ['夏普比率', (report.sharpe_ratio ?? 0).toFixed(3)],
-                  ['勝率', `${((report.win_rate ?? 0) * 100).toFixed(2)}%`],
-                  ['交易次數', report.total_trades ?? 0],
-                  ['回測期間', `${report.start_date} ~ ${report.end_date}`],
-                  ['交易對', `${report.symbol} (${report.market_type === 'futures' ? '期貨' : '現貨'})`],
-                  ['時間週期', report.interval ?? '-'],
-                ].map(([label, value]) => (
-                  <div key={String(label)} className="flex justify-between px-4 py-2.5">
-                    <span className="text-gray-400 text-sm">{label}</span>
-                    <span className="text-white text-sm font-medium">{value}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// HomePage component
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// MAIN COMPONENT
+// ----------------------------------------------------------------------------
 export default function HomePage() {
-  const [tickers, setTickers] = useState<MarketTicker[]>(
-    MARKET_SYMBOLS.map(s => ({ ...s, candles: [], latest_price: 0, change_pct: 0, loading: true }))
-  )
-  const [reports, setReports] = useState<SavedReport[]>([])
-  const [reportsLoading, setReportsLoading] = useState(true)
-  const [selectedCandle, setSelectedCandle] = useState<{ symbol: string; candles: Candle[] } | null>(null)
-  const [selectedReport, setSelectedReport] = useState<SavedReport | null>(null)
+  const navigate = useNavigate()
+  const { strategies, fetchStrategies, deleteStrategy } = useStrategyStore()
+  const [tickers, setTickers] = useState<MarketTicker[]>([])
+  const [recentReports, setRecentReports] = useState<SavedReport[]>([])
+  const [loadingReports, setLoadingReports] = useState(false)
+  const isMountedRef = useRef(false)
 
-  // Fetch market data
-  useEffect(() => {
-    MARKET_SYMBOLS.forEach(async ({ symbol, label }, idx) => {
-      try {
-        const res = await fetch(`${API_BASE}/candles?symbol=${symbol}&interval=1h&limit=48`)
-        if (!res.ok) throw new Error(res.statusText)
-        const data = await res.json()
-        setTickers(prev => prev.map((t, i) => i === idx
-          ? { ...t, candles: data.candles, latest_price: data.latest_price, change_pct: data.change_pct, loading: false }
-          : t
-        ))
-      } catch (e) {
-        setTickers(prev => prev.map((t, i) => i === idx
-          ? { ...t, loading: false, error: String(e) }
-          : t
-        ))
-      }
-    })
+  // 1) Fetch market tickers in parallel — 24h hourly candles
+  const fetchMarketData = useCallback(async () => {
+    const init: MarketTicker[] = MARKET_SYMBOLS.map(s => ({
+      ...s,
+      candles: [],
+      latest_price: 0,
+      change_pct: 0,
+      loading: true
+    }))
+    setTickers(init)
+    const results = await Promise.allSettled(
+      MARKET_SYMBOLS.map(async (s) => {
+        try {
+          // 24h走勢：1h K線，取24根
+          const url = `https://api.binance.com/api/v3/klines?symbol=${s.symbol}&interval=1h&limit=24`
+          const res = await fetch(url)
+          if (!res.ok) throw new Error(`HTTP ${res.status}`)
+          const data = await res.json()
+          const candles: Candle[] = data.map((k: any) => ({
+            t: k[0] / 1000,
+            o: parseFloat(k[1]),
+            h: parseFloat(k[2]),
+            l: parseFloat(k[3]),
+            c: parseFloat(k[4]),
+            v: parseFloat(k[5])
+          }))
+          const latest = candles[candles.length - 1]?.c ?? 0
+          const prev = candles[0]?.o ?? 1
+          const pct = ((latest - prev) / prev) * 100
+          return { ...s, candles, latest_price: latest, change_pct: pct, loading: false }
+        } catch (err: any) {
+          return { ...s, candles: [], latest_price: 0, change_pct: 0, loading: false, error: err.message }
+        }
+      })
+    )
+    const tickersData = results.map((r, i) =>
+      r.status === 'fulfilled' ? r.value : { ...MARKET_SYMBOLS[i], candles: [], latest_price: 0, change_pct: 0, loading: false, error: 'Failed' }
+    )
+    setTickers(tickersData)
   }, [])
 
-  // Fetch reports
-  useEffect(() => {
-    fetch(`${API_BASE}/reports?limit=10`)
-      .then(r => r.json())
-      .then(data => { setReports(data.reports ?? []); setReportsLoading(false) })
-      .catch(() => setReportsLoading(false))
+  // 2) Fetch recent saved reports from backend
+  const fetchSavedReports = useCallback(async () => {
+    setLoadingReports(true)
+    try {
+      const res = await fetch(`${API_BASE}/saved-reports`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      const arr = Array.isArray(data) ? data : data.reports ?? []
+      setRecentReports(arr.slice(0, 10))
+    } catch (err) {
+      console.error('Failed to fetch saved reports:', err)
+      setRecentReports([])
+    } finally {
+      setLoadingReports(false)
+    }
   }, [])
 
-  const formatPrice = (p: number) => {
-    if (p >= 1000) return p.toLocaleString('en-US', { maximumFractionDigits: 2 })
-    if (p >= 1) return p.toFixed(4)
-    return p.toFixed(6)
+  useEffect(() => {
+    if (!isMountedRef.current) {
+      isMountedRef.current = true
+      fetchMarketData()
+      fetchSavedReports()
+      fetchStrategies()
+    }
+  }, [fetchMarketData, fetchSavedReports, fetchStrategies])
+
+  // 3) UI helpers
+  const formatPrice = (v?: number) => {
+    if (v == null || isNaN(v)) return '$0.000000'
+    if (v >= 1000) return `$${v.toFixed(2)}`
+    if (v >= 1) return `$${v.toFixed(4)}`
+    return `$${v.toFixed(6)}`
+  }
+  const pctColor = (val?: number) => {
+    if (val == null || isNaN(val)) return 'text-green-400'
+    return val >= 0 ? 'text-green-400' : 'text-red-400'
+  }
+  const formatPct = (val?: number) => {
+    if (val == null || isNaN(val)) return '+0.00%'
+    return `${val >= 0 ? '+' : ''}${val.toFixed(2)}%`
   }
 
   return (
-    <div className="min-h-screen bg-gray-950 text-white p-6 space-y-8">
-      {/* -- 市場概覽 -- */}
-      <section>
-        <h2 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
-          <span className="w-1 h-5 bg-blue-500 rounded-full inline-block" />
-          市場概覽
-        </h2>
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-          {tickers.map(ticker => {
-            const isUp = ticker.change_pct >= 0
-            const color = isUp ? '#26a69a' : '#ef5350'
+    <div className="min-h-screen bg-gray-900 text-gray-100">
+
+      {/* ── 市場概覽 ── */}
+      <div className="px-6 pt-6">
+        <div className="flex items-center gap-3 mb-4">
+          <span className="text-base font-semibold text-gray-200">市場概覽</span>
+          <span className="text-xs px-2 py-0.5 rounded bg-green-500/20 text-green-400 font-medium">+ LIVE</span>
+          <a href="/chart" className="ml-auto text-xs text-blue-400 hover:text-blue-300">查看所有市場</a>
+        </div>
+
+        <div className="grid grid-cols-2 xl:grid-cols-4 gap-4 mb-8">
+          {tickers.map(t => {
+            const lineColor = t.change_pct >= 0 ? '#10B981' : '#EF4444'
             return (
-              <div key={ticker.symbol}
-                className="bg-gray-900 border border-gray-800 rounded-xl p-3 cursor-pointer hover:border-gray-600 transition-all"
-                onClick={() => !ticker.loading && ticker.candles.length > 0 &&
-                  setSelectedCandle({ symbol: ticker.symbol, candles: ticker.candles })}>
-                <div className="flex justify-between items-start mb-2">
-                  <span className="text-white font-bold text-sm">{ticker.label}</span>
-                  <span className={`text-xs font-semibold ${isUp ? 'text-green-400' : 'text-red-400'}`}>
-                    {isUp ? '+' : ''}{ticker.change_pct.toFixed(2)}%
+              <div
+                key={t.symbol}
+                onClick={() => navigate(`/chart?symbol=${t.symbol}&interval=1h`)}
+                className="bg-gray-800 rounded-xl p-4 cursor-pointer hover:bg-gray-750 hover:border-blue-500 border border-gray-700 transition-all"
+              >
+                <div className="flex justify-between items-start mb-1">
+                  <span className="text-xs text-gray-400">{t.label}</span>
+                  <span className={`text-xs font-semibold ${pctColor(t.change_pct)}`}>
+                    {t.loading ? '+0.00%' : formatPct(t.change_pct)}
                   </span>
                 </div>
-                {ticker.loading ? (
-                  <div className="h-12 bg-gray-800 rounded animate-pulse mb-2" />
-                ) : (
-                  <SparkLine candles={ticker.candles} color={color} />
-                )}
-                <div className="text-white font-mono text-sm mt-1">
-                  {ticker.loading ? '載入中...' : `$${formatPrice(ticker.latest_price)}`}
+                <div className="text-2xl font-bold text-white mb-2">
+                  {t.loading ? '$0.000000' : formatPrice(t.latest_price)}
                 </div>
-                <div className="text-gray-600 text-xs mt-0.5">點擊查看 K 線</div>
+                <SparkLine candles={t.candles} color={lineColor} />
               </div>
             )
           })}
         </div>
-      </section>
+      </div>
 
-      {/* -- 近期優化策略 -- */}
-      <section>
-        <h2 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
-          <span className="w-1 h-5 bg-purple-500 rounded-full inline-block" />
-          近期優化策略
-        </h2>
-        {reportsLoading ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {[1,2,3].map(i => <div key={i} className="bg-gray-900 rounded-xl h-40 animate-pulse" />)}
-          </div>
-        ) : reports.length === 0 ? (
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-8 text-center text-gray-500">
-            尚無優化記錄。前往優化頁面執行第一次回測！
+      {/* ── 策略概覽 ── */}
+      <div className="px-6 mb-8">
+        <div className="flex items-center gap-3 mb-4">
+          <span className="text-base font-semibold text-gray-200">策略概覽</span>
+          <button
+            onClick={() => navigate('/strategy')}
+            className="ml-auto flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-yellow-500 hover:bg-yellow-400 text-gray-900 font-semibold transition-colors"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            新增策略
+          </button>
+        </div>
+
+        {strategies.length === 0 ? (
+          <div className="bg-gray-800 rounded-xl p-6 text-center text-gray-400 border border-gray-700">
+            尚無策略。點擊「新增策略」開始建立。
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {reports.map((r, i) => {
-              const isPos = (r.profit_pct ?? 0) >= 0
-              return (
-                <div key={i}
-                  className="bg-gray-900 border border-gray-800 rounded-xl p-4 cursor-pointer hover:border-gray-600 transition-all"
-                  onClick={() => setSelectedReport(r)}>
-                  <div className="flex justify-between items-start mb-3">
-                    <div>
-                      <div className="text-white font-semibold text-sm">{r.strategy_name || r.symbol}</div>
-                      <div className="text-gray-500 text-xs mt-0.5">
-                        {r.symbol} {r.market_type === 'futures' ? '永續' : '現貨'} · {r.interval}
+          <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-700/50">
+                <tr>
+                  <th className="px-4 py-3 text-left text-gray-400 font-medium">策略名稱</th>
+                  <th className="px-4 py-3 text-left text-gray-400 font-medium">狀態</th>
+                  <th className="px-4 py-3 text-left text-gray-400 font-medium">勝率</th>
+                  <th className="px-4 py-3 text-left text-gray-400 font-medium">淨利率</th>
+                  <th className="px-4 py-3 text-left text-gray-400 font-medium">最大回撤</th>
+                  <th className="px-4 py-3 text-right text-gray-400 font-medium">操作</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-700">
+                {strategies.map((s: Strategy) => (
+                  <tr key={s.id} className="hover:bg-gray-700/30 transition-colors">
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-7 h-7 rounded-lg bg-yellow-500/20 flex items-center justify-center">
+                          <span className="text-yellow-400 text-xs">⚡</span>
+                        </div>
+                        <div>
+                          <div className="text-white font-medium text-sm">{s.name}</div>
+                          <div className="text-gray-500 text-xs">{s.description?.slice(0, 30) ?? '-'}</div>
+                        </div>
                       </div>
-                    </div>
-                    <div className={`text-lg font-bold ${isPos ? 'text-green-400' : 'text-red-400'}`}>
-                      {isPos ? '+' : ''}{(r.profit_pct ?? 0).toFixed(2)}%
-                    </div>
-                  </div>
-                  <MiniEquity data={r.equity_curve} />
-                  <div className="grid grid-cols-4 gap-1 mt-3">
-                    <div className="text-center">
-                      <div className="text-gray-500 text-xs">MDD</div>
-                      <div className="text-red-400 text-xs font-semibold">{((r.max_drawdown ?? 0) * 100).toFixed(1)}%</div>
-                    </div>
-                    <div className="text-center">
-                      <div className="text-gray-500 text-xs">勝率</div>
-                      <div className="text-blue-400 text-xs font-semibold">{((r.win_rate ?? 0) * 100).toFixed(1)}%</div>
-                    </div>
-                    <div className="text-center">
-                      <div className="text-gray-500 text-xs">交易數</div>
-                      <div className="text-gray-300 text-xs font-semibold">{r.total_trades ?? 0}</div>
-                    </div>
-                    <div className="text-center">
-                      <div className="text-gray-500 text-xs">夏普</div>
-                      <div className="text-yellow-400 text-xs font-semibold">{(r.sharpe_ratio ?? 0).toFixed(2)}</div>
-                    </div>
-                  </div>
-                  <div className="text-gray-700 text-xs mt-2 text-right">
-                    {r.start_date} ~ {r.end_date}
-                  </div>
-                </div>
-              )
-            })}
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className="text-xs px-2 py-0.5 rounded border border-gray-500 text-gray-400">BACKTEST</span>
+                    </td>
+                    <td className="px-4 py-3 text-gray-300">-</td>
+                    <td className="px-4 py-3 text-gray-300">-</td>
+                    <td className="px-4 py-3 text-red-400">-</td>
+                    <td className="px-4 py-3 text-right">
+                      <div className="flex items-center justify-end gap-2">
+                        <button
+                          onClick={() => navigate('/strategy')}
+                          className="p-1.5 rounded hover:bg-gray-600 text-gray-400 hover:text-white transition-colors"
+                        >
+                          <Edit2 className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => deleteStrategy(s.id)}
+                          className="p-1.5 rounded hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition-colors"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
-      </section>
+      </div>
 
-      {/* K線圖 modal */}
-      {selectedCandle && (
-        <CandlestickChart
-          candles={selectedCandle.candles}
-          symbol={selectedCandle.symbol}
-          onClose={() => setSelectedCandle(null)}
-        />
-      )}
+      {/* ── 最近優化活動 ── */}
+      <div className="px-6 pb-8">
+        <div className="flex items-center gap-3 mb-4">
+          <span className="text-base font-semibold text-gray-200">最近優化活動</span>
+        </div>
 
-      {/* Report modal */}
-      {selectedReport && (
-        <ReportModal report={selectedReport} onClose={() => setSelectedReport(null)} />
-      )}
+        {loadingReports ? (
+          <div className="bg-gray-800 rounded-xl p-6 text-center text-gray-400 border border-gray-700">載入中...</div>
+        ) : recentReports.length === 0 ? (
+          <div className="bg-gray-800 rounded-xl p-6 text-center text-gray-400 border border-gray-700">
+            尚無優化報告。執行參數優化後會顯示於此。
+          </div>
+        ) : (
+          <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+            {recentReports.map((r, idx) => (
+              <div key={idx} className="flex items-center px-4 py-3 border-b border-gray-700 last:border-0 hover:bg-gray-700/30 transition-colors">
+                <div className="w-7 h-7 rounded-full bg-green-500/20 flex items-center justify-center mr-3 flex-shrink-0">
+                  <span className="text-green-400 text-xs">✓</span>
+                </div>
+                <div className="flex-1">
+                  <div className="text-sm text-white font-medium">
+                    {r.symbol ?? '-'} · {r.interval ?? '-'} · 完成
+                  </div>
+                  <div className="text-xs text-gray-400">
+                    {r.saved_at ? new Date(r.saved_at).toLocaleDateString('zh-TW') : '-'} · 淨利率{' '}
+                    <span className={r.profit_pct != null && r.profit_pct >= 0 ? 'text-green-400' : 'text-red-400'}>
+                      {r.profit_pct != null ? `${r.profit_pct >= 0 ? '+' : ''}${r.profit_pct.toFixed(2)}%` : '-'}
+                    </span>
+                  </div>
+                </div>
+                <button
+                  onClick={() => navigate('/results')}
+                  className="text-xs text-blue-400 hover:text-blue-300"
+                >
+                  查看報告
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
