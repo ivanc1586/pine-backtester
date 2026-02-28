@@ -51,7 +51,7 @@ const MARKET_SYMBOLS = [
   { symbol: 'XRPUSDT', label: 'XRP' },
   { symbol: 'DOGEUSDT', label: 'DOGE' },
 ]
-const API_BASE = '/api/optimize'
+const API_BASE = ((import.meta as any).env?.VITE_API_URL ?? '') + '/api/optimize'
 
 // ---------------------------------------------------------------------------
 // Mini spark line chart
@@ -346,7 +346,7 @@ export default function HomePage() {
 
   return (
     <div className="min-h-screen bg-gray-950 text-white p-6 space-y-8">
-      {/* ── 市場概覽 ── */}
+      {/* -- 市場概覽 -- */}
       <section>
         <h2 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
           <span className="w-1 h-5 bg-blue-500 rounded-full inline-block" />
@@ -382,7 +382,7 @@ export default function HomePage() {
         </div>
       </section>
 
-      {/* ── 近期優化策略 ── */}
+      {/* -- 近期優化策略 -- */}
       <section>
         <h2 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
           <span className="w-1 h-5 bg-purple-500 rounded-full inline-block" />
