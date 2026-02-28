@@ -1,7 +1,7 @@
 // =============================================================================
 // OptimizePage v2.7.0
 // -----------------------------------------------------------------------------
-// v2.7.0 - 2026-02-28
+// v2.8.0 - 2026-02-28
 //   - 新增「策略執行設定」區塊：初始資金、手續費類型/數值、開倉類型/數值 五個輸入框
 //   - /parse 回傳 header 後自動填充上述五個欄位
 //   - runOptimization body 補齊 initial_capital / commission_type / commission_value
@@ -39,7 +39,7 @@ interface DetectedParam {
 
 interface ParamRange {
   name: string
-  title: string
+  title: string   // Human-readable label e.g. "Fast MA Period"
   enabled: boolean
   min_val: number
   max_val: number
@@ -59,6 +59,11 @@ interface StrategyHeader {
 interface OptimizeResult {
   rank: number
   params: Record<string, number>
+  symbol?: string
+  market_type?: string
+  interval?: string
+  start_date?: string
+  end_date?: string
   total_trades: number
   win_rate: number
   profit_pct: number
@@ -70,6 +75,30 @@ interface OptimizeResult {
   gross_loss: number
   monthly_pnl: Record<string, number>
   equity_curve: number[]
+  trades?: TradeRecord[]
+}
+
+interface TradeRecord {
+  entry_time?: string
+  exit_time?: string
+  side?: string
+  pnl?: number
+  entry_price?: number
+  exit_price?: number
+}
+
+interface SavedReport extends OptimizeResult {
+  strategy_name?: string
+  saved_at?: string
+}
+
+interface Candle {
+  t: number
+  o: number
+  h: number
+  l: number
+  c: number
+  v: number
 }
 
 const SORT_OPTIONS = [
@@ -102,71 +131,116 @@ const POPULAR_SYMBOLS = [
 // ---------------------------------------------------------------------------
 // SVG Equity Curve（零依賴，不使用 lightweight-charts）
 // ---------------------------------------------------------------------------
-function EquityCurve({ data }: { data: number[] }) {
-  if (!data || data.length < 2) return null
-  const W = 600, H = 160, PAD = 8
-  const min = Math.min(...data)
-  const max = Math.max(...data)
-  const range = max - min || 1
-  const pts = data.map((v, i) => {
-    const x = PAD + (i / (data.length - 1)) * (W - PAD * 2)
-    const y = PAD + (1 - (v - min) / range) * (H - PAD * 2)
-    return `${x},${y}`
+function EquityCurve({ data, timestamps }: { data: number[]; timestamps?: number[] }) {
+  if (!data || data.length < 2) return <div className="h-40 flex items-center justify-center text-gray-500 text-sm">無資料</div>
+  const W = 600, H = 180, PL = 48, PR = 8, PT = 8, PB = 24
+  const chartW = W - PL - PR
+  const chartH = H - PT - PB
+  const minV = Math.min(...data)
+  const maxV = Math.max(...data)
+  const range = maxV - minV || 1
+  const toX = (i: number) => PL + (i / (data.length - 1)) * chartW
+  const toY = (v: number) => PT + (1 - (v - minV) / range) * chartH
+  const pts = data.map((v, i) => `${toX(i)},${toY(v)}`).join(' ')
+  const fillPts = `${PL},${PT + chartH} ${pts} ${PL + chartW},${PT + chartH}`
+  const zeroY = toY(0)
+  const isPositive = data[data.length - 1] >= data[0]
+  const color = isPositive ? '#26a69a' : '#ef5350'
+  // Y axis labels (5 ticks)
+  const yTicks = Array.from({ length: 5 }, (_, i) => {
+    const v = minV + (range * i) / 4
+    const y = toY(v)
+    return { v, y }
   })
-  const polyline = pts.join(' ')
-  const fill = `${pts.join(' ')} ${W - PAD},${H - PAD} ${PAD},${H - PAD}`
-  const isUp = data[data.length - 1] >= data[0]
-  const stroke = isUp ? '#26a69a' : '#ef5350'
-  const fillColor = isUp ? 'rgba(38,166,154,0.12)' : 'rgba(239,83,80,0.12)'
-
+  // X axis labels (up to 5 timestamps)
+  const xTicks = timestamps && timestamps.length > 0
+    ? [0, 0.25, 0.5, 0.75, 1].map(frac => {
+        const i = Math.min(Math.floor(frac * (data.length - 1)), data.length - 1)
+        const d = new Date(timestamps[i])
+        const label = `${d.getMonth() + 1}/${d.getDate()}`
+        return { x: toX(i), label }
+      })
+    : []
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: H, display: 'block' }}>
-      <polygon points={fill} fill={fillColor} />
-      <polyline points={polyline} fill="none" stroke={stroke} strokeWidth={2} strokeLinejoin="round" />
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ height: 180 }}>
+      <defs>
+        <linearGradient id="eq-grad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.3" />
+          <stop offset="100%" stopColor={color} stopOpacity="0.02" />
+        </linearGradient>
+      </defs>
+      {/* Y grid lines + labels */}
+      {yTicks.map(({ v, y }, i) => (
+        <g key={i}>
+          <line x1={PL} y1={y} x2={W - PR} y2={y} stroke="#2a2a3a" strokeWidth="0.5" />
+          <text x={PL - 4} y={y + 4} textAnchor="end" fontSize="9" fill="#666">{v.toFixed(1)}%</text>
+        </g>
+      ))}
+      {/* 0% reference line */}
+      {zeroY >= PT && zeroY <= PT + chartH && (
+        <line x1={PL} y1={zeroY} x2={W - PR} y2={zeroY} stroke="#555" strokeWidth="1" strokeDasharray="4,3" />
+      )}
+      {/* Area fill */}
+      <polygon points={fillPts} fill="url(#eq-grad)" />
+      {/* Line */}
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" />
+      {/* X axis labels */}
+      {xTicks.map(({ x, label }, i) => (
+        <text key={i} x={x} y={H - 4} textAnchor="middle" fontSize="9" fill="#555">{label}</text>
+      ))}
     </svg>
   )
 }
 
-// ---------------------------------------------------------------------------
-// Monthly Bar Chart
-// ---------------------------------------------------------------------------
-function MonthlyBarChart({ data }: { data: Record<string, number> }) {
+function MonthlyBarChart({ data, initialCapital }: { data: Record<string, number>; initialCapital?: number }) {
   const entries = Object.entries(data).sort(([a], [b]) => a.localeCompare(b))
-  if (!entries.length) return null
-  const vals = entries.map(([, v]) => v)
-  const maxAbs = Math.max(...vals.map(Math.abs), 1)
-
+  if (entries.length === 0) return <div className="h-24 flex items-center justify-center text-gray-500 text-sm">無月度資料</div>
+  const values = entries.map(([, v]) => v)
+  const maxAbs = Math.max(...values.map(Math.abs), 1)
+  const barW = Math.max(8, Math.min(28, Math.floor(560 / entries.length) - 2))
+  const H = 120, midY = 60, maxBarH = 50
+  const [tooltip, setTooltip] = React.useState<{ x: number; y: number; text: string } | null>(null)
   return (
-    <div>
-      <div style={{ fontSize: 11, color: '#848e9c', marginBottom: 8, fontWeight: 600 }}>每月績效</div>
-      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 4, height: 80, overflowX: 'auto', paddingBottom: 4 }}>
-        {entries.map(([month, pnl]) => {
-          const pct = (Math.abs(pnl) / maxAbs) * 60
-          const isPos = pnl >= 0
+    <div className="relative">
+      <svg viewBox={`0 0 ${Math.max(560, entries.length * (barW + 2))} ${H + 28}`} className="w-full overflow-visible">
+        {/* Zero baseline */}
+        <line x1="0" y1={midY} x2="100%" y2={midY} stroke="#444" strokeWidth="1" />
+        {entries.map(([month, val], i) => {
+          const x = i * (barW + 2) + 1
+          const barH = Math.abs(val) / maxAbs * maxBarH
+          const y = val >= 0 ? midY - barH : midY
+          const color = val >= 0 ? '#26a69a' : '#ef5350'
+          const monthLabel = month.slice(5)  // "MM"
+          const year = month.slice(0, 4)     // "YYYY"
+          const prevEntry = i > 0 ? entries[i - 1] : null
+          const showYear = i === 0 || (prevEntry && prevEntry[0].slice(0, 4) !== year)
+          const pctVal = initialCapital && initialCapital > 0
+            ? (val / initialCapital * 100).toFixed(2) + '%'
+            : val.toFixed(2)
           return (
-            <div key={month} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: 28 }}>
-              <div style={{ height: 60, display: 'flex', alignItems: 'flex-end' }}>
-                <div
-                  style={{
-                    width: 20, height: Math.max(3, pct),
-                    background: isPos ? '#26a69a' : '#ef5350',
-                    borderRadius: 2,
-                  }}
-                  title={`${month}: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`}
-                />
-              </div>
-              <div style={{ fontSize: 9, color: '#848e9c', marginTop: 3 }}>{month.slice(5)}</div>
-            </div>
+            <g key={month}
+              onMouseEnter={() => setTooltip({ x: x + barW / 2, y: val >= 0 ? y - 4 : y + barH + 4, text: `${month}\n${val >= 0 ? '+' : ''}${val.toFixed(2)} (${pctVal})` })}
+              onMouseLeave={() => setTooltip(null)}
+              style={{ cursor: 'default' }}>
+              <rect x={x} y={y} width={barW} height={Math.max(barH, 1)} fill={color} opacity="0.85" rx="1" />
+              <text x={x + barW / 2} y={H + 10} textAnchor="middle" fontSize="8" fill="#666">{monthLabel}</text>
+              {showYear && (
+                <text x={x + barW / 2} y={H + 22} textAnchor="middle" fontSize="8" fill="#888">{year}</text>
+              )}
+            </g>
           )
         })}
-      </div>
+      </svg>
+      {tooltip && (
+        <div className="absolute z-10 bg-gray-900 border border-gray-600 text-white text-xs px-2 py-1 rounded pointer-events-none whitespace-pre"
+          style={{ left: tooltip.x, top: tooltip.y - 32, transform: 'translateX(-50%)' }}>
+          {tooltip.text}
+        </div>
+      )}
     </div>
   )
 }
 
-// ---------------------------------------------------------------------------
-// Metric Badge
-// ---------------------------------------------------------------------------
 function MetricBadge({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {
   return (
     <div style={{
@@ -210,6 +284,7 @@ export default function OptimizePage() {
   const [bypassCache,      setBypassCache]      = useState(false)
 
   const [symbol,       setSymbol]      = useState('BTCUSDT')
+  const [marketType,   setMarketType]  = useState<'spot' | 'futures'>('spot')
   const [intervalVal,  setIntervalVal] = useState('1h')
   const [startDate,    setStartDate]   = useState('2023-01-01')
   const [endDate,      setEndDate]     = useState(new Date().toISOString().split('T')[0])
@@ -222,6 +297,7 @@ export default function OptimizePage() {
   const [results,        setResults]        = useState<OptimizeResult[]>([])
   const [selectedResult, setSelectedResult] = useState<OptimizeResult | null>(null)
   const [copiedCode,     setCopiedCode]     = useState(false)
+  const [showExportModal, setShowExportModal] = useState(false)
   const [errorMsg,       setErrorMsg]       = useState('')
 
   // 即時日誌
@@ -375,6 +451,7 @@ export default function OptimizePage() {
         body: JSON.stringify({
           pine_script:      pineScript,
           symbol,
+          market_type:      marketType,
           interval:         intervalVal,
           start_date:       startDate,
           end_date:         endDate,
@@ -438,6 +515,30 @@ export default function OptimizePage() {
   // ---------------------------------------------------------------------------
   // Copy optimized code
   // ---------------------------------------------------------------------------
+  const getOptimizedCode = useCallback(() => {
+    if (!selectedResult) return ''
+    let code = pineScript
+    Object.entries(selectedResult.params).forEach(([name, val]) => {
+      const pattern = new RegExp(`(${name}\\s*=\\s*input\\.(int|float)\\s*\\()[^)]*\\)`, 'g')
+      code = code.replace(pattern, (match: string) =>
+        match.replace(/defval\s*=\s*[\d.]+/, `defval = ${val}`)
+      )
+    })
+    return code
+  }, [selectedResult, pineScript])
+
+  const getOptimizedCode = useCallback(() => {
+    if (!selectedResult) return ''
+    let code = pineScript
+    Object.entries(selectedResult.params).forEach(([name, val]) => {
+      const pattern = new RegExp(`(${name}\\s*=\\s*input\\.(int|float)\\s*\\()[^)]*\\)`, 'g')
+      code = code.replace(pattern, (match: string) =>
+        match.replace(/defval\s*=\s*[\d.]+/, `defval = ${val}`)
+      )
+    })
+    return code
+  }, [selectedResult, pineScript])
+
   const copyOptimizedCode = useCallback(() => {
     if (!selectedResult) return
     let code = pineScript
@@ -859,7 +960,7 @@ export default function OptimizePage() {
                 <span style={{ fontWeight: 700, fontSize: 13 }}>第 {selectedResult.rank} 名詳細分析</span>
               </div>
               <button
-                onClick={copyOptimizedCode}
+                onClick={() => setShowExportModal(true)}
                 style={{
                   display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
                   background: copiedCode ? 'rgba(38,166,154,0.15)' : 'rgba(240,185,11,0.1)',
