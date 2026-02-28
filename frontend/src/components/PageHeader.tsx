@@ -1,15 +1,25 @@
+import React from 'react'
+
 interface Props {
   title: string
   subtitle?: string
+  icon?: React.ReactNode
   actions?: React.ReactNode
 }
 
-export default function PageHeader({ title, subtitle, actions }: Props) {
+export default function PageHeader({ title, subtitle, icon, actions }: Props) {
   return (
     <div className="h-14 px-6 border-b border-[#2a2e39] flex items-center justify-between shrink-0 bg-[#1e2328]">
-      <div>
-        <h1 className="text-white font-semibold text-base">{title}</h1>
-        {subtitle && <p className="text-[#787b86] text-xs mt-0.5">{subtitle}</p>}
+      <div className="flex items-center gap-2.5">
+        {icon && (
+          <div className="w-7 h-7 rounded-lg bg-[#2b2b43] flex items-center justify-center text-[#26a69a]">
+            {icon}
+          </div>
+        )}
+        <div>
+          <h1 className="text-white font-semibold text-base">{title}</h1>
+          {subtitle && <p className="text-[#787b86] text-xs mt-0.5">{subtitle}</p>}
+        </div>
       </div>
       {actions && <div className="flex items-center gap-2">{actions}</div>}
     </div>
