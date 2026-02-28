@@ -51,7 +51,7 @@ const MARKET_SYMBOLS = [
   { symbol: 'XRPUSDT', label: 'XRP' },
   { symbol: 'DOGEUSDT', label: 'DOGE' },
 ]
-const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? 'http://localhost:8000/api/optimize'
+const API_BASE = ((import.meta as any).env?.VITE_API_URL ?? '').replace(/\/$/, '') || 'http://localhost:8000/api/optimize'
 
 // ---------------------------------------------------------------------------
 // Mini spark line chart
