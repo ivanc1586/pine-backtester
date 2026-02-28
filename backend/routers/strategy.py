@@ -1,11 +1,13 @@
 # =============================================================================
-# strategy.py  v2.0.0 - 2026-02-28
+# strategy.py  v3.0.0 - 2026-02-28
 # -----------------------------------------------------------------------------
-# /api/strategies  — 策略總覽 CRUD（in-memory，含完整回測報告欄位）
-#   GET  /api/strategies         — 列出所有策略
-#   POST /api/strategies         — 新增策略（自動賦予 id + saved_at）
-#   PUT  /api/strategies/{id}    — 更新策略名稱 / 描述
-#   DELETE /api/strategies/{id}  — 刪除策略
+# /api/strategies  — 策略總覽 + 優化活動 CRUD（in-memory）
+#
+#   GET  /api/strategies              — 策略概覽（type="strategy"，使用者手動存）
+#   GET  /api/strategies/activities   — 最近優化活動（type="activity"，每次優化第一名自動存）
+#   POST /api/strategies              — 新增（body 帶 type 欄位區分）
+#   PUT  /api/strategies/{id}         — 更新名稱/描述
+#   DELETE /api/strategies/{id}       — 刪除
 # =============================================================================
 
 from fastapi import APIRouter, HTTPException
@@ -16,30 +18,19 @@ import datetime as _dt
 
 router = APIRouter()
 
-# ---------------------------------------------------------------------------
-# In-memory store（最多保留 200 筆，LIFO 插入）
-# ---------------------------------------------------------------------------
 _strategies: list[dict] = []
 MAX_STRATEGIES = 200
 
-
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
 class StrategySaveRequest(BaseModel):
-    # 基本識別
-    name: str                           # e.g. "BTCUSDT 1H"
+    type: str = "strategy"          # "strategy" = 使用者手動存；"activity" = 優化第一名自動存
+    name: str
     description: str = ""
-    pine_script: str = ""               # 含最佳參數的完整 Pine Script
-
-    # 回測設定
+    pine_script: str = ""
     symbol: str = ""
     market_type: str = "spot"
     interval: str = ""
     start_date: str = ""
     end_date: str = ""
-
-    # 核心績效指標
     profit_pct: float = 0.0
     win_rate: float = 0.0
     max_drawdown: float = 0.0
@@ -49,49 +40,40 @@ class StrategySaveRequest(BaseModel):
     final_equity: float = 0.0
     gross_profit: float = 0.0
     gross_loss: float = 0.0
-
-    # 完整報告資料
     params: dict = {}
     equity_curve: list = []
     monthly_pnl: dict = {}
     trades: list = []
-
-    # 排名（從優化結果帶入）
     rank: int = 1
-
 
 class StrategyUpdateRequest(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
 
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+@router.get("/activities")
+async def list_activities():
+    """最近優化活動（type='activity'）。"""
+    activities = [s for s in _strategies if s.get("type") == "activity"]
+    return {"activities": activities, "count": len(activities)}
 
 @router.get("")
 async def list_strategies():
-    """列出所有已儲存的策略（含完整回測指標）。"""
-    return {"strategies": _strategies, "count": len(_strategies)}
-
+    """策略概覽（type='strategy'）。"""
+    strategies = [s for s in _strategies if s.get("type") == "strategy"]
+    return {"strategies": strategies, "count": len(strategies)}
 
 @router.post("")
 async def save_strategy(req: StrategySaveRequest):
-    """新增一筆策略到策略總覽。自動產生 id 與 saved_at。"""
     entry = req.dict()
     entry["id"] = str(uuid.uuid4())
     entry["saved_at"] = _dt.datetime.now().isoformat()
-
     _strategies.insert(0, entry)
     if len(_strategies) > MAX_STRATEGIES:
         _strategies.pop()
-
     return {"status": "saved", "id": entry["id"], "total": len(_strategies)}
-
 
 @router.put("/{strategy_id}")
 async def update_strategy(strategy_id: str, req: StrategyUpdateRequest):
-    """更新策略名稱或描述。"""
     for s in _strategies:
         if s["id"] == strategy_id:
             if req.name is not None:
@@ -102,10 +84,8 @@ async def update_strategy(strategy_id: str, req: StrategyUpdateRequest):
             return {"status": "updated", "strategy": s}
     raise HTTPException(status_code=404, detail="Strategy not found")
 
-
 @router.delete("/{strategy_id}")
 async def delete_strategy(strategy_id: str):
-    """刪除策略。"""
     global _strategies
     before = len(_strategies)
     _strategies = [s for s in _strategies if s["id"] != strategy_id]
