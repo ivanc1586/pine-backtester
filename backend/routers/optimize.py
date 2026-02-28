@@ -377,9 +377,17 @@ PERFORMANCE RULES — MANDATORY:
 - Pre-compute ALL indicator arrays as numpy arrays BEFORE the bar loop.
 - The bar loop must only read from pre-computed arrays — no pandas ops inside loop.
 - MANDATORY @njit STRUCTURE: The core bar loop MUST be extracted into a separate
-  @njit function. Example skeleton:
+  @njit function. ALWAYS use the following safe import pattern at the top of the
+  generated code (graceful fallback when numba is not installed):
 
-    from numba import njit
+    try:
+        from numba import njit
+    except ImportError:
+        def njit(*args, **kwargs):
+            def decorator(fn): return fn
+            return decorator if args and callable(args[0]) else decorator
+
+  Example skeleton:
 
     @njit
     def _core_loop(close_arr, high_arr, low_arr, open_arr,
