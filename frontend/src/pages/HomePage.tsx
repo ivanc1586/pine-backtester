@@ -52,7 +52,7 @@ const MARKET_SYMBOLS = [
   { symbol: 'SOLUSDT', label: 'SOL / USD' },
   { symbol: 'BNBUSDT', label: 'BNB / USD' },
 ]
-const API_BASE = ((import.meta as any).env?.VITE_API_URL ?? '') + '/api/optimize'
+const API_BASE = ((import.meta as any).env?.VITE_API_URL ?? '') + '/api/strategies'
 
 // ----------------------------------------------------------------------------
 // Mini spark line chart (24h)
@@ -124,17 +124,30 @@ export default function HomePage() {
     setTickers(tickersData)
   }, [])
 
-  // 2) Fetch recent saved reports from backend
+  // 2) Fetch strategies (which now carry backtest report fields) from backend
   const fetchSavedReports = useCallback(async () => {
     setLoadingReports(true)
     try {
-      const res = await fetch(`${API_BASE}/saved-reports`)
+      const res = await fetch(API_BASE)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      const arr = Array.isArray(data) ? data : data.reports ?? []
+      const arr: SavedReport[] = (Array.isArray(data) ? data : data.strategies ?? []).map((s: any) => ({
+        symbol: s.symbol,
+        interval: s.interval,
+        strategy_name: s.name,
+        saved_at: s.created_at ?? s.saved_at,
+        profit_pct: s.profit_pct,
+        win_rate: s.win_rate,
+        max_drawdown: s.max_drawdown,
+        sharpe_ratio: s.sharpe_ratio,
+        total_trades: s.total_trades,
+        profit_factor: s.profit_factor,
+        final_equity: s.final_equity,
+        params: s.params,
+      }))
       setRecentReports(arr.slice(0, 10))
     } catch (err) {
-      console.error('Failed to fetch saved reports:', err)
+      console.error('Failed to fetch strategies:', err)
       setRecentReports([])
     } finally {
       setLoadingReports(false)
@@ -249,9 +262,15 @@ export default function HomePage() {
                     <td className="px-4 py-3">
                       <span className="text-xs px-2 py-0.5 rounded border border-gray-500 text-gray-400">BACKTEST</span>
                     </td>
-                    <td className="px-4 py-3 text-gray-300">-</td>
-                    <td className="px-4 py-3 text-gray-300">-</td>
-                    <td className="px-4 py-3 text-red-400">-</td>
+                    <td className="px-4 py-3 text-gray-300">
+                      {(s as any).win_rate != null ? `${((s as any).win_rate as number).toFixed(1)}%` : '-'}
+                    </td>
+                    <td className={`px-4 py-3 ${(s as any).profit_pct != null && (s as any).profit_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {(s as any).profit_pct != null ? `${(s as any).profit_pct >= 0 ? '+' : ''}${((s as any).profit_pct as number).toFixed(2)}%` : '-'}
+                    </td>
+                    <td className="px-4 py-3 text-red-400">
+                      {(s as any).max_drawdown != null ? `${((s as any).max_drawdown as number).toFixed(2)}%` : '-'}
+                    </td>
                     <td className="px-4 py-3 text-right">
                       <div className="flex items-center justify-end gap-2">
                         <button
