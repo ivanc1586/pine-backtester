@@ -1,7 +1,7 @@
 # =============================================================================
 # optimize.py
 # -----------------------------------------------------------------------------
-# v2.7.4 - 2026-02-28
+# v2.7.5 - 2026-02-28
 #   - GEMINI_SYSTEM_PROMPT: @njit 模板加入嚴格禁令
 #       * FORBIDDEN: dict/list/str 在 @njit 內（numba nopython 不支援）
 #       * trade 資料結構改為純 numpy array（entry/exit price/idx/pnl/side）
@@ -803,45 +803,53 @@ def calc_metrics(result: dict, initial_capital: float) -> dict:
     profit_pct = (final_equity - initial_capital) / initial_capital * 100
 
     # ---------------------------------------------------------------------------
-    # Sharpe ratio — TV-aligned: daily returns from bar-level equity_curve × √252
+    # Sharpe ratio — TV-aligned: daily equity snapshots × √252
     #
-    # TV uses daily equity snapshots, NOT per-trade returns.
-    # Using trade-based returns × √252 massively over-estimates Sharpe for
-    # high-frequency strategies (many trades per day → std underestimated).
+    # Key fix: TV counts EVERY calendar/trading day between first and last trade,
+    # including days with no trades (equity stays flat = 0 daily return).
+    # Skipping no-trade days under-estimates std → over-estimates Sharpe.
     #
     # Approach:
-    #   1. Use the bar-level equity_curve returned by run_strategy (same length as df)
-    #   2. Resample to daily by taking the last bar value each day
-    #      (trades dict carry exit_time strings for resampling)
-    #   3. Compute daily returns → mean/std × √252
+    #   1. Build sparse dict: exit_date → running equity (last trade of that day)
+    #   2. Use pd.date_range to generate every day in the range
+    #   3. Forward-fill missing days (equity unchanged on no-trade days)
+    #   4. daily_returns = diff / prev_equity → mean/std × √252
     # ---------------------------------------------------------------------------
     sharpe = 0.0
-    bar_curve = result.get("equity_curve", [])   # bar-level, same length as df
-    if len(bar_curve) > 2:
-        # Build a per-trade exit_time → equity mapping to resample to daily
-        # Use exit_time strings from trades (format: "YYYY-MM-DD ..." or ISO)
-        # Group by date, take the last equity value seen that day
-        daily_eq: dict[str, float] = {}
-        running_eq = float(initial_capital)
-        for t in trades:
-            exit_date = str(t.get("exit_time", ""))[:10]   # "YYYY-MM-DD"
-            running_eq += t["pnl"]
-            if exit_date:
-                daily_eq[exit_date] = running_eq            # last trade of day wins
+    if len(trades) >= 2:
+        try:
+            # Step 1 — sparse daily equity from trades
+            sparse: dict[str, float] = {}
+            running_eq = float(initial_capital)
+            for t in trades:
+                exit_date = str(t.get("exit_time", ""))[:10]  # "YYYY-MM-DD"
+                running_eq += float(t.get("pnl", 0))
+                if exit_date and len(exit_date) == 10:
+                    sparse[exit_date] = running_eq  # last trade of day wins
 
-        if len(daily_eq) > 2:
-            sorted_vals = [v for _, v in sorted(daily_eq.items())]
-            d_arr = np.array([initial_capital] + sorted_vals, dtype=float)
-            d_rets = np.diff(d_arr) / np.where(d_arr[:-1] == 0, 1, d_arr[:-1])
-            if d_rets.std() > 0:
-                sharpe = float(d_rets.mean() / d_rets.std() * np.sqrt(252))
-        else:
-            # Fallback for strategies with very few trading days
-            d_arr = np.array([initial_capital] + list(daily_eq.values()), dtype=float) \
-                    if daily_eq else eq_arr
-            d_rets = np.diff(d_arr) / np.where(d_arr[:-1] == 0, 1, d_arr[:-1])
-            if len(d_rets) > 0 and d_rets.std() > 0:
-                sharpe = float(d_rets.mean() / d_rets.std() * np.sqrt(252))
+            if len(sparse) >= 2:
+                sorted_dates = sorted(sparse.keys())
+                first_date, last_date = sorted_dates[0], sorted_dates[-1]
+
+                # Step 2 — full date range (every calendar day)
+                date_range = pd.date_range(start=first_date, end=last_date, freq="D")
+                all_dates = [d.strftime("%Y-%m-%d") for d in date_range]
+
+                # Step 3 — forward-fill: carry last known equity on no-trade days
+                filled = []
+                last_val = float(initial_capital)
+                for d in all_dates:
+                    if d in sparse:
+                        last_val = sparse[d]
+                    filled.append(last_val)
+
+                # Step 4 — daily returns → Sharpe
+                d_arr = np.array([float(initial_capital)] + filled, dtype=float)
+                d_rets = np.diff(d_arr) / np.where(d_arr[:-1] == 0, 1, d_arr[:-1])
+                if len(d_rets) > 1 and d_rets.std() > 0:
+                    sharpe = float(d_rets.mean() / d_rets.std() * np.sqrt(252))
+        except Exception:
+            sharpe = 0.0
 
     # Use compact trade-based curve for API response (replaces full bar-level curve)
     equity_curve = trade_equity
@@ -1011,6 +1019,7 @@ async def run_optuna_optimization(
     completed = [0]
     best_value = [None]
     trial_times = []     # 每個 trial 耗時 (秒)
+    seen_params: set = set()   # dedup — 跳過完全相同的參數組合
 
     minimize_metrics = {"max_drawdown"}
     direction = "minimize" if sort_by in minimize_metrics else "maximize"
@@ -1030,6 +1039,15 @@ async def run_optuna_optimization(
             else:
                 val = trial.suggest_float(pr.name, pr.min_val, pr.max_val, step=pr.step if pr.step > 0 else None)
             trial_params[pr.name] = val
+
+        # ── Dedup：相同參數組合已測過，直接跳過（不計入 completed）──────────
+        param_key = frozenset((k, round(v, 8) if isinstance(v, float) else v)
+                              for k, v in trial_params.items())
+        worst_value = float("inf") if direction == "minimize" else float("-inf")
+        if param_key in seen_params:
+            return worst_value
+        seen_params.add(param_key)
+        # ─────────────────────────────────────────────────────────────────────
 
         # 對齊 OptimizeRequest 鍵名：qty_value / commission_value
         trial_params.update({
@@ -1144,13 +1162,16 @@ async def run_optuna_optimization(
         # Todo 5: n_jobs=-1 並行解鎖（共享 float32 numpy 陣列，無 race condition）
         await loop.run_in_executor(None, lambda b=batch: study.optimize(objective, n_trials=b, n_jobs=-1, show_progress_bar=False))
         remaining -= batch
-        progress = min(99, int((completed[0] / n_trials) * 100))
+        # 用 study.trials 總數計算進度，避免 failed/dedup trial 造成 completed[0] 和
+        # batch 脫鉤導致進度跳格或卡在 999
+        actual_done = len(study.trials)
+        progress = min(99, int((actual_done / n_trials) * 100)) if remaining > 0 else 100
 
         best_str = f"，最佳 {sort_by}={best_value[0]:.4f}" if best_value[0] is not None else ""
 
-        log_msg = f"[{progress:3d}%] 已完成 {completed[0]}/{n_trials} 次試驗{best_str}"
+        log_msg = f"[{progress:3d}%] 已完成 {actual_done}/{n_trials} 次試驗{best_str}"
 
-        yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'completed': completed[0], 'total': n_trials})}\n\n"
+        yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'completed': actual_done, 'total': n_trials})}\n\n"
         yield f"data: {json.dumps({'type': 'log', 'message': log_msg})}\n\n"
 
     # Todo 6: JIT 編譯耗時 + 後續平均耗時診斷
