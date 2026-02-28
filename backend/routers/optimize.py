@@ -1318,6 +1318,18 @@ async def get_reports(limit: int = 20):
     return {"reports": result, "count": len(result)}
 
 
+@router.post("/reports")
+async def save_report(report: dict):
+    """手動儲存一筆優化報告到 _saved_reports。"""
+    global _saved_reports
+    import datetime as _dt
+    report["saved_at"] = report.get("saved_at") or _dt.datetime.now().isoformat()
+    _saved_reports.insert(0, report)
+    if len(_saved_reports) > MAX_SAVED_REPORTS:
+        _saved_reports = _saved_reports[:MAX_SAVED_REPORTS]
+    return {"status": "saved", "total": len(_saved_reports)}
+
+
 @router.get("/reports/{index}")
 async def get_report_detail(index: int):
     """取得特定報告的完整資料（含 trades）。"""
