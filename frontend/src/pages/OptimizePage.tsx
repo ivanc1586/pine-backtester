@@ -1,6 +1,11 @@
 // =============================================================================
-// OptimizePage v2.6.0
+// OptimizePage v2.7.0
 // -----------------------------------------------------------------------------
+// v2.7.0 - 2026-02-28
+//   - 新增「策略執行設定」區塊：初始資金、手續費類型/數值、開倉類型/數值 五個輸入框
+//   - /parse 回傳 header 後自動填充上述五個欄位
+//   - runOptimization body 補齊 initial_capital / commission_type / commission_value
+//     / qty_value / qty_type / bypass_cache 欄位，完整對齊後端 OptimizeRequest
 // v2.6.0 - 2026-02-27
 //   - 新增即時日誌窗格（消費 SSE type:'log' 事件，顯示優化進度訊息）
 //   - 新增清除 Pine Script 按鈕（一鍵清空輸入區）
@@ -43,6 +48,14 @@ interface ParamRange {
   default_val: number
 }
 
+interface StrategyHeader {
+  initial_capital?: number
+  commission_type?: string
+  commission_value?: number
+  qty_type?: string
+  qty_value?: number
+}
+
 interface OptimizeResult {
   rank: number
   params: Record<string, number>
@@ -66,6 +79,18 @@ const SORT_OPTIONS = [
   { value: 'max_drawdown',  label: '最低 MDD' },
   { value: 'sharpe_ratio',  label: '最高夏普比率' },
   { value: 'total_trades',  label: '最多交易筆數' },
+]
+
+const COMMISSION_TYPES = [
+  { value: 'percent',           label: '百分比 (%)' },
+  { value: 'cash_per_contract', label: '每口固定金額' },
+  { value: 'cash_per_order',    label: '每單固定金額' },
+]
+
+const QTY_TYPES = [
+  { value: 'percent_of_equity', label: '資金百分比 (%)' },
+  { value: 'cash',              label: '固定金額' },
+  { value: 'fixed',             label: '固定數量' },
 ]
 
 const INTERVALS       = ['1m','5m','15m','30m','1h','4h','1d','1w']
@@ -176,6 +201,14 @@ export default function OptimizePage() {
   const [paramRanges,    setParamRanges]    = useState<ParamRange[]>([])
   const [parseError,     setParseError]     = useState('')
 
+  // ── 策略執行設定（從 /parse header 自動填充）──
+  const [initialCapital,   setInitialCapital]   = useState(10000)
+  const [commissionType,   setCommissionType]   = useState('percent')
+  const [commissionValue,  setCommissionValue]  = useState(0.001)
+  const [qtyType,          setQtyType]          = useState('percent_of_equity')
+  const [qtyValue,         setQtyValue]         = useState(1.0)
+  const [bypassCache,      setBypassCache]      = useState(false)
+
   const [symbol,       setSymbol]      = useState('BTCUSDT')
   const [intervalVal,  setIntervalVal] = useState('1h')
   const [startDate,    setStartDate]   = useState('2023-01-01')
@@ -225,6 +258,14 @@ export default function OptimizePage() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
       setDetectedParams(data.params)
+
+      // ── 自動填充 header 數值到策略執行設定 ──
+      const hdr: StrategyHeader = data.header ?? {}
+      if (hdr.initial_capital  !== undefined) setInitialCapital(hdr.initial_capital)
+      if (hdr.commission_type  !== undefined) setCommissionType(hdr.commission_type)
+      if (hdr.commission_value !== undefined) setCommissionValue(hdr.commission_value)
+      if (hdr.qty_type         !== undefined) setQtyType(hdr.qty_type)
+      if (hdr.qty_value        !== undefined) setQtyValue(hdr.qty_value)
 
       const ranges: ParamRange[] = data.params
         .filter((p: DetectedParam) => p.type === 'int' || p.type === 'float')
@@ -332,9 +373,19 @@ export default function OptimizePage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          pine_script: pineScript,
-          symbol, interval: intervalVal,
-          start_date: startDate, end_date: endDate,
+          pine_script:      pineScript,
+          symbol,
+          interval:         intervalVal,
+          start_date:       startDate,
+          end_date:         endDate,
+          // ── 策略執行設定 ──
+          initial_capital:  initialCapital,
+          commission_type:  commissionType,
+          commission_value: commissionValue,
+          qty_value:        qtyValue,
+          qty_type:         qtyType,
+          bypass_cache:     bypassCache,
+          // ── 優化設定 ──
           param_ranges: enabledRanges.map(p => ({
             name: p.name, min_val: p.min_val, max_val: p.max_val,
             step: p.step, is_int: p.is_int,
@@ -463,6 +514,81 @@ export default function OptimizePage() {
                 <AlertCircle size={13} /> {parseError}
               </div>
             )}
+          </div>
+        </div>
+
+        {/* ── 策略執行設定（初始資金 / 手續費 / 開倉）────────────────── */}
+        <div style={{ background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 8, padding: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+            <Settings2 size={14} color="#26a69a" />
+            <span style={{ fontWeight: 700, fontSize: 13 }}>策略執行設定</span>
+            <span style={{ fontSize: 11, color: '#848e9c' }}>貼入策略後自動從 strategy() 填入</span>
+            {/* bypass_cache 勾選框 */}
+            <div
+              style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}
+              onClick={() => setBypassCache(v => !v)}
+            >
+              <div style={{
+                width: 14, height: 14, borderRadius: 3, flexShrink: 0,
+                border: `1px solid ${bypassCache ? '#f0b90b' : '#555'}`,
+                background: bypassCache ? '#f0b90b' : 'transparent',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}>
+                {bypassCache && <span style={{ fontSize: 9, fontWeight: 900, color: '#000', lineHeight: 1 }}>✓</span>}
+              </div>
+              <span style={{ fontSize: 11, color: '#848e9c' }}>強制重新轉譯</span>
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginBottom: 12 }}>
+            {/* 初始資金 */}
+            <div>
+              <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>初始資金 (USDT)</div>
+              <input
+                type="number" value={initialCapital} min={100} step={100}
+                onChange={e => setInitialCapital(Number(e.target.value))}
+                style={inputStyle}
+              />
+            </div>
+            {/* 手續費類型 */}
+            <div>
+              <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>手續費類型</div>
+              <select value={commissionType} onChange={e => setCommissionType(e.target.value)} style={selectStyle}>
+                {COMMISSION_TYPES.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
+            </div>
+            {/* 手續費數值 */}
+            <div>
+              <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>
+                手續費數值 {commissionType === 'percent' ? '(0.001 = 0.1%)' : '(固定金額)'}
+              </div>
+              <input
+                type="number" value={commissionValue} min={0} step={0.0001}
+                onChange={e => setCommissionValue(Number(e.target.value))}
+                style={inputStyle}
+              />
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12 }}>
+            {/* 開倉類型 */}
+            <div>
+              <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>開倉類型</div>
+              <select value={qtyType} onChange={e => setQtyType(e.target.value)} style={selectStyle}>
+                {QTY_TYPES.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
+            </div>
+            {/* 開倉數值 */}
+            <div>
+              <div style={{ fontSize: 10, color: '#848e9c', marginBottom: 4 }}>
+                開倉數值 {qtyType === 'percent_of_equity' ? '(% of equity)' : qtyType === 'cash' ? '(USDT)' : '(contracts)'}
+              </div>
+              <input
+                type="number" value={qtyValue} min={0.01} step={qtyType === 'percent_of_equity' ? 1 : 0.01}
+                onChange={e => setQtyValue(Number(e.target.value))}
+                style={inputStyle}
+              />
+            </div>
           </div>
         </div>
 
