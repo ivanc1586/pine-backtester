@@ -1,7 +1,7 @@
 # =============================================================================
 # optimize.py
 # -----------------------------------------------------------------------------
-# v2.7.1 - 2026-02-28
+# v2.7.2 - 2026-02-28
 #   - OptimizeRequest: quantity -> qty_value (對齊 parse_strategy_header 輸出)
 #   - run_optuna_optimization: 加入 commission_value 參數全鏈路傳遞
 #   - objective: trial_params 鍵名全面對齊 (qty_value / commission_value)
@@ -729,24 +729,30 @@ def calc_metrics(result: dict, initial_capital: float) -> dict:
     gross_loss = abs(sum(losses)) if losses else 1e-9
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0.0
 
-    if equity_curve:
-        eq = np.array(equity_curve, dtype=float)
-        peak = np.maximum.accumulate(eq)
-        dd = (peak - eq) / np.where(peak == 0, 1, peak) * 100
-        max_drawdown = float(dd.max())
-        final_equity = float(equity_curve[-1])
-    else:
-        max_drawdown = 0.0
-        final_equity = initial_capital + sum(pnls)
+    # Build trade-based equity curve: initial_capital + cumulative PnL after each trade exit
+    # N+1 points (start + one per trade) — compact and clean for charting
+    trade_equity = [initial_capital]
+    running = initial_capital
+    for t in trades:
+        running += t["pnl"]
+        trade_equity.append(round(running, 2))
+
+    eq_arr = np.array(trade_equity, dtype=float)
+    peak = np.maximum.accumulate(eq_arr)
+    dd = (peak - eq_arr) / np.where(peak == 0, 1, peak) * 100
+    max_drawdown = float(dd.max())
+    final_equity = trade_equity[-1]
 
     profit_pct = (final_equity - initial_capital) / initial_capital * 100
 
     sharpe = 0.0
-    if len(equity_curve) > 1:
-        eq = np.array(equity_curve, dtype=float)
-        rets = np.diff(eq) / np.where(eq[:-1] == 0, 1, eq[:-1])
+    if len(trade_equity) > 2:
+        rets = np.diff(eq_arr) / np.where(eq_arr[:-1] == 0, 1, eq_arr[:-1])
         if rets.std() > 0:
             sharpe = float(rets.mean() / rets.std() * np.sqrt(252))
+
+    # Use compact trade-based curve for API response (replaces full bar-level curve)
+    equity_curve = trade_equity
 
     monthly = {}
     for t in trades:
