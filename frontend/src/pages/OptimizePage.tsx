@@ -500,6 +500,26 @@ export default function OptimizePage() {
               setResults(data.results); setProgress(100)
               setProgressText(`優化完成！共 ${data.results.length} 個最佳組合`)
               setLogs(prev => [...prev, `✅ 優化完成，回傳 ${data.results.length} 個最佳組合`])
+              // ── 儲存前三名結果到後端 ──
+              const topResults: OptimizeResult[] = (data.results as OptimizeResult[]).slice(0, 3)
+              for (const result of topResults) {
+                try {
+                  await fetch(`${API_BASE}/api/optimize/reports`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      ...result,
+                      symbol,
+                      market_type: marketType,
+                      interval: intervalVal,
+                      start_date: startDate,
+                      end_date: endDate,
+                      strategy_name: `${symbol} ${intervalVal}`,
+                    }),
+                  })
+                } catch (_) { /* 儲存失敗不影響主流程 */ }
+              }
+              setLogs(prev => [...prev, `💾 已儲存前 ${topResults.length} 名結果`])
             } else if (data.type === 'error') {
               throw new Error(data.message)
             }
@@ -517,32 +537,53 @@ export default function OptimizePage() {
   // ---------------------------------------------------------------------------
   // Copy optimized code
   // ---------------------------------------------------------------------------
-  const getOptimizedCode = useCallback(() => {
-    if (!selectedResult) return ''
-    let code = pineScript
-    Object.entries(selectedResult.params).forEach(([name, val]) => {
-      const pattern = new RegExp(`(${name}\\s*=\\s*input\\.(int|float)\\s*\\()[^)]*\\)`, 'g')
-      code = code.replace(pattern, (match: string) =>
-        match.replace(/defval\s*=\s*[\d.]+/, `defval = ${val}`)
-      )
+  // ---------------------------------------------------------------------------
+  // 替換 Pine Script 中某個參數的 defval 值
+  // 支援格式：
+  //   name = input.int(9, ...)
+  //   name = input.int(defval=9, ...)
+  //   name=input.float(defval = 9.5, title="xxx")
+  // ---------------------------------------------------------------------------
+  const applyParamsToScript = useCallback((script: string, params: Record<string, number>): string => {
+    let code = script
+    Object.entries(params).forEach(([name, val]) => {
+      // 逐行替換，避免跨行 regex 問題
+      code = code.split('\n').map(line => {
+        // 這行是否包含 name = input.int/float(
+        const linePattern = new RegExp(
+          `^(\\s*${name}\\s*=\\s*input\\.(?:int|float)\\s*\\()(.*)$`
+        )
+        const m = line.match(linePattern)
+        if (!m) return line
+        const prefix = m[1]   // e.g. "fastLength = input.int("
+        let args = m[2]       // e.g. "9, title=\"Fast EMA\", minval=2, maxval=50)"
+
+        // 如果有 defval=xxx，直接替換
+        if (/defval\s*=\s*[\d.]+/.test(args)) {
+          args = args.replace(/defval\s*=\s*[\d.]+/, `defval=${val}`)
+        } else {
+          // 否則第一個純數字參數（positional defval）替換
+          args = args.replace(/^(\s*)[\d.]+/, `$1${val}`)
+        }
+        return prefix + args
+      }).join('\n')
     })
     return code
-  }, [selectedResult, pineScript])
+  }, [])
+
+  const getOptimizedCode = useCallback(() => {
+    if (!selectedResult) return ''
+    return applyParamsToScript(pineScript, selectedResult.params)
+  }, [selectedResult, pineScript, applyParamsToScript])
 
   const copyOptimizedCode = useCallback(() => {
     if (!selectedResult) return
-    let code = pineScript
-    Object.entries(selectedResult.params).forEach(([name, val]) => {
-      const pattern = new RegExp(`(${name}\\s*=\\s*input\\.(?:int|float)\\s*\\()[^)]*\\)`, 'g')
-      code = code.replace(pattern, (match) =>
-        match.replace(/defval\s*=\s*[\d.]+/, `defval = ${val}`)
-      )
-    })
+    const code = applyParamsToScript(pineScript, selectedResult.params)
     navigator.clipboard.writeText(code).then(() => {
       setCopiedCode(true)
       setTimeout(() => setCopiedCode(false), 2500)
     })
-  }, [selectedResult, pineScript])
+  }, [selectedResult, pineScript, applyParamsToScript])
 
   // ---------------------------------------------------------------------------
   // Render
