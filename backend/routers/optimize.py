@@ -1,7 +1,7 @@
 # =============================================================================
 # optimize.py
 # -----------------------------------------------------------------------------
-# v2.7.5 - 2026-02-28
+# v2.7.6 - 2026-02-28
 #   - GEMINI_SYSTEM_PROMPT: @njit 模板加入嚴格禁令
 #       * FORBIDDEN: dict/list/str 在 @njit 內（numba nopython 不支援）
 #       * trade 資料結構改為純 numpy array（entry/exit price/idx/pnl/side）
@@ -1018,8 +1018,9 @@ async def run_optuna_optimization(
 
     completed = [0]
     best_value = [None]
-    trial_times = []     # 每個 trial 耗時 (秒)
-    seen_params: set = set()   # dedup — 跳過完全相同的參數組合
+    trial_times = []          # 每個 trial 耗時 (秒)
+    seen_params: set = set()  # dedup — 跳過完全相同的參數組合
+    _fallback_compiled = [False]  # numba fallback 只編譯一次
 
     minimize_metrics = {"max_drawdown"}
     direction = "minimize" if sort_by in minimize_metrics else "maximize"
@@ -1075,26 +1076,34 @@ async def run_optuna_optimization(
             if not is_numba_error and "nopython" in str(e).lower():
                 is_numba_error = True
 
-            if is_numba_error and trial.number <= 1:
-                # 只在前兩個 trial 觸發時做一次 fallback，避免重複日誌
-                logger.warning(
-                    f"Trial #{trial.number}: numba TypingError 偵測到，"
-                    f"清除 translate cache 並切換至 pure-Python fallback strategy"
-                )
-                # 清除 Gemini 翻譯 cache，讓後續翻譯重新生成
-                if pine_script:
-                    key = _script_hash(pine_script)
-                    _translate_cache.pop(key, None)
-                # 用 fallback strategy 重建 run_fn（閉包更新）
-                fallback_code = _get_fallback_strategy()
-                fb_ns = {"pd": pd, "np": np}
+            if is_numba_error:
+                # numba TypingError = Gemini 生成的 @njit 代碼有問題 (dict/str 等)
+                # 首次觸發：記錄 warning，清除 translate cache，編譯 fallback
+                # 後續 trial：run_fn 已被替換為 fallback，直接重用
+                if not _fallback_compiled[0]:
+                    logger.warning(
+                        f"Trial #{trial.number}: numba TypingError 偵測到，"
+                        f"切換至 pure-Python fallback strategy（後續試驗均使用 fallback）"
+                    )
+                    if pine_script:
+                        key = _script_hash(pine_script)
+                        _translate_cache.pop(key, None)
+                    fallback_code = _get_fallback_strategy()
+                    fb_ns = {"pd": pd, "np": np}
+                    try:
+                        exec(compile(fallback_code, "<fallback>", "exec"), fb_ns)
+                        run_fn = fb_ns["run_strategy"]
+                        _fallback_compiled[0] = True
+                    except Exception as fb_compile_e:
+                        logger.error(f"Fallback compile failed: {fb_compile_e}")
+                        gc.collect()
+                        return float("inf") if direction == "minimize" else float("-inf")
+                # run_fn 已是 fallback（首次編譯後 nonlocal 更新），直接執行
                 try:
-                    exec(compile(fallback_code, "<fallback>", "exec"), fb_ns)
-                    run_fn = fb_ns["run_strategy"]
                     raw = run_fn(shared_df, **trial_params)
                     metrics = calc_metrics(raw, initial_capital)
                 except Exception as fb_e:
-                    logger.warning(f"Trial #{trial.number} fallback also failed: {fb_e}")
+                    logger.warning(f"Trial #{trial.number} fallback exec failed: {fb_e}")
                     gc.collect()
                     return float("inf") if direction == "minimize" else float("-inf")
             else:
