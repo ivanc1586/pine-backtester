@@ -500,26 +500,41 @@ export default function OptimizePage() {
               setResults(data.results); setProgress(100)
               setProgressText(`優化完成！共 ${data.results.length} 個最佳組合`)
               setLogs(prev => [...prev, `✅ 優化完成，回傳 ${data.results.length} 個最佳組合`])
-              // ── 儲存前三名結果到後端 ──
-              const topResults: OptimizeResult[] = (data.results as OptimizeResult[]).slice(0, 3)
-              for (const result of topResults) {
+              // ── 自動儲存第一名到策略總覽 ──
+              const best: OptimizeResult | undefined = (data.results as OptimizeResult[])[0]
+              if (best) {
                 try {
-                  await fetch(`${API_BASE}/api/optimize/reports`, {
+                  await fetch(`${API_BASE}/api/strategies`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                      ...result,
+                      name: `${symbol} ${intervalVal}`,
+                      description: `自動儲存｜回測 ${startDate} ~ ${endDate}`,
+                      pine_script: applyParamsToScript(pineScript, best.params),
                       symbol,
                       market_type: marketType,
                       interval: intervalVal,
                       start_date: startDate,
                       end_date: endDate,
-                      strategy_name: `${symbol} ${intervalVal}`,
+                      profit_pct: best.profit_pct,
+                      win_rate: best.win_rate,
+                      max_drawdown: best.max_drawdown,
+                      sharpe_ratio: best.sharpe_ratio,
+                      profit_factor: best.profit_factor,
+                      total_trades: best.total_trades,
+                      final_equity: best.final_equity,
+                      gross_profit: best.gross_profit,
+                      gross_loss: best.gross_loss,
+                      params: best.params,
+                      equity_curve: best.equity_curve,
+                      monthly_pnl: best.monthly_pnl,
+                      trades: best.trades ?? [],
+                      rank: 1,
                     }),
                   })
+                  setLogs(prev => [...prev, `💾 第一名已自動儲存到策略總覽`])
                 } catch (_) { /* 儲存失敗不影響主流程 */ }
               }
-              setLogs(prev => [...prev, `💾 已儲存前 ${topResults.length} 名結果`])
             } else if (data.type === 'error') {
               throw new Error(data.message)
             }
@@ -981,6 +996,10 @@ export default function OptimizePage() {
             </div>
           </div>
         )}
+              </table>
+            </div>
+          </div>
+        )}
 
         {/* ── Selected Result Detail ───────────────────────────────────── */}
         {selectedResult && (
@@ -1109,16 +1128,42 @@ export default function OptimizePage() {
                   {copiedCode ? '已複製到剪貼簿！' : '複製優化後的 Pine Script'}
                 </button>
                 <button
-                  onClick={() => {
-                    const code = getOptimizedCode()
-                    if (!code) return
-                    const blob = new Blob([code], { type: 'text/plain' })
-                    const url = URL.createObjectURL(blob)
-                    const a = document.createElement('a')
-                    a.href = url
-                    a.download = `optimized_rank${selectedResult.rank}.pine`
-                    a.click()
-                    URL.revokeObjectURL(url)
+                  onClick={async () => {
+                    if (!selectedResult) return
+                    try {
+                      await fetch(`${API_BASE}/api/strategies`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          name: `${symbol} ${intervalVal} #${selectedResult.rank}`,
+                          description: `手動儲存｜回測 ${startDate} ~ ${endDate}`,
+                          pine_script: getOptimizedCode(),
+                          symbol,
+                          market_type: marketType,
+                          interval: intervalVal,
+                          start_date: startDate,
+                          end_date: endDate,
+                          profit_pct: selectedResult.profit_pct,
+                          win_rate: selectedResult.win_rate,
+                          max_drawdown: selectedResult.max_drawdown,
+                          sharpe_ratio: selectedResult.sharpe_ratio,
+                          profit_factor: selectedResult.profit_factor,
+                          total_trades: selectedResult.total_trades,
+                          final_equity: selectedResult.final_equity,
+                          gross_profit: selectedResult.gross_profit,
+                          gross_loss: selectedResult.gross_loss,
+                          params: selectedResult.params,
+                          equity_curve: selectedResult.equity_curve,
+                          monthly_pnl: selectedResult.monthly_pnl,
+                          trades: selectedResult.trades ?? [],
+                          rank: selectedResult.rank,
+                        }),
+                      })
+                      alert(`✅ 第 ${selectedResult.rank} 名策略已儲存到策略總覽！`)
+                      setShowExportModal(false)
+                    } catch (e) {
+                      alert('❌ 儲存失敗，請稍後再試')
+                    }
                   }}
                   style={{
                     display: 'flex', alignItems: 'center', gap: 6,
@@ -1127,7 +1172,7 @@ export default function OptimizePage() {
                     color: '#26a69a', fontSize: 13, cursor: 'pointer', fontWeight: 600,
                   }}
                 >
-                  匯出 .pine
+                  儲存到策略總覽
                 </button>
               </div>
 
