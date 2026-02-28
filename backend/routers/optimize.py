@@ -1,3 +1,19 @@
+# =============================================================================
+# optimize.py
+# -----------------------------------------------------------------------------
+# v2.7.0 - 2026-02-28
+#   - OptimizeRequest: quantity -> qty_value (對齊 parse_strategy_header 輸出)
+#   - run_optuna_optimization: 加入 commission_value 參數全鏈路傳遞
+#   - objective: trial_params 鍵名全面對齊 (qty_value / commission_value)
+#   - _sys_keys: 更新過濾集合，移除 quantity，加入 commission_value / qty_value
+#   - shared_df: 改為拆解獨立 ndarray (open/high/low/close/volume)，避免多執行緒物件污染
+#   - GEMINI_SYSTEM_PROMPT: 修正 qty_value 鍵名、強制動態複利 (每筆用 current equity)
+#                           新增 @njit 核心迴圈模板，含 commission_type_id / qty_type_id
+#                           新增 equity_curve mark-to-market 規範
+#   - fallback strategy: commission / qty 改用 commission_value / qty_value
+#   - 啟動診斷日誌: 輸出 Capital / Qty / commission_value / commission_type
+# =============================================================================
+
 import re
 import gc
 import json
@@ -56,7 +72,7 @@ class OptimizeRequest(BaseModel):
     commission: float = 0.001
     commission_type: str = "percent"          # percent | cash_per_contract | cash_per_order
     commission_value: float = 0.001           # 0.001 = 0.1% for percent type
-    quantity: float = 1.0
+    qty_value: float = 1.0                    # renamed from quantity — aligns with parse_strategy_header output
     qty_type: str = "percent_of_equity"       # percent_of_equity | fixed | cash
     param_ranges: list[ParamRange]
     sort_by: str = "profit_pct"
@@ -300,16 +316,19 @@ Convert the Pine Script strategy to a Python function with these STRICT rules:
    the translation is INVALID and will be rejected. Every. Single. Parameter. Must use params.get().
 
 4. TV-ALIGNED ACCOUNTING RULES (must match TradingView strategy engine exactly):
-   a) Read execution context from params:
+   a) Read execution context from params — use EXACTLY these key names:
       initial_capital  = float(params.get('initial_capital', 10000.0))
-      commission       = float(params.get('commission', 0.001))
+      commission_value = float(params.get('commission_value', 0.001))
       commission_type  = str(params.get('commission_type', 'percent'))
       qty_type         = str(params.get('qty_type', 'percent_of_equity'))
-      qty_value        = float(params.get('quantity', 1.0))
+      qty_value        = float(params.get('qty_value', 1.0))
+      equity           = initial_capital   # mutable, updated after every trade
 
-   b) Position sizing — MUST follow TV formula:
+   b) Position sizing — DYNAMIC COMPOUNDING (IRON LAW):
+      Recalculate units at the moment of EACH entry using the CURRENT equity value.
+      NEVER use initial_capital for sizing after the first trade.
       if qty_type == 'percent_of_equity':
-          units = (current_equity * qty_value / 100.0) / entry_price
+          units = (equity * qty_value / 100.0) / entry_price   # equity = current value, NOT initial
       elif qty_type == 'cash':
           units = qty_value / entry_price
       else:  # 'fixed'
@@ -317,14 +336,18 @@ Convert the Pine Script strategy to a Python function with these STRICT rules:
 
    c) Commission deduction — apply on BOTH entry AND exit:
       if commission_type == 'percent':
-          comm = units * price * commission
+          comm = units * price * commission_value
       else:  # cash_per_contract or cash_per_order
-          comm = commission
-      Deduct comm from equity on entry; deduct again on exit.
+          comm = commission_value
+      equity -= comm   # deduct on entry
+      # on exit: equity += gross_pnl - comm_exit
 
    d) equity_curve MUST be List[float] — a plain Python list of float values,
       one value per bar, representing total portfolio value (cash + open position mark-to-market).
+      While in a position: equity_curve[i] = equity + units * (close_arr[i] - entry_price)
+      While flat: equity_curve[i] = equity
       FORBIDDEN: returning dicts, DataFrames, or any non-float items in equity_curve.
+
 5. NEVER use future data: ta.highest/lowest MUST use .shift(1) before rolling
 6. SMMA: first value = SMA, then smma = (smma_prev*(length-1) + close) / length
 7. ATR: Wilder smoothing (same formula as SMMA), NOT simple EMA
@@ -353,6 +376,71 @@ PERFORMANCE RULES — MANDATORY:
   Then index with close_arr[i], NOT df['close'].iloc[i]
 - Pre-compute ALL indicator arrays as numpy arrays BEFORE the bar loop.
 - The bar loop must only read from pre-computed arrays — no pandas ops inside loop.
+- MANDATORY @njit STRUCTURE: The core bar loop MUST be extracted into a separate
+  @njit function. Example skeleton:
+
+    from numba import njit
+
+    @njit
+    def _core_loop(close_arr, high_arr, low_arr, open_arr,
+                   indicator_arr,   # pass all pre-computed indicator arrays
+                   initial_capital, commission_value, commission_type_id,
+                   qty_type_id, qty_value):
+        # commission_type_id: 0=percent, 1=cash
+        # qty_type_id: 0=percent_of_equity, 1=cash, 2=fixed
+        equity = initial_capital
+        position = 0
+        entry_price = 0.0
+        entry_units = 0.0
+        entry_idx = 0
+        n = len(close_arr)
+        # preallocate result arrays
+        eq_curve   = np.empty(n, dtype=np.float64)
+        trade_entry_price = np.empty(n, dtype=np.float64)
+        trade_exit_price  = np.empty(n, dtype=np.float64)
+        trade_entry_idx   = np.empty(n, dtype=np.int64)
+        trade_exit_idx    = np.empty(n, dtype=np.int64)
+        trade_pnl         = np.empty(n, dtype=np.float64)
+        trade_count = 0
+        for i in range(n):
+            price = close_arr[i]
+            # --- your signal logic here ---
+            # entry:
+            if signal_entry and position == 0:
+                if qty_type_id == 0:   # percent_of_equity
+                    units = (equity * qty_value / 100.0) / price
+                elif qty_type_id == 1: # cash
+                    units = qty_value / price
+                else:                  # fixed
+                    units = qty_value
+                comm = (units * price * commission_value) if commission_type_id == 0 else commission_value
+                equity -= comm
+                position = 1
+                entry_price = price
+                entry_units = units
+                entry_idx = i
+            # exit:
+            elif signal_exit and position == 1:
+                comm = (entry_units * price * commission_value) if commission_type_id == 0 else commission_value
+                gross = entry_units * (price - entry_price)
+                pnl = gross - comm
+                equity += gross - comm
+                trade_entry_price[trade_count] = entry_price
+                trade_exit_price[trade_count]  = price
+                trade_entry_idx[trade_count]   = entry_idx
+                trade_exit_idx[trade_count]    = i
+                trade_pnl[trade_count]         = pnl
+                trade_count += 1
+                position = 0
+            # equity curve (mark-to-market)
+            if position == 1:
+                eq_curve[i] = equity + entry_units * (price - entry_price)
+            else:
+                eq_curve[i] = equity
+        return eq_curve, trade_entry_price, trade_exit_price, trade_entry_idx, trade_exit_idx, trade_pnl, trade_count
+
+  Then call _core_loop() from run_strategy() and convert its outputs to the
+  required trades list and equity_curve list.
 
 Technical indicators:
 - SMA(src, n): src.rolling(n).mean()
@@ -409,8 +497,8 @@ def _get_fallback_strategy() -> str:
     return '''def run_strategy(df: pd.DataFrame, **params) -> dict:
     fast = int(params.get("fastLength", params.get("fast_length", 9)))
     slow = int(params.get("slowLength", params.get("slow_length", 21)))
-    qty = float(params.get("quantity", 1.0))
-    commission = float(params.get("commission", 0.001))
+    qty_value = float(params.get("qty_value", 1.0))
+    commission_value = float(params.get("commission_value", 0.001))
     capital = float(params.get("initial_capital", 10000.0))
     qty_type = str(params.get("qty_type", "percent_of_equity"))
     commission_type = str(params.get("commission_type", "percent"))
@@ -439,18 +527,18 @@ def _get_fallback_strategy() -> str:
         ts = str(df.index[i])
 
         if prev_f <= prev_s and curr_f > curr_s and position == 0:
-            # TV-aligned position sizing
+            # TV-aligned position sizing — dynamic compounding (use current equity)
             if qty_type == "percent_of_equity":
-                units = (equity * qty / 100.0) / price
+                units = (equity * qty_value / 100.0) / price
             elif qty_type == "cash":
-                units = qty / price
+                units = qty_value / price
             else:  # fixed
-                units = qty
+                units = qty_value
             # commission deduction
             if commission_type == "percent":
-                comm_cost = units * price * commission
+                comm_cost = units * price * commission_value
             else:
-                comm_cost = commission  # cash_per_contract / cash_per_order
+                comm_cost = commission_value  # cash_per_contract / cash_per_order
             equity -= comm_cost
             position = 1
             entry_price = price
@@ -459,9 +547,9 @@ def _get_fallback_strategy() -> str:
 
         elif prev_f >= prev_s and curr_f < curr_s and position == 1:
             if commission_type == "percent":
-                comm_cost = entry_units * price * commission
+                comm_cost = entry_units * price * commission_value
             else:
-                comm_cost = commission
+                comm_cost = commission_value
             gross = entry_units * (price - entry_price)
             pnl = gross - comm_cost
             equity += gross - comm_cost
@@ -479,9 +567,9 @@ def _get_fallback_strategy() -> str:
         price = close.iloc[-1]
         ts = str(df.index[-1])
         if commission_type == "percent":
-            comm_cost = entry_units * price * commission
+            comm_cost = entry_units * price * commission_value
         else:
-            comm_cost = commission
+            comm_cost = commission_value
         gross = entry_units * (price - entry_price)
         pnl = gross - comm_cost
         equity += pnl
@@ -789,19 +877,23 @@ def execute_strategy(strategy_code: str, df: pd.DataFrame, params: dict) -> dict
 async def run_optuna_optimization(
     run_fn, df: pd.DataFrame,
     param_ranges: list[ParamRange], initial_capital: float,
-    commission: float, commission_type: str,
-    quantity: float, qty_type: str,
+    commission: float, commission_type: str, commission_value: float,
+    qty_value: float, qty_type: str,
     sort_by: str, n_trials: int, top_n: int
 ) -> AsyncGenerator[str, None]:
 
-    # Todo 5: df → float32 numpy 唯讀共享陣列，所有 Trial 共用，不再 copy()
-    shared_df = pd.DataFrame({
-        "open":   df["open"].to_numpy(dtype=np.float32),
-        "high":   df["high"].to_numpy(dtype=np.float32),
-        "low":    df["low"].to_numpy(dtype=np.float32),
-        "close":  df["close"].to_numpy(dtype=np.float32),
-        "volume": df["volume"].to_numpy(dtype=np.float32),
-    }, index=df.index)
+    # 將 df 拆解為獨立 float32 numpy 陣列，避免多執行緒共享同一物件造成潛在污染
+    # 同時重建輕量 DataFrame 供 run_fn 使用（保留 datetime index）
+    _idx = df.index
+    _open   = df["open"].to_numpy(dtype=np.float32)
+    _high   = df["high"].to_numpy(dtype=np.float32)
+    _low    = df["low"].to_numpy(dtype=np.float32)
+    _close  = df["close"].to_numpy(dtype=np.float32)
+    _volume = df["volume"].to_numpy(dtype=np.float32)
+    shared_df = pd.DataFrame(
+        {"open": _open, "high": _high, "low": _low, "close": _close, "volume": _volume},
+        index=_idx
+    )
     n_bars = len(shared_df)
 
     # results_store 只存摘要指標 (OOM 防護)
@@ -831,13 +923,14 @@ async def run_optuna_optimization(
                 val = trial.suggest_float(pr.name, pr.min_val, pr.max_val, step=pr.step if pr.step > 0 else None)
             trial_params[pr.name] = val
 
-        # Todo 6: 正確鍵名 initial_capital/commission/commission_type/qty_type
+        # 對齊 OptimizeRequest 鍵名：qty_value / commission_value
         trial_params.update({
-            "initial_capital": initial_capital,
-            "commission":      commission,
-            "commission_type": commission_type,
-            "quantity":        quantity,
-            "qty_type":        qty_type,
+            "initial_capital":  initial_capital,
+            "commission":       commission,
+            "commission_type":  commission_type,
+            "commission_value": commission_value,
+            "qty_value":        qty_value,
+            "qty_type":         qty_type,
         })
 
         try:
@@ -852,7 +945,7 @@ async def run_optuna_optimization(
         current_val = metrics.get(sort_by, 0.0)
 
         # 摘要資料（不含完整 trades/equity_curve，過濾系統控制鍵）
-        _sys_keys = {"initial_capital", "commission", "commission_type", "quantity", "qty_type"}
+        _sys_keys = {"initial_capital", "commission", "commission_type", "commission_value", "qty_value", "qty_type"}
         summary_entry = {
             "params": {k: v for k, v in trial_params.items() if k not in _sys_keys},
             "total_trades": metrics["total_trades"],
@@ -902,7 +995,7 @@ async def run_optuna_optimization(
     chunk_size = 10
     remaining = n_trials
 
-    yield f"data: {json.dumps({'type': 'log', 'message': f'開始優化：{n_trials} 次試驗，目標 {sort_by}，K 線：{n_bars} 根，n_jobs=-1'})}\n\n"
+    yield f"data: {json.dumps({'type': 'log', 'message': f'接收標頭：Capital={initial_capital}, Qty={qty_value}% ({qty_type}), Commission={commission_value} ({commission_type})｜K 線：{n_bars} 根｜試驗：{n_trials} 次'})}\n\n"
 
     while remaining > 0:
         batch = min(chunk_size, remaining)
@@ -1005,7 +1098,8 @@ async def run_optimization(req: OptimizeRequest):
                 run_fn=run_fn, df=df,
                 param_ranges=req.param_ranges, initial_capital=req.initial_capital,
                 commission=req.commission, commission_type=req.commission_type,
-                quantity=req.quantity, qty_type=req.qty_type,
+                commission_value=req.commission_value,
+                qty_value=req.qty_value, qty_type=req.qty_type,
                 sort_by=req.sort_by, n_trials=req.n_trials, top_n=req.top_n,
             ):
                 yield chunk
