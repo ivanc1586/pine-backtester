@@ -173,7 +173,9 @@ function EquityCurve({ data, timestamps }: { data: number[]; timestamps?: number
       {yTicks.map(({ v, y }, i) => (
         <g key={i}>
           <line x1={PL} y1={y} x2={W - PR} y2={y} stroke="#2a2a3a" strokeWidth="0.5" />
-          <text x={PL - 4} y={y + 4} textAnchor="end" fontSize="9" fill="#666">{v.toFixed(1)}%</text>
+          <text x={PL - 4} y={y + 4} textAnchor="end" fontSize="9" fill="#666">
+            {v >= 10000 ? `${(v/1000).toFixed(0)}k` : v >= 1000 ? `${(v/1000).toFixed(1)}k` : v.toFixed(0)}
+          </text>
         </g>
       ))}
       {/* 0% reference line */}
@@ -980,7 +982,12 @@ export default function OptimizePage() {
               </div>
             </div>
 
-            <MonthlyBarChart data={selectedResult.monthly_pnl} />
+            <div>
+              <div style={{ fontSize: 11, color: '#848e9c', marginBottom: 8, fontWeight: 600 }}>每月績效</div>
+              <div style={{ background: '#131722', borderRadius: 6, border: '1px solid #2b2b43', padding: '8px 4px', overflow: 'hidden' }}>
+                <MonthlyBarChart data={selectedResult.monthly_pnl} initialCapital={initialCapital} />
+              </div>
+            </div>
 
             <div>
               <div style={{ fontSize: 11, color: '#848e9c', marginBottom: 8, fontWeight: 600 }}>最佳參數值</div>
@@ -1000,6 +1007,105 @@ export default function OptimizePage() {
           </div>
         )}
       </div>
+
+      {/* ── Export Modal ──────────────────────────────────────────────── */}
+      {showExportModal && selectedResult && (
+        <div
+          style={{ position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(0,0,0,0.75)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}
+          onClick={() => setShowExportModal(false)}
+        >
+          <div
+            style={{ background: '#1e222d', border: '1px solid #2b2b43', borderRadius: 10, width: '100%', maxWidth: 600, maxHeight: '80vh', overflow: 'auto' }}
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 18px', borderBottom: '1px solid #2b2b43' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Copy size={14} color="#f0b90b" />
+                <span style={{ fontWeight: 700, fontSize: 14, color: '#d1d4dc' }}>複製優化代碼</span>
+              </div>
+              <button onClick={() => setShowExportModal(false)} style={{ background: 'none', border: 'none', color: '#848e9c', cursor: 'pointer', fontSize: 18, lineHeight: 1 }}>✕</button>
+            </div>
+
+            <div style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 14 }}>
+              {/* 最佳參數 */}
+              <div>
+                <div style={{ fontSize: 11, color: '#848e9c', marginBottom: 8, fontWeight: 600 }}>第 {selectedResult.rank} 名最佳參數</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {Object.entries(selectedResult.params).filter(([k]) => !k.startsWith('_')).map(([k, v]) => (
+                    <div key={k} style={{ padding: '4px 10px', background: 'rgba(240,185,11,0.1)', border: '1px solid rgba(240,185,11,0.25)', borderRadius: 4 }}>
+                      <span style={{ fontSize: 11, color: '#848e9c' }}>{k}: </span>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: '#f0b90b' }}>
+                        {typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(4)) : String(v)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* 績效摘要 */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6 }}>
+                <MetricBadge label="總盈利" value={`${selectedResult.profit_pct >= 0 ? '+' : ''}${selectedResult.profit_pct.toFixed(2)}%`} highlight={selectedResult.profit_pct > 0} />
+                <MetricBadge label="MDD" value={`${selectedResult.max_drawdown.toFixed(2)}%`} />
+                <MetricBadge label="勝率" value={`${selectedResult.win_rate.toFixed(1)}%`} highlight={selectedResult.win_rate > 50} />
+                <MetricBadge label="夏普" value={selectedResult.sharpe_ratio.toFixed(2)} highlight={selectedResult.sharpe_ratio > 1} />
+              </div>
+
+              {/* 操作按鈕 */}
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  onClick={copyOptimizedCode}
+                  style={{
+                    flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+                    padding: '8px 16px', borderRadius: 4,
+                    background: copiedCode ? 'rgba(38,166,154,0.15)' : 'rgba(240,185,11,0.1)',
+                    border: `1px solid ${copiedCode ? 'rgba(38,166,154,0.3)' : 'rgba(240,185,11,0.3)'}`,
+                    color: copiedCode ? '#26a69a' : '#f0b90b',
+                    fontSize: 13, cursor: 'pointer', fontWeight: 600,
+                  }}
+                >
+                  {copiedCode ? <Check size={14} /> : <Copy size={14} />}
+                  {copiedCode ? '已複製到剪貼簿！' : '複製優化後的 Pine Script'}
+                </button>
+                <button
+                  onClick={() => {
+                    const code = getOptimizedCode()
+                    if (!code) return
+                    const blob = new Blob([code], { type: 'text/plain' })
+                    const url = URL.createObjectURL(blob)
+                    const a = document.createElement('a')
+                    a.href = url
+                    a.download = `optimized_rank${selectedResult.rank}.pine`
+                    a.click()
+                    URL.revokeObjectURL(url)
+                  }}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 6,
+                    padding: '8px 14px', borderRadius: 4,
+                    background: 'rgba(38,166,154,0.1)', border: '1px solid rgba(38,166,154,0.3)',
+                    color: '#26a69a', fontSize: 13, cursor: 'pointer', fontWeight: 600,
+                  }}
+                >
+                  匯出 .pine
+                </button>
+              </div>
+
+              {/* 代碼預覽 */}
+              <div>
+                <div style={{ fontSize: 11, color: '#848e9c', marginBottom: 6, fontWeight: 600 }}>代碼預覽</div>
+                <pre style={{
+                  background: '#131722', border: '1px solid #2b2b43', borderRadius: 6,
+                  padding: '10px 12px', fontSize: 11, color: '#26a69a',
+                  overflowX: 'auto', maxHeight: 240, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                  fontFamily: 'monospace', lineHeight: 1.5,
+                }}>
+                  {getOptimizedCode() || '（無代碼）'}
+                </pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <style>{`
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
