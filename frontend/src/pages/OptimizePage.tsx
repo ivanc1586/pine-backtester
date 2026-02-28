@@ -527,18 +527,6 @@ export default function OptimizePage() {
     return code
   }, [selectedResult, pineScript])
 
-  const getOptimizedCode = useCallback(() => {
-    if (!selectedResult) return ''
-    let code = pineScript
-    Object.entries(selectedResult.params).forEach(([name, val]) => {
-      const pattern = new RegExp(`(${name}\\s*=\\s*input\\.(int|float)\\s*\\()[^)]*\\)`, 'g')
-      code = code.replace(pattern, (match: string) =>
-        match.replace(/defval\s*=\s*[\d.]+/, `defval = ${val}`)
-      )
-    })
-    return code
-  }, [selectedResult, pineScript])
-
   const copyOptimizedCode = useCallback(() => {
     if (!selectedResult) return
     let code = pineScript
