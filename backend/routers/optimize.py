@@ -1,17 +1,15 @@
 # =============================================================================
 # optimize.py
 # -----------------------------------------------------------------------------
-# v2.7.2 - 2026-02-28
-#   - OptimizeRequest: quantity -> qty_value (對齊 parse_strategy_header 輸出)
-#   - run_optuna_optimization: 加入 commission_value 參數全鏈路傳遞
-#   - objective: trial_params 鍵名全面對齊 (qty_value / commission_value)
-#   - _sys_keys: 更新過濾集合，移除 quantity，加入 commission_value / qty_value
-#   - shared_df: 改為拆解獨立 ndarray (open/high/low/close/volume)，避免多執行緒物件污染
-#   - GEMINI_SYSTEM_PROMPT: 修正 qty_value 鍵名、強制動態複利 (每筆用 current equity)
-#                           新增 @njit 核心迴圈模板，含 commission_type_id / qty_type_id
-#                           新增 equity_curve mark-to-market 規範
-#   - fallback strategy: commission / qty 改用 commission_value / qty_value
-#   - 啟動診斷日誌: 輸出 Capital / Qty / commission_value / commission_type
+# v2.7.3 - 2026-02-28
+#   - GEMINI_SYSTEM_PROMPT: @njit 模板加入嚴格禁令
+#       * FORBIDDEN: dict/list/str 在 @njit 內（numba nopython 不支援）
+#       * trade 資料結構改為純 numpy array（entry/exit price/idx/pnl/side）
+#       * Python 層組裝 trade dicts（在 _core_loop 返回後）
+#       * 加入正確的 run_strategy 組裝範例
+#   - objective: 針對 numba TypingError 加入自動 fallback
+#       * 偵測到 TypingError 時清除 translate cache，改用 fallback strategy 重跑
+#       * 避免 100 個 trial 全部失敗（回傳 0 筆交易）
 # =============================================================================
 
 import re
@@ -387,32 +385,42 @@ PERFORMANCE RULES — MANDATORY:
             def decorator(fn): return fn
             return decorator if args and callable(args[0]) else decorator
 
-  Example skeleton:
+  !!!CRITICAL NUMBA RULES — VIOLATION CAUSES ALL TRIALS TO FAIL!!!
+  The @njit function runs in nopython mode. These types are STRICTLY FORBIDDEN inside @njit:
+    - FORBIDDEN: dict  (e.g. trades.append({"entry_time": ...}))  — numba cannot type dicts
+    - FORBIDDEN: list of dicts  (e.g. trades_list = [])            — numba cannot type list of dicts
+    - FORBIDDEN: str  (e.g. side = "long")                         — numba cannot type Python strings
+    - FORBIDDEN: pandas Series, DataFrame, or any pandas object
+  The @njit function MUST only use: np.ndarray, int, float, bool scalars.
+  Trade data MUST be stored in pre-allocated numpy arrays and assembled into dicts OUTSIDE @njit.
+
+  Correct skeleton — @njit stores raw numbers only, Python layer assembles dicts:
 
     @njit
     def _core_loop(close_arr, high_arr, low_arr, open_arr,
-                   indicator_arr,   # pass all pre-computed indicator arrays
+                   indicator_arr,   # pass all pre-computed indicator arrays as np.ndarray
                    initial_capital, commission_value, commission_type_id,
                    qty_type_id, qty_value):
         # commission_type_id: 0=percent, 1=cash
         # qty_type_id: 0=percent_of_equity, 1=cash, 2=fixed
         equity = initial_capital
-        position = 0
+        position = 0        # 0=flat, 1=long, -1=short  (int, NOT str)
         entry_price = 0.0
         entry_units = 0.0
         entry_idx = 0
         n = len(close_arr)
-        # preallocate result arrays
-        eq_curve   = np.empty(n, dtype=np.float64)
+        # preallocate result arrays — ONLY numpy arrays allowed here
+        eq_curve          = np.empty(n, dtype=np.float64)
         trade_entry_price = np.empty(n, dtype=np.float64)
         trade_exit_price  = np.empty(n, dtype=np.float64)
         trade_entry_idx   = np.empty(n, dtype=np.int64)
         trade_exit_idx    = np.empty(n, dtype=np.int64)
         trade_pnl         = np.empty(n, dtype=np.float64)
+        trade_side        = np.empty(n, dtype=np.int64)   # 1=long, -1=short  (int, NOT str)
         trade_count = 0
         for i in range(n):
             price = close_arr[i]
-            # --- your signal logic here ---
+            # --- your signal logic here (use only numeric comparisons) ---
             # entry:
             if signal_entry and position == 0:
                 if qty_type_id == 0:   # percent_of_equity
@@ -428,9 +436,9 @@ PERFORMANCE RULES — MANDATORY:
                 entry_units = units
                 entry_idx = i
             # exit:
-            elif signal_exit and position == 1:
+            elif signal_exit and position != 0:
                 comm = (entry_units * price * commission_value) if commission_type_id == 0 else commission_value
-                gross = entry_units * (price - entry_price)
+                gross = entry_units * (price - entry_price) * position  # *position handles short
                 pnl = gross - comm
                 equity += gross - comm
                 trade_entry_price[trade_count] = entry_price
@@ -438,17 +446,48 @@ PERFORMANCE RULES — MANDATORY:
                 trade_entry_idx[trade_count]   = entry_idx
                 trade_exit_idx[trade_count]    = i
                 trade_pnl[trade_count]         = pnl
+                trade_side[trade_count]        = position   # 1 or -1, converted to "long"/"short" in Python
                 trade_count += 1
                 position = 0
             # equity curve (mark-to-market)
-            if position == 1:
-                eq_curve[i] = equity + entry_units * (price - entry_price)
+            if position != 0:
+                eq_curve[i] = equity + entry_units * (price - entry_price) * position
             else:
                 eq_curve[i] = equity
-        return eq_curve, trade_entry_price, trade_exit_price, trade_entry_idx, trade_exit_idx, trade_pnl, trade_count
+        return (eq_curve,
+                trade_entry_price, trade_exit_price,
+                trade_entry_idx, trade_exit_idx,
+                trade_pnl, trade_side, trade_count)
 
-  Then call _core_loop() from run_strategy() and convert its outputs to the
-  required trades list and equity_curve list.
+  After calling _core_loop(), assemble trade dicts in Python (NOT inside @njit):
+
+    def run_strategy(df: pd.DataFrame, **params) -> dict:
+        # ... read params, compute indicators as numpy arrays ...
+        commission_type_id = 0 if commission_type == 'percent' else 1
+        qty_type_id = 0 if qty_type == 'percent_of_equity' else (1 if qty_type == 'cash' else 2)
+        (eq_curve,
+         t_ep, t_xp, t_ei, t_xi, t_pnl, t_side, t_count) = _core_loop(
+            close_arr, high_arr, low_arr, open_arr,
+            indicator_arr,
+            initial_capital, commission_value, commission_type_id,
+            qty_type_id, qty_value)
+        times = df.index
+        trades = []
+        for k in range(t_count):
+            ep = float(t_ep[k]); xp = float(t_xp[k])
+            side_str = "long" if t_side[k] == 1 else "short"
+            pnl = float(t_pnl[k])
+            pnl_pct = (xp - ep) / ep * 100.0 * (1 if t_side[k] == 1 else -1)
+            trades.append({
+                "entry_time":  str(times[int(t_ei[k])]),
+                "exit_time":   str(times[int(t_xi[k])]),
+                "entry_price": round(ep, 4),
+                "exit_price":  round(xp, 4),
+                "side":        side_str,
+                "pnl":         round(pnl, 4),
+                "pnl_pct":     round(pnl_pct, 4),
+            })
+        return {"trades": trades, "equity_curve": eq_curve.tolist()}
 
 Technical indicators:
 - SMA(src, n): src.rolling(n).mean()
@@ -893,7 +932,8 @@ async def run_optuna_optimization(
     param_ranges: list[ParamRange], initial_capital: float,
     commission: float, commission_type: str, commission_value: float,
     qty_value: float, qty_type: str,
-    sort_by: str, n_trials: int, top_n: int
+    sort_by: str, n_trials: int, top_n: int,
+    pine_script: str = "",
 ) -> AsyncGenerator[str, None]:
 
     # 將 df 拆解為獨立 float32 numpy 陣列，避免多執行緒共享同一物件造成潛在污染
@@ -948,14 +988,48 @@ async def run_optuna_optimization(
         })
 
         try:
-            # Todo 5: 傳入共享 shared_df，不 copy()
             raw = run_fn(shared_df, **trial_params)
             metrics = calc_metrics(raw, initial_capital)
         except Exception as e:
-            import traceback
-            logger.warning(f"Trial #{trial.number} failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
-            gc.collect()
-            return float("inf") if direction == "minimize" else float("-inf")
+            # numba TypingError: Gemini 生成的 @njit 內用了 dict/str，無法在 nopython 模式執行
+            # → 清除 translate cache，改用 pure-Python fallback strategy 重跑本 trial
+            is_numba_error = "TypingError" in type(e).__name__ or "TypingError" in str(type(e).__mro__)
+            if not is_numba_error:
+                try:
+                    from numba.core.errors import TypingError as _NumbaTypingError
+                    is_numba_error = isinstance(e, _NumbaTypingError)
+                except ImportError:
+                    pass
+            if not is_numba_error and "nopython" in str(e).lower():
+                is_numba_error = True
+
+            if is_numba_error and trial.number <= 1:
+                # 只在前兩個 trial 觸發時做一次 fallback，避免重複日誌
+                logger.warning(
+                    f"Trial #{trial.number}: numba TypingError 偵測到，"
+                    f"清除 translate cache 並切換至 pure-Python fallback strategy"
+                )
+                # 清除 Gemini 翻譯 cache，讓後續翻譯重新生成
+                if pine_script:
+                    key = _script_hash(pine_script)
+                    _translate_cache.pop(key, None)
+                # 用 fallback strategy 重建 run_fn（閉包更新）
+                fallback_code = _get_fallback_strategy()
+                fb_ns = {"pd": pd, "np": np}
+                try:
+                    exec(compile(fallback_code, "<fallback>", "exec"), fb_ns)
+                    nonlocal run_fn
+                    run_fn = fb_ns["run_strategy"]
+                    raw = run_fn(shared_df, **trial_params)
+                    metrics = calc_metrics(raw, initial_capital)
+                except Exception as fb_e:
+                    logger.warning(f"Trial #{trial.number} fallback also failed: {fb_e}")
+                    gc.collect()
+                    return float("inf") if direction == "minimize" else float("-inf")
+            else:
+                logger.debug(f"Trial #{trial.number} failed: {type(e).__name__}: {e}")
+                gc.collect()
+                return float("inf") if direction == "minimize" else float("-inf")
 
         current_val = metrics.get(sort_by, 0.0)
 
@@ -1128,6 +1202,7 @@ async def run_optimization(req: OptimizeRequest):
                 commission_value=req.commission_value,
                 qty_value=req.qty_value, qty_type=req.qty_type,
                 sort_by=req.sort_by, n_trials=req.n_trials, top_n=req.top_n,
+                pine_script=req.pine_script,
             ):
                 yield chunk
         except Exception as e:
