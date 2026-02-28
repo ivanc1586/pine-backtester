@@ -1,10 +1,10 @@
 // HomePage.tsx
-// v1.1.0 - 2026-02-28
-// 首頁：市場概覽（24h走勢 + 點擊跳全頁KLineChart）+ 策略概覽 + 近期優化報告
+// v1.2.0 - 2026-02-28
+// 首頁：市場概覽 + 策略概覽（使用者手動存）+ 最近優化活動（每次優化第一名自動存）
 
 import React, { useEffect, useState, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useStrategyStore, Strategy } from '../store/strategyStore'
+import { useStrategyStore } from '../store/strategyStore'
 import { Edit2, Trash2, Plus } from 'lucide-react'
 
 // ----------------------------------------------------------------------------
@@ -20,27 +20,15 @@ interface MarketTicker {
   loading: boolean
   error?: string
 }
-interface SavedReport {
-  rank?: number
+interface Activity {
+  id?: string
   symbol?: string
-  market_type?: string
   interval?: string
-  start_date?: string
-  end_date?: string
-  strategy_name?: string
   saved_at?: string
   profit_pct?: number
   win_rate?: number
   max_drawdown?: number
-  sharpe_ratio?: number
   total_trades?: number
-  profit_factor?: number
-  final_equity?: number
-  gross_profit?: number
-  gross_loss?: number
-  params?: Record<string, number>
-  monthly_pnl?: Record<string, number>
-  equity_curve?: number[]
 }
 
 // ----------------------------------------------------------------------------
@@ -52,7 +40,7 @@ const MARKET_SYMBOLS = [
   { symbol: 'SOLUSDT', label: 'SOL / USD' },
   { symbol: 'BNBUSDT', label: 'BNB / USD' },
 ]
-const API_BASE = ((import.meta as any).env?.VITE_API_URL ?? '') + '/api/strategies'
+const API_BASE = ((import.meta as any).env?.VITE_API_URL ?? '').replace(/\/$/, '')
 
 // ----------------------------------------------------------------------------
 // Mini spark line chart (24h)
@@ -79,35 +67,26 @@ export default function HomePage() {
   const navigate = useNavigate()
   const { strategies, fetchStrategies, deleteStrategy } = useStrategyStore()
   const [tickers, setTickers] = useState<MarketTicker[]>([])
-  const [recentReports, setRecentReports] = useState<SavedReport[]>([])
-  const [loadingReports, setLoadingReports] = useState(false)
+  const [activities, setActivities] = useState<Activity[]>([])
+  const [loadingActivities, setLoadingActivities] = useState(false)
   const isMountedRef = useRef(false)
 
   // 1) Fetch market tickers in parallel — 24h hourly candles
   const fetchMarketData = useCallback(async () => {
     const init: MarketTicker[] = MARKET_SYMBOLS.map(s => ({
-      ...s,
-      candles: [],
-      latest_price: 0,
-      change_pct: 0,
-      loading: true
+      ...s, candles: [], latest_price: 0, change_pct: 0, loading: true
     }))
     setTickers(init)
     const results = await Promise.allSettled(
       MARKET_SYMBOLS.map(async (s) => {
         try {
-          // 24h走勢：1h K線，取24根
           const url = `https://api.binance.com/api/v3/klines?symbol=${s.symbol}&interval=1h&limit=24`
           const res = await fetch(url)
           if (!res.ok) throw new Error(`HTTP ${res.status}`)
           const data = await res.json()
           const candles: Candle[] = data.map((k: any) => ({
-            t: k[0] / 1000,
-            o: parseFloat(k[1]),
-            h: parseFloat(k[2]),
-            l: parseFloat(k[3]),
-            c: parseFloat(k[4]),
-            v: parseFloat(k[5])
+            t: k[0] / 1000, o: parseFloat(k[1]), h: parseFloat(k[2]),
+            l: parseFloat(k[3]), c: parseFloat(k[4]), v: parseFloat(k[5])
           }))
           const latest = candles[candles.length - 1]?.c ?? 0
           const prev = candles[0]?.o ?? 1
@@ -118,39 +97,25 @@ export default function HomePage() {
         }
       })
     )
-    const tickersData = results.map((r, i) =>
+    setTickers(results.map((r, i) =>
       r.status === 'fulfilled' ? r.value : { ...MARKET_SYMBOLS[i], candles: [], latest_price: 0, change_pct: 0, loading: false, error: 'Failed' }
-    )
-    setTickers(tickersData)
+    ))
   }, [])
 
-  // 2) Fetch strategies (which now carry backtest report fields) from backend
-  const fetchSavedReports = useCallback(async () => {
-    setLoadingReports(true)
+  // 2) 最近優化活動：從 /api/strategies/activities 讀取（每次優化第一名自動存）
+  const fetchActivities = useCallback(async () => {
+    setLoadingActivities(true)
     try {
-      const res = await fetch(API_BASE)
+      const res = await fetch(`${API_BASE}/api/strategies/activities`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      const arr: SavedReport[] = (Array.isArray(data) ? data : data.strategies ?? []).map((s: any) => ({
-        symbol: s.symbol,
-        interval: s.interval,
-        strategy_name: s.name,
-        saved_at: s.created_at ?? s.saved_at,
-        profit_pct: s.profit_pct,
-        win_rate: s.win_rate,
-        max_drawdown: s.max_drawdown,
-        sharpe_ratio: s.sharpe_ratio,
-        total_trades: s.total_trades,
-        profit_factor: s.profit_factor,
-        final_equity: s.final_equity,
-        params: s.params,
-      }))
-      setRecentReports(arr.slice(0, 10))
+      const arr: Activity[] = Array.isArray(data) ? data : data.activities ?? []
+      setActivities(arr.slice(0, 10))
     } catch (err) {
-      console.error('Failed to fetch strategies:', err)
-      setRecentReports([])
+      console.error('Failed to fetch activities:', err)
+      setActivities([])
     } finally {
-      setLoadingReports(false)
+      setLoadingActivities(false)
     }
   }, [])
 
@@ -158,10 +123,10 @@ export default function HomePage() {
     if (!isMountedRef.current) {
       isMountedRef.current = true
       fetchMarketData()
-      fetchSavedReports()
+      fetchActivities()
       fetchStrategies()
     }
-  }, [fetchMarketData, fetchSavedReports, fetchStrategies])
+  }, [fetchMarketData, fetchActivities, fetchStrategies])
 
   // 3) UI helpers
   const formatPrice = (v?: number) => {
@@ -170,10 +135,7 @@ export default function HomePage() {
     if (v >= 1) return `$${v.toFixed(4)}`
     return `$${v.toFixed(6)}`
   }
-  const pctColor = (val?: number) => {
-    if (val == null || isNaN(val)) return 'text-green-400'
-    return val >= 0 ? 'text-green-400' : 'text-red-400'
-  }
+  const pctColor = (val?: number) => (val == null || isNaN(val) || val >= 0) ? 'text-green-400' : 'text-red-400'
   const formatPct = (val?: number) => {
     if (val == null || isNaN(val)) return '+0.00%'
     return `${val >= 0 ? '+' : ''}${val.toFixed(2)}%`
@@ -189,7 +151,6 @@ export default function HomePage() {
           <span className="text-xs px-2 py-0.5 rounded bg-green-500/20 text-green-400 font-medium">+ LIVE</span>
           <a href="/chart" className="ml-auto text-xs text-blue-400 hover:text-blue-300">查看所有市場</a>
         </div>
-
         <div className="grid grid-cols-2 xl:grid-cols-4 gap-4 mb-8">
           {tickers.map(t => {
             const lineColor = t.change_pct >= 0 ? '#10B981' : '#EF4444'
@@ -215,12 +176,12 @@ export default function HomePage() {
         </div>
       </div>
 
-      {/* ── 策略概覽 ── */}
+      {/* ── 策略概覽（使用者手動存的策略）── */}
       <div className="px-6 mb-8">
         <div className="flex items-center gap-3 mb-4">
           <span className="text-base font-semibold text-gray-200">策略概覽</span>
           <button
-            onClick={() => navigate('/strategy')}
+            onClick={() => navigate('/optimize')}
             className="ml-auto flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-yellow-500 hover:bg-yellow-400 text-gray-900 font-semibold transition-colors"
           >
             <Plus className="w-3.5 h-3.5" />
@@ -230,7 +191,7 @@ export default function HomePage() {
 
         {strategies.length === 0 ? (
           <div className="bg-gray-800 rounded-xl p-6 text-center text-gray-400 border border-gray-700">
-            尚無策略。點擊「新增策略」開始建立。
+            尚無策略。執行參數優化後點擊「儲存到策略總覽」來新增。
           </div>
         ) : (
           <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
@@ -238,15 +199,15 @@ export default function HomePage() {
               <thead className="bg-gray-700/50">
                 <tr>
                   <th className="px-4 py-3 text-left text-gray-400 font-medium">策略名稱</th>
-                  <th className="px-4 py-3 text-left text-gray-400 font-medium">狀態</th>
-                  <th className="px-4 py-3 text-left text-gray-400 font-medium">勝率</th>
-                  <th className="px-4 py-3 text-left text-gray-400 font-medium">淨利率</th>
-                  <th className="px-4 py-3 text-left text-gray-400 font-medium">最大回撤</th>
+                  <th className="px-4 py-3 text-left text-gray-400 font-medium">交易對</th>
+                  <th className="px-4 py-3 text-right text-gray-400 font-medium">勝率</th>
+                  <th className="px-4 py-3 text-right text-gray-400 font-medium">淨利率</th>
+                  <th className="px-4 py-3 text-right text-gray-400 font-medium">最大回撤</th>
                   <th className="px-4 py-3 text-right text-gray-400 font-medium">操作</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-700">
-                {strategies.map((s: Strategy) => (
+                {strategies.map((s: any) => (
                   <tr key={s.id} className="hover:bg-gray-700/30 transition-colors">
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2.5">
@@ -259,22 +220,22 @@ export default function HomePage() {
                         </div>
                       </div>
                     </td>
-                    <td className="px-4 py-3">
-                      <span className="text-xs px-2 py-0.5 rounded border border-gray-500 text-gray-400">BACKTEST</span>
+                    <td className="px-4 py-3 text-gray-300 text-xs">
+                      {s.symbol ?? '-'} {s.interval ? `· ${s.interval}` : ''}
                     </td>
-                    <td className="px-4 py-3 text-gray-300">
-                      {(s as any).win_rate != null ? `${((s as any).win_rate as number).toFixed(1)}%` : '-'}
+                    <td className="px-4 py-3 text-right text-gray-300">
+                      {s.win_rate != null ? `${Number(s.win_rate).toFixed(1)}%` : '-'}
                     </td>
-                    <td className={`px-4 py-3 ${(s as any).profit_pct != null && (s as any).profit_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                      {(s as any).profit_pct != null ? `${(s as any).profit_pct >= 0 ? '+' : ''}${((s as any).profit_pct as number).toFixed(2)}%` : '-'}
+                    <td className={`px-4 py-3 text-right ${s.profit_pct != null && s.profit_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {s.profit_pct != null ? `${s.profit_pct >= 0 ? '+' : ''}${Number(s.profit_pct).toFixed(2)}%` : '-'}
                     </td>
-                    <td className="px-4 py-3 text-red-400">
-                      {(s as any).max_drawdown != null ? `${((s as any).max_drawdown as number).toFixed(2)}%` : '-'}
+                    <td className="px-4 py-3 text-right text-red-400">
+                      {s.max_drawdown != null ? `${Number(s.max_drawdown).toFixed(2)}%` : '-'}
                     </td>
                     <td className="px-4 py-3 text-right">
                       <div className="flex items-center justify-end gap-2">
                         <button
-                          onClick={() => navigate('/strategy')}
+                          onClick={() => navigate('/optimize')}
                           className="p-1.5 rounded hover:bg-gray-600 text-gray-400 hover:text-white transition-colors"
                         >
                           <Edit2 className="w-3.5 h-3.5" />
@@ -295,34 +256,37 @@ export default function HomePage() {
         )}
       </div>
 
-      {/* ── 最近優化活動 ── */}
+      {/* ── 最近優化活動（每次優化第一名自動存）── */}
       <div className="px-6 pb-8">
         <div className="flex items-center gap-3 mb-4">
           <span className="text-base font-semibold text-gray-200">最近優化活動</span>
         </div>
 
-        {loadingReports ? (
+        {loadingActivities ? (
           <div className="bg-gray-800 rounded-xl p-6 text-center text-gray-400 border border-gray-700">載入中...</div>
-        ) : recentReports.length === 0 ? (
+        ) : activities.length === 0 ? (
           <div className="bg-gray-800 rounded-xl p-6 text-center text-gray-400 border border-gray-700">
-            尚無優化報告。執行參數優化後會顯示於此。
+            尚無優化記錄。執行參數優化後第一名會自動顯示於此。
           </div>
         ) : (
           <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
-            {recentReports.map((r, idx) => (
-              <div key={idx} className="flex items-center px-4 py-3 border-b border-gray-700 last:border-0 hover:bg-gray-700/30 transition-colors">
+            {activities.map((r, idx) => (
+              <div key={r.id ?? idx} className="flex items-center px-4 py-3 border-b border-gray-700 last:border-0 hover:bg-gray-700/30 transition-colors">
                 <div className="w-7 h-7 rounded-full bg-green-500/20 flex items-center justify-center mr-3 flex-shrink-0">
                   <span className="text-green-400 text-xs">✓</span>
                 </div>
                 <div className="flex-1">
                   <div className="text-sm text-white font-medium">
-                    {r.symbol ?? '-'} · {r.interval ?? '-'} · 完成
+                    {r.symbol ?? '-'} · {r.interval ?? '-'} · 優化完成
                   </div>
                   <div className="text-xs text-gray-400">
                     {r.saved_at ? new Date(r.saved_at).toLocaleDateString('zh-TW') : '-'} · 淨利率{' '}
                     <span className={r.profit_pct != null && r.profit_pct >= 0 ? 'text-green-400' : 'text-red-400'}>
-                      {r.profit_pct != null ? `${r.profit_pct >= 0 ? '+' : ''}${r.profit_pct.toFixed(2)}%` : '-'}
+                      {r.profit_pct != null ? `${r.profit_pct >= 0 ? '+' : ''}${Number(r.profit_pct).toFixed(2)}%` : '-'}
                     </span>
+                    {r.win_rate != null && (
+                      <> · 勝率 <span className="text-gray-300">{Number(r.win_rate).toFixed(1)}%</span></>
+                    )}
                   </div>
                 </div>
                 <button
