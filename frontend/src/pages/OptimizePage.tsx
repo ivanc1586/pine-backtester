@@ -12,7 +12,7 @@
 //   - 後端 Binance 451 修正（api.binance.vision）
 // =============================================================================
 
-import { useState, useRef, useEffect, useCallback } from 'react'
+import React, { useState, useRef, useEffect, useCallback } from 'react'
 import {
   Play, Sparkles, Settings2, Copy, Check,
   TrendingUp, BarChart2, Zap, AlertCircle, RefreshCw, Target, X, Terminal
