@@ -1,13 +1,8 @@
 # =============================================================================
 # strategy.py  v3.0.0 - 2026-02-28
 # -----------------------------------------------------------------------------
-# /api/strategies  — 策略總覽 + 優化活動 CRUD（in-memory）
-#
-#   GET  /api/strategies              — 策略概覽（type="strategy"，使用者手動存）
-#   GET  /api/strategies/activities   — 最近優化活動（type="activity"，每次優化第一名自動存）
-#   POST /api/strategies              — 新增（body 帶 type 欄位區分）
-#   PUT  /api/strategies/{id}         — 更新名稱/描述
-#   DELETE /api/strategies/{id}       — 刪除
+# /api/strategies              — 策略概覽（type="strategy"，使用者手動存）
+# /api/strategies/activities   — 最近優化活動（type="activity"，每次優化第一名自動存）
 # =============================================================================
 
 from fastapi import APIRouter, HTTPException
@@ -22,7 +17,7 @@ _strategies: list[dict] = []
 MAX_STRATEGIES = 200
 
 class StrategySaveRequest(BaseModel):
-    type: str = "strategy"          # "strategy" = 使用者手動存；"activity" = 優化第一名自動存
+    type: str = "strategy"
     name: str
     description: str = ""
     pine_script: str = ""
@@ -52,13 +47,11 @@ class StrategyUpdateRequest(BaseModel):
 
 @router.get("/activities")
 async def list_activities():
-    """最近優化活動（type='activity'）。"""
     activities = [s for s in _strategies if s.get("type") == "activity"]
     return {"activities": activities, "count": len(activities)}
 
 @router.get("")
 async def list_strategies():
-    """策略概覽（type='strategy'）。"""
     strategies = [s for s in _strategies if s.get("type") == "strategy"]
     return {"strategies": strategies, "count": len(strategies)}
 
