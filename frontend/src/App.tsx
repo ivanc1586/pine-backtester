@@ -1,12 +1,13 @@
-// =============================================================================
-// 修改歷程記錄
-// -----------------------------------------------------------------------------
-// v1.1.0 - 2026-02-26 - 導覽列名稱更新
-//   - 「參數優化」改名為「策略優化」以符合新頁面功能
-// =============================================================================
+// ============================================================
+// 主程式入口模組
+// ------------------------------------------------------------
+// v1.2.0 - 2026-02-28 - 新增首頁（市場概覽 + 近期策略）
+// v1.1.0 - 2026-02-26 - 新增「參數優化」與「績效分析」頁面
+// ============================================================
 
 import { BrowserRouter, Routes, Route, NavLink, Navigate } from 'react-router-dom'
-import { LineChart, Code2, Target, BarChart3, TrendingUp } from 'lucide-react'
+import { Home, LineChart, Code2, Target, BarChart3, TrendingUp } from 'lucide-react'
+import HomePage from './pages/HomePage'
 import ChartPage from './pages/ChartPage'
 import StrategyPage from './pages/StrategyPage'
 import OptimizePage from './pages/OptimizePage'
@@ -15,11 +16,12 @@ import PerformancePage from './pages/PerformancePage'
 import { useStrategyStore } from './store/strategyStore'
 
 const navItems = [
-  { path: '/chart', label: '即時行情', icon: LineChart },
-  { path: '/strategy', label: '策略管理', icon: Code2 },
-  { path: '/optimize', label: '策略優化', icon: Target },
-  { path: '/results', label: '回測結果', icon: BarChart3 },
-  { path: '/performance', label: '績效分析', icon: TrendingUp },
+  { path: '/',           label: '首頁',     icon: Home       },
+  { path: '/chart',      label: '圖表瀏覽器', icon: LineChart  },
+  { path: '/strategy',   label: '策略程式碼', icon: Code2      },
+  { path: '/optimize',   label: '參數優化',  icon: Target     },
+  { path: '/results',    label: '回測結果',  icon: BarChart3  },
+  { path: '/performance',label: '績效分析',  icon: TrendingUp },
 ]
 
 export default function App() {
@@ -47,6 +49,7 @@ export default function App() {
               <NavLink
                 key={path}
                 to={path}
+                end={path === '/'}
                 className={({ isActive }) =>
                   `flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all ${
                     isActive
@@ -62,18 +65,18 @@ export default function App() {
           </div>
 
           <div className="p-4 border-t border-white/10">
-            <div className="text-xs text-gray-600 text-center">Pine Backtester v2.0</div>
+            <div className="text-xs text-gray-600 text-center">Pine Backtester v1.2.0</div>
           </div>
         </nav>
 
         {/* Main content */}
-        <main className="flex-1 overflow-y-auto">
+        <main className="flex-1 overflow-auto">
           <Routes>
-            <Route path="/" element={<Navigate to="/chart" replace />} />
-            <Route path="/chart" element={<ChartPage />} />
-            <Route path="/strategy" element={<StrategyPage />} />
-            <Route path="/optimize" element={<OptimizePage />} />
-            <Route path="/results" element={<ResultsPage />} />
+            <Route path="/"            element={<HomePage />} />
+            <Route path="/chart"       element={<ChartPage />} />
+            <Route path="/strategy"    element={<StrategyPage />} />
+            <Route path="/optimize"    element={<OptimizePage />} />
+            <Route path="/results"     element={<ResultsPage />} />
             <Route path="/performance" element={<PerformancePage />} />
           </Routes>
         </main>
