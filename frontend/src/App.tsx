@@ -5,7 +5,7 @@
 // v1.1.0 - 2026-02-26 - 新增「參數優化」與「績效分析」頁面
 // ============================================================
 
-import { BrowserRouter, Routes, Route, NavLink, Navigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
 import { Home, LineChart, Code2, Target, BarChart3, TrendingUp } from 'lucide-react'
 import HomePage from './pages/HomePage'
 import ChartPage from './pages/ChartPage'
@@ -16,12 +16,12 @@ import PerformancePage from './pages/PerformancePage'
 import { useStrategyStore } from './store/strategyStore'
 
 const navItems = [
-  { path: '/',           label: '首頁',     icon: Home       },
-  { path: '/chart',      label: '圖表瀏覽器', icon: LineChart  },
-  { path: '/strategy',   label: '策略程式碼', icon: Code2      },
-  { path: '/optimize',   label: '參數優化',  icon: Target     },
-  { path: '/results',    label: '回測結果',  icon: BarChart3  },
-  { path: '/performance',label: '績效分析',  icon: TrendingUp },
+  { path: '/',            label: '首頁',      icon: Home        },
+  { path: '/chart',       label: '圖表瀏覽器', icon: LineChart   },
+  { path: '/strategy',    label: '策略程式碼', icon: Code2       },
+  { path: '/optimize',    label: '參數優化',   icon: Target      },
+  { path: '/results',     label: '回測結果',   icon: BarChart3   },
+  { path: '/performance', label: '績效分析',   icon: TrendingUp  },
 ]
 
 export default function App() {
@@ -30,7 +30,6 @@ export default function App() {
   return (
     <BrowserRouter>
       <div className="flex h-screen bg-slate-900 overflow-hidden">
-        {/* Sidebar */}
         <nav className="w-56 flex-shrink-0 bg-slate-800/80 backdrop-blur border-r border-white/10 flex flex-col">
           <div className="p-5 border-b border-white/10">
             <div className="flex items-center gap-2.5">
@@ -69,7 +68,6 @@ export default function App() {
           </div>
         </nav>
 
-        {/* Main content */}
         <main className="flex-1 overflow-auto">
           <Routes>
             <Route path="/"            element={<HomePage />} />
