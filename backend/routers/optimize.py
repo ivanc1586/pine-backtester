@@ -54,7 +54,10 @@ class OptimizeRequest(BaseModel):
     end_date: str = "2024-01-01"
     initial_capital: float = 10000.0
     commission: float = 0.001
+    commission_type: str = "percent"          # percent | cash_per_contract | cash_per_order
+    commission_value: float = 0.001           # 0.001 = 0.1% for percent type
     quantity: float = 1.0
+    qty_type: str = "percent_of_equity"       # percent_of_equity | fixed | cash
     param_ranges: list[ParamRange]
     sort_by: str = "profit_pct"
     n_trials: int = 100
@@ -70,6 +73,75 @@ class SuggestRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Pine Script input parser
 # ---------------------------------------------------------------------------
+
+def parse_strategy_header(pine_script: str) -> dict:
+    """Extract strategy() call parameters: initial_capital, commission_type/value, qty_type/value."""
+    header = {}
+
+    # Match the strategy(...) block (may span multiple lines)
+    strat_match = re.search(r'strategy\s*\(([^)]+)\)', pine_script, re.DOTALL | re.IGNORECASE)
+    if not strat_match:
+        return header
+
+    args = strat_match.group(1)
+
+    def _get(key: str, default=None):
+        pat = re.compile(rf'\b{key}\s*=\s*([^\s,)]+)', re.IGNORECASE)
+        m = pat.search(args)
+        return m.group(1).strip().strip('"\'') if m else default
+
+    # initial_capital
+    ic = _get('initial_capital')
+    if ic:
+        try:
+            header['initial_capital'] = float(ic)
+        except ValueError:
+            pass
+
+    # commission_type: strategy.commission.percent / strategy.commission.cash_per_contract / ...
+    ct = _get('commission_type')
+    if ct:
+        raw = ct.lower()
+        if 'percent' in raw:
+            header['commission_type'] = 'percent'
+        elif 'cash_per_contract' in raw:
+            header['commission_type'] = 'cash_per_contract'
+        elif 'cash_per_order' in raw:
+            header['commission_type'] = 'cash_per_order'
+        else:
+            header['commission_type'] = raw
+
+    # commission_value
+    cv = _get('commission_value')
+    if cv:
+        try:
+            header['commission_value'] = float(cv)
+        except ValueError:
+            pass
+
+    # default_qty_type: strategy.percent_of_equity / strategy.fixed / strategy.cash
+    qt = _get('default_qty_type')
+    if qt:
+        raw = qt.lower()
+        if 'percent_of_equity' in raw:
+            header['qty_type'] = 'percent_of_equity'
+        elif 'cash' in raw:
+            header['qty_type'] = 'cash'
+        elif 'fixed' in raw:
+            header['qty_type'] = 'fixed'
+        else:
+            header['qty_type'] = raw
+
+    # default_qty_value
+    qv = _get('default_qty_value')
+    if qv:
+        try:
+            header['qty_value'] = float(qv)
+        except ValueError:
+            pass
+
+    return header
+
 
 def parse_pine_inputs(pine_script: str) -> list[dict]:
     """Extract all input declarations from Pine Script."""
@@ -226,12 +298,39 @@ Convert the Pine Script strategy to a Python function with these STRICT rules:
    - FORBIDDEN: sl_mult = 1.5     # hardcoded literal — this is a CRITICAL bug
    If ANY input variable is hardcoded as a literal instead of read via params.get(),
    the translation is INVALID and will be rejected. Every. Single. Parameter. Must use params.get().
-4. NEVER use future data: ta.highest/lowest MUST use .shift(1) before rolling
-5. SMMA: first value = SMA, then smma = (smma_prev*(length-1) + close) / length
-6. ATR: Wilder smoothing (same formula as SMMA), NOT simple EMA
-7. var variables = persistent state across bars
-8. position tracking: integer flag (0=flat, 1=long, -1=short)
-9. Return: {"trades": [...], "equity_curve": [...]}
+
+4. TV-ALIGNED ACCOUNTING RULES (must match TradingView strategy engine exactly):
+   a) Read execution context from params:
+      initial_capital  = float(params.get('initial_capital', 10000.0))
+      commission       = float(params.get('commission', 0.001))
+      commission_type  = str(params.get('commission_type', 'percent'))
+      qty_type         = str(params.get('qty_type', 'percent_of_equity'))
+      qty_value        = float(params.get('quantity', 1.0))
+
+   b) Position sizing — MUST follow TV formula:
+      if qty_type == 'percent_of_equity':
+          units = (current_equity * qty_value / 100.0) / entry_price
+      elif qty_type == 'cash':
+          units = qty_value / entry_price
+      else:  # 'fixed'
+          units = qty_value
+
+   c) Commission deduction — apply on BOTH entry AND exit:
+      if commission_type == 'percent':
+          comm = units * price * commission
+      else:  # cash_per_contract or cash_per_order
+          comm = commission
+      Deduct comm from equity on entry; deduct again on exit.
+
+   d) equity_curve MUST be List[float] — a plain Python list of float values,
+      one value per bar, representing total portfolio value (cash + open position mark-to-market).
+      FORBIDDEN: returning dicts, DataFrames, or any non-float items in equity_curve.
+5. NEVER use future data: ta.highest/lowest MUST use .shift(1) before rolling
+6. SMMA: first value = SMA, then smma = (smma_prev*(length-1) + close) / length
+7. ATR: Wilder smoothing (same formula as SMMA), NOT simple EMA
+8. var variables = persistent state across bars
+9. position tracking: integer flag (0=flat, 1=long, -1=short)
+10. Return: {"trades": [...], "equity_curve": [...]}
 
 Each trade dict:
 {
@@ -241,7 +340,19 @@ Each trade dict:
   "pnl": float, "pnl_pct": float
 }
 
-equity_curve: list of portfolio value at each bar (same length as df)
+equity_curve: List[float] — plain list of float, one per bar, same length as df.
+  FORBIDDEN formats: [{"time":..,"equity":..}], pd.Series, np.ndarray — must be list of float.
+
+PERFORMANCE RULES — MANDATORY:
+- FORBIDDEN: using .iloc inside any for-loop. Convert to numpy FIRST:
+    close_arr = df['close'].to_numpy(dtype=np.float64)
+    high_arr  = df['high'].to_numpy(dtype=np.float64)
+    low_arr   = df['low'].to_numpy(dtype=np.float64)
+    open_arr  = df['open'].to_numpy(dtype=np.float64)
+    times     = df.index
+  Then index with close_arr[i], NOT df['close'].iloc[i]
+- Pre-compute ALL indicator arrays as numpy arrays BEFORE the bar loop.
+- The bar loop must only read from pre-computed arrays — no pandas ops inside loop.
 
 Technical indicators:
 - SMA(src, n): src.rolling(n).mean()
@@ -299,8 +410,10 @@ def _get_fallback_strategy() -> str:
     fast = int(params.get("fastLength", params.get("fast_length", 9)))
     slow = int(params.get("slowLength", params.get("slow_length", 21)))
     qty = float(params.get("quantity", 1.0))
-    commission = float(params.get("_commission", 0.001))
-    capital = float(params.get("_capital", 10000.0))
+    commission = float(params.get("commission", 0.001))
+    capital = float(params.get("initial_capital", 10000.0))
+    qty_type = str(params.get("qty_type", "percent_of_equity"))
+    commission_type = str(params.get("commission_type", "percent"))
 
     close = df["close"]
     fast_ema = close.ewm(span=fast, adjust=False).mean()
@@ -326,13 +439,32 @@ def _get_fallback_strategy() -> str:
         ts = str(df.index[i])
 
         if prev_f <= prev_s and curr_f > curr_s and position == 0:
+            # TV-aligned position sizing
+            if qty_type == "percent_of_equity":
+                units = (equity * qty / 100.0) / price
+            elif qty_type == "cash":
+                units = qty / price
+            else:  # fixed
+                units = qty
+            # commission deduction
+            if commission_type == "percent":
+                comm_cost = units * price * commission
+            else:
+                comm_cost = commission  # cash_per_contract / cash_per_order
+            equity -= comm_cost
             position = 1
             entry_price = price
+            entry_units = units
             entry_time = ts
 
         elif prev_f >= prev_s and curr_f < curr_s and position == 1:
-            pnl = (price - entry_price) * qty - (entry_price + price) * qty * commission
-            equity += pnl
+            if commission_type == "percent":
+                comm_cost = entry_units * price * commission
+            else:
+                comm_cost = commission
+            gross = entry_units * (price - entry_price)
+            pnl = gross - comm_cost
+            equity += gross - comm_cost
             trades.append({
                 "entry_time": entry_time, "exit_time": ts,
                 "entry_price": round(entry_price, 4), "exit_price": round(price, 4),
@@ -341,19 +473,23 @@ def _get_fallback_strategy() -> str:
             })
             position = 0
 
-        equity_curve.append(equity)
+        equity_curve.append(float(equity))
 
     if position != 0 and entry_price > 0:
         price = close.iloc[-1]
         ts = str(df.index[-1])
-        mult = 1 if position == 1 else -1
-        pnl = (price - entry_price) * qty * mult - (entry_price + price) * qty * commission
+        if commission_type == "percent":
+            comm_cost = entry_units * price * commission
+        else:
+            comm_cost = commission
+        gross = entry_units * (price - entry_price)
+        pnl = gross - comm_cost
         equity += pnl
         trades.append({
             "entry_time": entry_time, "exit_time": ts,
             "entry_price": round(entry_price, 4), "exit_price": round(price, 4),
-            "side": "long" if position == 1 else "short", "pnl": round(pnl, 4),
-            "pnl_pct": round((price - entry_price) / entry_price * 100 * mult, 4)
+            "side": "long", "pnl": round(pnl, 4),
+            "pnl_pct": round((price - entry_price) / entry_price * 100, 4)
         })
 
     return {"trades": trades, "equity_curve": equity_curve}
@@ -653,14 +789,25 @@ def execute_strategy(strategy_code: str, df: pd.DataFrame, params: dict) -> dict
 async def run_optuna_optimization(
     run_fn, df: pd.DataFrame,
     param_ranges: list[ParamRange], initial_capital: float,
-    commission: float, quantity: float,
+    commission: float, commission_type: str,
+    quantity: float, qty_type: str,
     sort_by: str, n_trials: int, top_n: int
 ) -> AsyncGenerator[str, None]:
 
-    # results_store 只存摘要指標，不存完整 trades/equity_curve (OOM 防護)
-    results_store = []   # list of {params, metrics_summary}
-    # 菁英緩衝區：top_n 完整資料 (trades + equity_curve)
-    elite_store = []     # list of full result_entry, 保持有序、長度 <= top_n
+    # Todo 5: df → float32 numpy 唯讀共享陣列，所有 Trial 共用，不再 copy()
+    shared_df = pd.DataFrame({
+        "open":   df["open"].to_numpy(dtype=np.float32),
+        "high":   df["high"].to_numpy(dtype=np.float32),
+        "low":    df["low"].to_numpy(dtype=np.float32),
+        "close":  df["close"].to_numpy(dtype=np.float32),
+        "volume": df["volume"].to_numpy(dtype=np.float32),
+    }, index=df.index)
+    n_bars = len(shared_df)
+
+    # results_store 只存摘要指標 (OOM 防護)
+    results_store = []
+    # 菁英緩衝區：僅保留 top_n 完整資料 (trades + equity_curve)
+    elite_store = []
 
     completed = [0]
     best_value = [None]
@@ -670,13 +817,10 @@ async def run_optuna_optimization(
     direction = "minimize" if sort_by in minimize_metrics else "maximize"
 
     def _is_better(a, b):
-        if direction == "maximize":
-            return a > b
-        return a < b
+        return a > b if direction == "maximize" else a < b
 
     def objective(trial: optuna.Trial) -> float:
-        # 1b: 執行緒安全 — 每個 trial 使用獨立 DataFrame 副本
-        local_df = df.copy()
+        # Todo 6: JIT 耗時計時
         t_start = time.monotonic()
 
         trial_params = {}
@@ -687,23 +831,30 @@ async def run_optuna_optimization(
                 val = trial.suggest_float(pr.name, pr.min_val, pr.max_val, step=pr.step if pr.step > 0 else None)
             trial_params[pr.name] = val
 
-        trial_params.update({"_commission": commission, "_capital": initial_capital, "quantity": quantity})
+        # Todo 6: 正確鍵名 initial_capital/commission/commission_type/qty_type
+        trial_params.update({
+            "initial_capital": initial_capital,
+            "commission":      commission,
+            "commission_type": commission_type,
+            "quantity":        quantity,
+            "qty_type":        qty_type,
+        })
 
         try:
-            raw = run_fn(local_df, **trial_params)
+            # Todo 5: 傳入共享 shared_df，不 copy()
+            raw = run_fn(shared_df, **trial_params)
             metrics = calc_metrics(raw, initial_capital)
         except Exception as e:
             logger.debug(f"Trial failed: {e}")
-            # 2b: 釋放資源
-            del local_df
             gc.collect()
             return float("inf") if direction == "minimize" else float("-inf")
 
         current_val = metrics.get(sort_by, 0.0)
 
-        # 2a: 摘要資料（不含完整 trades/equity_curve）
+        # 摘要資料（不含完整 trades/equity_curve，過濾系統控制鍵）
+        _sys_keys = {"initial_capital", "commission", "commission_type", "quantity", "qty_type"}
         summary_entry = {
-            "params": {k: v for k, v in trial_params.items() if not k.startswith("_")},
+            "params": {k: v for k, v in trial_params.items() if k not in _sys_keys},
             "total_trades": metrics["total_trades"],
             "win_rate": metrics["win_rate"],
             "profit_pct": metrics["profit_pct"],
@@ -728,17 +879,16 @@ async def run_optuna_optimization(
 
         completed[0] += 1
 
-        # 記錄耗時
+        # Todo 6: JIT 耗時診斷
         t_elapsed = time.monotonic() - t_start
         trial_times.append(t_elapsed)
+        if completed[0] == 1:
+            logger.info(f"Trial #1 (含 JIT 編譯) 耗時：{t_elapsed * 1000:.1f} ms")
 
         if best_value[0] is None or _is_better(current_val, best_value[0]):
             best_value[0] = current_val
 
-        # 2b: 釋放 local_df
-        del local_df
         gc.collect()
-
         return current_val
 
     loop = asyncio.get_event_loop()
@@ -752,30 +902,30 @@ async def run_optuna_optimization(
     chunk_size = 10
     remaining = n_trials
 
-    yield f"data: {json.dumps({'type': 'log', 'message': f'開始優化：{n_trials} 次試驗，目標 {sort_by}'})}\n\n"
-    yield f"data: {json.dumps({'type': 'log', 'message': f'載入 K 線資料：{len(df)} 根 K 線'})}\n\n"
+    yield f"data: {json.dumps({'type': 'log', 'message': f'開始優化：{n_trials} 次試驗，目標 {sort_by}，K 線：{n_bars} 根，n_jobs=-1'})}\n\n"
 
     while remaining > 0:
         batch = min(chunk_size, remaining)
-        # 1b: n_jobs=1 確保執行緒安全（已有 local_df.copy() 雙重保護）
-        await loop.run_in_executor(None, lambda b=batch: study.optimize(objective, n_trials=b, n_jobs=1, show_progress_bar=False))
+        # Todo 5: n_jobs=-1 並行解鎖（共享 float32 numpy 陣列，無 race condition）
+        await loop.run_in_executor(None, lambda b=batch: study.optimize(objective, n_trials=b, n_jobs=-1, show_progress_bar=False))
         remaining -= batch
         progress = min(99, int((completed[0] / n_trials) * 100))
 
-        best_str = ""
-        if best_value[0] is not None:
-            best_str = f"，目前最佳 {sort_by}={best_value[0]:.4f}"
+        best_str = f"，最佳 {sort_by}={best_value[0]:.4f}" if best_value[0] is not None else ""
 
         log_msg = f"[{progress:3d}%] 已完成 {completed[0]}/{n_trials} 次試驗{best_str}"
 
         yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'completed': completed[0], 'total': n_trials})}\n\n"
         yield f"data: {json.dumps({'type': 'log', 'message': log_msg})}\n\n"
 
-    # 3b: 平均 Trial 耗時診斷日誌
+    # Todo 6: JIT 編譯耗時 + 後續平均耗時診斷
     if trial_times:
-        avg_ms = sum(trial_times) / len(trial_times) * 1000
-        logger.info(f"優化完成：共 {completed[0]} 個 Trial，平均耗時 {avg_ms:.1f} ms/trial")
-        yield f"data: {json.dumps({'type': 'log', 'message': f'平均每個 Trial 運算耗時：{avg_ms:.1f} ms'})}\n\n"
+        jit_ms  = trial_times[0] * 1000
+        rest_ms = (sum(trial_times[1:]) / max(len(trial_times) - 1, 1)) * 1000
+        avg_ms  = sum(trial_times) / len(trial_times) * 1000
+        logger.info(f"優化完成：{completed[0]} 個 Trial，JIT={jit_ms:.1f} ms，後續平均={rest_ms:.1f} ms/trial")
+        yield f"data: {json.dumps({'type': 'log', 'message': f'JIT 編譯耗時：{jit_ms:.1f} ms｜後續平均：{rest_ms:.1f} ms/trial｜整體平均：{avg_ms:.1f} ms/trial'})}\n\n"
+
 
     # 從菁英緩衝區取完整資料，補上 rank
     top_results = [entry for _, entry in elite_store[:top_n]]
@@ -785,7 +935,7 @@ async def run_optuna_optimization(
         entry["rank"] = i + 1
         summary_results.append(entry)
 
-    yield f"data: {json.dumps({'type': 'log', 'message': f'優化完成！共找到 {len(results_store)} 個有效組合，回傳前 {len(summary_results)} 名'})}\n\n"
+    yield f"data: {json.dumps({'type': 'log', 'message': f'優化完成！{len(results_store)} 個有效組合，回傳前 {len(summary_results)} 名'})}\n\n"
     yield f"data: {json.dumps({'type': 'result', 'results': summary_results})}\n\n"
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
@@ -795,9 +945,10 @@ async def run_optuna_optimization(
 
 @router.post("/parse")
 async def parse_inputs(req: ParseRequest):
-    """Auto-detect all input parameters from Pine Script."""
+    """Auto-detect all input parameters from Pine Script, including strategy() header values."""
     params = parse_pine_inputs(req.pine_script)
-    return {"params": params, "count": len(params)}
+    header = parse_strategy_header(req.pine_script)
+    return {"params": params, "count": len(params), "header": header}
 
 @router.post("/suggest")
 async def suggest_ranges(req: SuggestRequest):
@@ -853,7 +1004,8 @@ async def run_optimization(req: OptimizeRequest):
             async for chunk in run_optuna_optimization(
                 run_fn=run_fn, df=df,
                 param_ranges=req.param_ranges, initial_capital=req.initial_capital,
-                commission=req.commission, quantity=req.quantity,
+                commission=req.commission, commission_type=req.commission_type,
+                quantity=req.quantity, qty_type=req.qty_type,
                 sort_by=req.sort_by, n_trials=req.n_trials, top_n=req.top_n,
             ):
                 yield chunk
