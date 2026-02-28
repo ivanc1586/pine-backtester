@@ -996,10 +996,6 @@ export default function OptimizePage() {
             </div>
           </div>
         )}
-              </table>
-            </div>
-          </div>
-        )}
 
         {/* ── Selected Result Detail ───────────────────────────────────── */}
         {selectedResult && (
