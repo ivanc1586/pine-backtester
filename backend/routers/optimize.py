@@ -1,7 +1,7 @@
 # =============================================================================
 # optimize.py
 # -----------------------------------------------------------------------------
-# v2.7.3 - 2026-02-28
+# v2.7.4 - 2026-02-28
 #   - GEMINI_SYSTEM_PROMPT: @njit 模板加入嚴格禁令
 #       * FORBIDDEN: dict/list/str 在 @njit 內（numba nopython 不支援）
 #       * trade 資料結構改為純 numpy array（entry/exit price/idx/pnl/side）
@@ -333,12 +333,25 @@ Convert the Pine Script strategy to a Python function with these STRICT rules:
           units = qty_value
 
    c) Commission deduction — apply on BOTH entry AND exit:
-      if commission_type == 'percent':
-          comm = units * price * commission_value
-      else:  # cash_per_contract or cash_per_order
-          comm = commission_value
-      equity -= comm   # deduct on entry
-      # on exit: equity += gross_pnl - comm_exit
+      ON ENTRY:
+          if commission_type == 'percent':
+              comm_entry = units * entry_price * commission_value
+          else:
+              comm_entry = commission_value
+          equity -= comm_entry          # deduct entry commission immediately
+          # store comm_entry for use at exit
+
+      ON EXIT:
+          if commission_type == 'percent':
+              comm_exit = units * exit_price * commission_value
+          else:
+              comm_exit = commission_value
+          gross_pnl = units * (exit_price - entry_price) * position  # *position handles short
+          pnl = gross_pnl - comm_entry - comm_exit   # BOTH commissions deducted from pnl
+          equity += gross_pnl - comm_exit            # equity already had comm_entry deducted at entry
+
+      CRITICAL: trade dict pnl field = gross_pnl - comm_entry - comm_exit (NOT just gross - comm_exit)
+      This ensures sum(trade["pnl"]) == final_equity - initial_capital (TV-aligned)
 
    d) equity_curve MUST be List[float] — a plain Python list of float values,
       one value per bar, representing total portfolio value (cash + open position mark-to-market).
@@ -556,7 +569,9 @@ def _get_fallback_strategy() -> str:
 
     position = 0
     entry_price = 0.0
+    entry_units = 0.0
     entry_time = None
+    entry_comm = 0.0
     trades = []
     equity = capital
     equity_curve = []
@@ -581,25 +596,27 @@ def _get_fallback_strategy() -> str:
                 units = qty_value / price
             else:  # fixed
                 units = qty_value
-            # commission deduction
+            # entry commission — deduct immediately, store for pnl calc at exit
             if commission_type == "percent":
-                comm_cost = units * price * commission_value
+                comm_entry = units * price * commission_value
             else:
-                comm_cost = commission_value  # cash_per_contract / cash_per_order
-            equity -= comm_cost
+                comm_entry = commission_value
+            equity -= comm_entry
             position = 1
             entry_price = price
             entry_units = units
             entry_time = ts
+            entry_comm = comm_entry  # stored for exit pnl calculation
 
         elif prev_f >= prev_s and curr_f < curr_s and position == 1:
             if commission_type == "percent":
-                comm_cost = entry_units * price * commission_value
+                comm_exit = entry_units * price * commission_value
             else:
-                comm_cost = commission_value
+                comm_exit = commission_value
             gross = entry_units * (price - entry_price)
-            pnl = gross - comm_cost
-            equity += gross - comm_cost
+            # pnl = gross - BOTH commissions (TV-aligned: entry already deducted from equity)
+            pnl = gross - entry_comm - comm_exit
+            equity += gross - comm_exit
             trades.append({
                 "entry_time": entry_time, "exit_time": ts,
                 "entry_price": round(entry_price, 4), "exit_price": round(price, 4),
@@ -607,6 +624,7 @@ def _get_fallback_strategy() -> str:
                 "pnl_pct": round((price - entry_price) / entry_price * 100, 4)
             })
             position = 0
+            entry_comm = 0.0
 
         equity_curve.append(float(equity))
 
@@ -614,12 +632,12 @@ def _get_fallback_strategy() -> str:
         price = close.iloc[-1]
         ts = str(df.index[-1])
         if commission_type == "percent":
-            comm_cost = entry_units * price * commission_value
+            comm_exit = entry_units * price * commission_value
         else:
-            comm_cost = commission_value
+            comm_exit = commission_value
         gross = entry_units * (price - entry_price)
-        pnl = gross - comm_cost
-        equity += pnl
+        pnl = gross - entry_comm - comm_exit
+        equity += gross - comm_exit
         trades.append({
             "entry_time": entry_time, "exit_time": ts,
             "entry_price": round(entry_price, 4), "exit_price": round(price, 4),
@@ -784,11 +802,46 @@ def calc_metrics(result: dict, initial_capital: float) -> dict:
 
     profit_pct = (final_equity - initial_capital) / initial_capital * 100
 
+    # ---------------------------------------------------------------------------
+    # Sharpe ratio — TV-aligned: daily returns from bar-level equity_curve × √252
+    #
+    # TV uses daily equity snapshots, NOT per-trade returns.
+    # Using trade-based returns × √252 massively over-estimates Sharpe for
+    # high-frequency strategies (many trades per day → std underestimated).
+    #
+    # Approach:
+    #   1. Use the bar-level equity_curve returned by run_strategy (same length as df)
+    #   2. Resample to daily by taking the last bar value each day
+    #      (trades dict carry exit_time strings for resampling)
+    #   3. Compute daily returns → mean/std × √252
+    # ---------------------------------------------------------------------------
     sharpe = 0.0
-    if len(trade_equity) > 2:
-        rets = np.diff(eq_arr) / np.where(eq_arr[:-1] == 0, 1, eq_arr[:-1])
-        if rets.std() > 0:
-            sharpe = float(rets.mean() / rets.std() * np.sqrt(252))
+    bar_curve = result.get("equity_curve", [])   # bar-level, same length as df
+    if len(bar_curve) > 2:
+        # Build a per-trade exit_time → equity mapping to resample to daily
+        # Use exit_time strings from trades (format: "YYYY-MM-DD ..." or ISO)
+        # Group by date, take the last equity value seen that day
+        daily_eq: dict[str, float] = {}
+        running_eq = float(initial_capital)
+        for t in trades:
+            exit_date = str(t.get("exit_time", ""))[:10]   # "YYYY-MM-DD"
+            running_eq += t["pnl"]
+            if exit_date:
+                daily_eq[exit_date] = running_eq            # last trade of day wins
+
+        if len(daily_eq) > 2:
+            sorted_vals = [v for _, v in sorted(daily_eq.items())]
+            d_arr = np.array([initial_capital] + sorted_vals, dtype=float)
+            d_rets = np.diff(d_arr) / np.where(d_arr[:-1] == 0, 1, d_arr[:-1])
+            if d_rets.std() > 0:
+                sharpe = float(d_rets.mean() / d_rets.std() * np.sqrt(252))
+        else:
+            # Fallback for strategies with very few trading days
+            d_arr = np.array([initial_capital] + list(daily_eq.values()), dtype=float) \
+                    if daily_eq else eq_arr
+            d_rets = np.diff(d_arr) / np.where(d_arr[:-1] == 0, 1, d_arr[:-1])
+            if len(d_rets) > 0 and d_rets.std() > 0:
+                sharpe = float(d_rets.mean() / d_rets.std() * np.sqrt(252))
 
     # Use compact trade-based curve for API response (replaces full bar-level curve)
     equity_curve = trade_equity
