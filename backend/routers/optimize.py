@@ -966,6 +966,7 @@ async def run_optuna_optimization(
         return a > b if direction == "maximize" else a < b
 
     def objective(trial: optuna.Trial) -> float:
+        nonlocal run_fn  # TypingError fallback 時更新外層 run_fn
         # Todo 6: JIT 耗時計時
         t_start = time.monotonic()
 
@@ -1018,7 +1019,6 @@ async def run_optuna_optimization(
                 fb_ns = {"pd": pd, "np": np}
                 try:
                     exec(compile(fallback_code, "<fallback>", "exec"), fb_ns)
-                    nonlocal run_fn
                     run_fn = fb_ns["run_strategy"]
                     raw = run_fn(shared_df, **trial_params)
                     metrics = calc_metrics(raw, initial_capital)
