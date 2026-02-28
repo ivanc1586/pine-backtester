@@ -1,7 +1,7 @@
 # =============================================================================
 # optimize.py
 # -----------------------------------------------------------------------------
-# v2.7.0 - 2026-02-28
+# v2.7.1 - 2026-02-28
 #   - OptimizeRequest: quantity -> qty_value (對齊 parse_strategy_header 輸出)
 #   - run_optuna_optimization: 加入 commission_value 參數全鏈路傳遞
 #   - objective: trial_params 鍵名全面對齊 (qty_value / commission_value)
@@ -893,11 +893,11 @@ async def run_optuna_optimization(
     # 將 df 拆解為獨立 float32 numpy 陣列，避免多執行緒共享同一物件造成潛在污染
     # 同時重建輕量 DataFrame 供 run_fn 使用（保留 datetime index）
     _idx = df.index
-    _open   = df["open"].to_numpy(dtype=np.float32)
-    _high   = df["high"].to_numpy(dtype=np.float32)
-    _low    = df["low"].to_numpy(dtype=np.float32)
-    _close  = df["close"].to_numpy(dtype=np.float32)
-    _volume = df["volume"].to_numpy(dtype=np.float32)
+    _open   = df["open"].to_numpy(dtype=np.float64)
+    _high   = df["high"].to_numpy(dtype=np.float64)
+    _low    = df["low"].to_numpy(dtype=np.float64)
+    _close  = df["close"].to_numpy(dtype=np.float64)
+    _volume = df["volume"].to_numpy(dtype=np.float64)
     shared_df = pd.DataFrame(
         {"open": _open, "high": _high, "low": _low, "close": _close, "volume": _volume},
         index=_idx
@@ -946,7 +946,8 @@ async def run_optuna_optimization(
             raw = run_fn(shared_df, **trial_params)
             metrics = calc_metrics(raw, initial_capital)
         except Exception as e:
-            logger.debug(f"Trial failed: {e}")
+            import traceback
+            logger.warning(f"Trial #{trial.number} failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
             gc.collect()
             return float("inf") if direction == "minimize" else float("-inf")
 
@@ -1088,10 +1089,22 @@ async def run_optimization(req: OptimizeRequest):
     except SyntaxError as e:
         raise HTTPException(status_code=422, detail=f"Generated code syntax error: {e}")
 
-    namespace = {"pd": pd, "np": np}
+    # 在 namespace 加入 numba graceful fallback，防止 import 失敗
+    try:
+        from numba import njit as _njit
+        _njit_avail = _njit
+    except ImportError:
+        def _njit_avail(*args, **kwargs):
+            def decorator(fn): return fn
+            return decorator if args and callable(args[0]) else decorator
+    namespace = {"pd": pd, "np": np, "njit": _njit_avail}
+
+    logger.info(f"Executing strategy code ({len(strategy_code)} chars), first 300 chars:\n{strategy_code[:300]}")
     try:
         exec(compiled, namespace)
     except Exception as e:
+        import traceback
+        logger.error(f"Strategy exec error: {traceback.format_exc()}")
         raise HTTPException(status_code=422, detail=f"Strategy execution error: {e}")
 
     run_fn = namespace.get("run_strategy")
