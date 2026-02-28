@@ -1,7 +1,13 @@
 # =============================================================================
 # optimize.py
 # -----------------------------------------------------------------------------
-# v2.7.6 - 2026-02-28
+# v2.8.0 - 2026-02-28
+#   - param_ranges: 新增 title 欄位（顯示 Pine Script input title，如 "Fast MA Period"）
+#   - OptimizeRequest: 新增 market_type 欄位（spot | futures），結果回傳 symbol_label
+#   - K 線快取：_kline_cache（symbol+interval+date range -> DataFrame）避免重複拉取
+#   - /candles 新端點：讓前端直接取得 K 線資料（首頁走勢圖使用）
+#   - /report 新端點：儲存 / 讀取最佳回測報告（JSON）
+#   - results 附帶 symbol / interval / start_date / end_date / market_type 欄位
 #   - GEMINI_SYSTEM_PROMPT: @njit 模板加入嚴格禁令
 #       * FORBIDDEN: dict/list/str 在 @njit 內（numba nopython 不支援）
 #       * trade 資料結構改為純 numpy array（entry/exit price/idx/pnl/side）
@@ -45,6 +51,13 @@ router = APIRouter(tags=["optimize"])
 _translate_cache: dict[str, str] = {}
 _suggest_cache: dict[str, list] = {}
 
+# K 線持久快取：key = "symbol|interval|start_ms|end_ms"
+_kline_cache: dict[str, pd.DataFrame] = {}
+
+# 已儲存的最佳回測報告（最多 50 筆，LIFO）
+_saved_reports: list[dict] = []
+MAX_SAVED_REPORTS = 50
+
 def _script_hash(pine_script: str) -> str:
     return hashlib.md5(pine_script.encode("utf-8")).hexdigest()
 
@@ -54,6 +67,7 @@ def _script_hash(pine_script: str) -> str:
 
 class ParamRange(BaseModel):
     name: str
+    title: str = ""          # Human-readable label, e.g. "Fast MA Period"
     min_val: float
     max_val: float
     step: float
@@ -62,6 +76,7 @@ class ParamRange(BaseModel):
 class OptimizeRequest(BaseModel):
     pine_script: str
     symbol: str = "BTCUSDT"
+    market_type: str = "spot"                 # spot | futures
     interval: str = "1h"
     source: str = "binance"
     start_date: str = "2023-01-01"
@@ -77,6 +92,7 @@ class OptimizeRequest(BaseModel):
     n_trials: int = 100
     top_n: int = 10
     bypass_cache: bool = False
+    strategy_name: str = ""                   # 策略名稱（用於報告標題）
 
 class ParseRequest(BaseModel):
     pine_script: str
@@ -892,8 +908,14 @@ INTERVAL_TO_MINUTES = {
     "1h": 60, "4h": 240, "1d": 1440, "1w": 10080,
 }
 
-async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    """Fetch OHLCV candles using Binance.US first, then Kraken as fallback."""
+async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int, use_cache: bool = True) -> pd.DataFrame:
+    """Fetch OHLCV candles using Binance.US first, then Kraken as fallback.
+    Results are cached in _kline_cache to avoid redundant API calls.
+    """
+    cache_key = f"{symbol}|{interval}|{start_ms}|{end_ms}"
+    if use_cache and cache_key in _kline_cache:
+        logger.info(f"K 線快取命中：{cache_key}（{len(_kline_cache[cache_key])} 根）")
+        return _kline_cache[cache_key].copy()
 
     async def _try_binance_us() -> pd.DataFrame:
         url = "https://api.binance.us/api/v3/klines"
@@ -963,10 +985,20 @@ async def fetch_candles(symbol: str, interval: str, start_ms: int, end_ms: int) 
         return df.set_index("timestamp")
 
     try:
-        return await _try_binance_us()
+        df = await _try_binance_us()
     except Exception as e:
         logger.warning(f"Binance.US failed ({e}), trying Kraken...")
-        return await _try_kraken()
+        df = await _try_kraken()
+
+    # 寫入持久快取（最多保留 200 key，超出清除最舊 50 個）
+    if use_cache:
+        if len(_kline_cache) >= 200:
+            old_keys = list(_kline_cache.keys())[:50]
+            for k in old_keys:
+                del _kline_cache[k]
+        _kline_cache[cache_key] = df.copy()
+        logger.info(f"K 線已快取：{cache_key}（{len(df)} 根，快取共 {len(_kline_cache)} 筆）")
+    return df
 
 # ---------------------------------------------------------------------------
 # Strategy executor
@@ -995,6 +1027,12 @@ async def run_optuna_optimization(
     qty_value: float, qty_type: str,
     sort_by: str, n_trials: int, top_n: int,
     pine_script: str = "",
+    symbol: str = "",
+    market_type: str = "spot",
+    interval: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    strategy_name: str = "",
 ) -> AsyncGenerator[str, None]:
 
     # 將 df 拆解為獨立 float32 numpy 陣列，避免多執行緒共享同一物件造成潛在污染
@@ -1117,6 +1155,11 @@ async def run_optuna_optimization(
         _sys_keys = {"initial_capital", "commission", "commission_type", "commission_value", "qty_value", "qty_type"}
         summary_entry = {
             "params": {k: v for k, v in trial_params.items() if k not in _sys_keys},
+            "symbol": symbol,
+            "market_type": market_type,
+            "interval": interval,
+            "start_date": start_date,
+            "end_date": end_date,
             "total_trades": metrics["total_trades"],
             "win_rate": metrics["win_rate"],
             "profit_pct": metrics["profit_pct"],
@@ -1202,11 +1245,86 @@ async def run_optuna_optimization(
 
     yield f"data: {json.dumps({'type': 'log', 'message': f'優化完成！{len(results_store)} 個有效組合，回傳前 {len(summary_results)} 名'})}\n\n"
     yield f"data: {json.dumps({'type': 'result', 'results': summary_results})}\n\n"
+
+    # 自動儲存第一名完整報告
+    if summary_results:
+        import datetime as _dt
+        best = summary_results[0]
+        report = {
+            **best,
+            "strategy_name": strategy_name or symbol or "Unknown",
+            "saved_at": _dt.datetime.now().isoformat(),
+        }
+        _saved_reports.insert(0, report)
+        if len(_saved_reports) > MAX_SAVED_REPORTS:
+            _saved_reports.pop()
+        logger.info(f"已自動儲存最佳報告：{report['strategy_name']} profit={report.get('profit_pct', 0):.2f}%")
+
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 # ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
+
+@router.get("/candles")
+async def get_candles(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 200):
+    """取得最新 K 線資料供前端走勢圖使用。優先使用快取。"""
+    import datetime as _dt
+    end_ms = int(_dt.datetime.now().timestamp() * 1000)
+    interval_hours = {"1m": 1/60, "5m": 5/60, "15m": 0.25, "30m": 0.5,
+                      "1h": 1, "4h": 4, "1d": 24, "1w": 168}.get(interval, 1)
+    days_needed = max(1, int((limit * interval_hours) / 24) + 2)
+    start_ms = int((_dt.datetime.now() - _dt.timedelta(days=days_needed)).timestamp() * 1000)
+    try:
+        df = await fetch_candles(symbol, interval, start_ms, end_ms, use_cache=True)
+        df = df.tail(limit)
+        candles = []
+        for ts, row in df.iterrows():
+            candles.append({
+                "t": int(ts.timestamp() * 1000),
+                "o": float(row["open"]),
+                "h": float(row["high"]),
+                "l": float(row["low"]),
+                "c": float(row["close"]),
+                "v": float(row["volume"]),
+            })
+        latest = candles[-1] if candles else {}
+        first = candles[0] if candles else {}
+        change_pct = round((latest.get("c", 0) - first.get("o", 0)) / max(first.get("o", 1e-9), 1e-9) * 100, 2) if first else 0.0
+        return {
+            "symbol": symbol,
+            "interval": interval,
+            "candles": candles,
+            "latest_price": latest.get("c", 0),
+            "change_pct": change_pct,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch candles: {e}")
+
+
+@router.get("/reports")
+async def get_reports(limit: int = 20):
+    """回傳近期自動儲存的最佳回測報告清單（不含完整 trades）。"""
+    summary_keys = [
+        "rank", "symbol", "market_type", "interval", "start_date", "end_date",
+        "strategy_name", "saved_at", "profit_pct", "win_rate", "max_drawdown",
+        "sharpe_ratio", "total_trades", "profit_factor", "final_equity",
+        "gross_profit", "gross_loss", "params", "monthly_pnl", "equity_curve",
+    ]
+    result = []
+    for r in _saved_reports[:limit]:
+        entry = {k: r[k] for k in summary_keys if k in r}
+        result.append(entry)
+    return {"reports": result, "count": len(result)}
+
+
+@router.get("/reports/{index}")
+async def get_report_detail(index: int):
+    """取得特定報告的完整資料（含 trades）。"""
+    if index < 0 or index >= len(_saved_reports):
+        raise HTTPException(status_code=404, detail="Report not found")
+    return _saved_reports[index]
+
 
 @router.post("/parse")
 async def parse_inputs(req: ParseRequest):
@@ -1286,6 +1404,9 @@ async def run_optimization(req: OptimizeRequest):
                 qty_value=req.qty_value, qty_type=req.qty_type,
                 sort_by=req.sort_by, n_trials=req.n_trials, top_n=req.top_n,
                 pine_script=req.pine_script,
+                symbol=req.symbol, market_type=req.market_type,
+                interval=req.interval, start_date=req.start_date,
+                end_date=req.end_date, strategy_name=req.strategy_name,
             ):
                 yield chunk
         except Exception as e:
