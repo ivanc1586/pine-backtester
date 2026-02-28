@@ -302,11 +302,11 @@ export default function HomePage() {
   const [selectedCandle, setSelectedCandle] = useState<{ symbol: string; candles: Candle[] } | null>(null)
   const [selectedReport, setSelectedReport] = useState<SavedReport | null>(null)
 
-  // ── 市場資料（打正確路徑 /api/optimize/market/candles）──
+  // ── 市場資料（打正確路徑 /api/optimize/candles）──
   useEffect(() => {
     MARKET_SYMBOLS.forEach(async ({ symbol, label }, idx) => {
       try {
-        const res = await fetch(`${API_BASE}/api/optimize/market/candles?symbol=${symbol}&interval=1h&limit=48`)
+        const res = await fetch(`${API_BASE}/api/optimize/candles?symbol=${symbol}&interval=1h&limit=48`)
         if (!res.ok) throw new Error(res.statusText)
         const data = await res.json()
         setTickers(prev => prev.map((t, i) => i === idx
