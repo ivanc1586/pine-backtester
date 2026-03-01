@@ -45,18 +45,73 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["optimize"])
 
 # ---------------------------------------------------------------------------
-# In-memory caches  (md5(pine_script) -> result)
+# Disk-backed caches (diskcache, falls back to in-memory dict if unavailable)
 # ---------------------------------------------------------------------------
+import os as _os
+import time as _time
 
-_translate_cache: dict[str, str] = {}
-_suggest_cache: dict[str, list] = {}
+_CACHE_DIR = _os.environ.get("OPTIMIZE_CACHE_DIR", "/tmp/optimize_cache")
+_disk_cache = None
+_mem_fallback: dict = {}   # {key: (value, expire_ts)}
 
-# K 線持久快取：key = "symbol|interval|start_ms|end_ms"
-_kline_cache: dict[str, pd.DataFrame] = {}
+def _init_opt_cache():
+    global _disk_cache
+    if _disk_cache is not None:
+        return
+    try:
+        import diskcache as _dc
+        _disk_cache = _dc.Cache(_CACHE_DIR)
+        logger.info(f"optimize: disk cache at {_CACHE_DIR}")
+    except Exception as e:
+        logger.warning(f"optimize: diskcache unavailable ({e}), using in-memory fallback")
+        _disk_cache = None
 
-# 已儲存的最佳回測報告（最多 50 筆，LIFO）
-_saved_reports: list[dict] = []
-MAX_SAVED_REPORTS = 50
+def _oget(key: str):
+    _init_opt_cache()
+    if _disk_cache is not None:
+        try:
+            v = _disk_cache.get(key)
+            if v is not None:
+                return v
+        except Exception:
+            pass
+    entry = _mem_fallback.get(key)
+    if entry and _time.time() < entry[1]:
+        return entry[0]
+    return None
+
+def _oset(key: str, value, ttl: int = 3600):
+    _init_opt_cache()
+    if _disk_cache is not None:
+        try:
+            _disk_cache.set(key, value, expire=ttl)
+            return
+        except Exception:
+            pass
+    _mem_fallback[key] = (value, _time.time() + ttl)
+
+# ---------------------------------------------------------------------------
+# Saved reports helpers (persist to diskcache, fallback to in-memory list)
+# ---------------------------------------------------------------------------
+_REPORTS_KEY = "saved_reports_v1"
+_MAX_SAVED_REPORTS = 50
+
+def _reports_list() -> list:
+    """Return persisted reports list (newest first)."""
+    data = _oget(_REPORTS_KEY)
+    return data if isinstance(data, list) else []
+
+def _reports_prepend(report: dict) -> None:
+    """Prepend a new report and persist, keeping at most _MAX_SAVED_REPORTS."""
+    reports = _reports_list()
+    reports.insert(0, report)
+    if len(reports) > _MAX_SAVED_REPORTS:
+        reports = reports[:_MAX_SAVED_REPORTS]
+    _oset(_REPORTS_KEY, reports, ttl=7 * 24 * 3600)  # keep for 7 days
+
+# K 線持久快取：key = "symbol|interval|start_ms|end_ms"  (kept as DataFrame in memory for speed,
+# serialised to disk via diskcache for cross-restart persistence)
+_kline_cache: dict[str, pd.DataFrame] = {}  # hot in-memory layer
 
 def _script_hash(pine_script: str) -> str:
     return hashlib.md5(pine_script.encode("utf-8")).hexdigest()
@@ -533,14 +588,21 @@ Technical indicators:
 Output ONLY the Python function, no markdown."""
 
 async def translate_with_gemini(pine_script: str, bypass_cache: bool = False) -> str:
-    """Use Gemini Flash to translate Pine Script to Python. Cached by md5 hash."""
-    key = _script_hash(pine_script)
-    if bypass_cache and key in _translate_cache:
-        del _translate_cache[key]
-        logger.info(f"Bypass Cache: 強制重新轉譯 (key={key[:8]}...)")
-    if key in _translate_cache:
-        logger.info(f"Cache Hit: translate key={key[:8]}...")
-        return _translate_cache[key]
+    """Use Gemini Flash to translate Pine Script to Python. Cached by diskcache."""
+    key = f"translate:{_script_hash(pine_script)}"
+    if bypass_cache:
+        try:
+            if _disk_cache is not None:
+                _disk_cache.delete(key)
+            else:
+                _mem_fallback.pop(key, None)
+        except Exception:
+            pass
+        logger.info(f"Bypass Cache: 強制重新轉譯 (key={key[:16]}...)")
+    cached = _oget(key)
+    if cached is not None:
+        logger.info(f"Cache Hit: translate key={key[:16]}...")
+        return cached
 
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
@@ -564,7 +626,7 @@ async def translate_with_gemini(pine_script: str, bypass_cache: bool = False) ->
         code = re.sub(r'\n?```$', '', code.strip())
         code = code.strip()
 
-        _translate_cache[key] = code
+        _oset(key, code, ttl=86400)  # cache translated code for 24h
         return code
 
     except Exception as e:
@@ -707,11 +769,12 @@ Rules:
 Return ONLY valid JSON array, no markdown, no explanation outside JSON."""
 
 async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
-    """Use Gemini to suggest intelligent parameter ranges. Cached by md5 hash."""
-    key = _script_hash(pine_script)
-    if key in _suggest_cache:
+    """Use Gemini to suggest intelligent parameter ranges. Cached by diskcache."""
+    key = f"suggest:{_script_hash(pine_script)}"
+    cached = _oget(key)
+    if cached is not None:
         logger.info("suggest_param_ranges_with_gemini: cache hit")
-        return _suggest_cache[key]
+        return cached
 
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
@@ -759,7 +822,7 @@ async def suggest_param_ranges_with_gemini(pine_script: str) -> list[dict]:
                 "reasoning": str(s.get("reasoning", "")),
             })
 
-        _suggest_cache[key] = result
+        _oset(key, result, ttl=3600)  # cache suggestions for 1h
         return result
 
     except Exception as e:
@@ -1270,9 +1333,7 @@ async def run_optuna_optimization(
             "strategy_name": strategy_name or symbol or "Unknown",
             "saved_at": _dt.datetime.now().isoformat(),
         }
-        _saved_reports.insert(0, report)
-        if len(_saved_reports) > MAX_SAVED_REPORTS:
-            _saved_reports.pop()
+        _reports_prepend(report)
         logger.info(f"已自動儲存最佳報告：{report['strategy_name']} profit={report.get('profit_pct', 0):.2f}%")
 
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
@@ -1326,8 +1387,9 @@ async def get_reports(limit: int = 20):
         "sharpe_ratio", "total_trades", "profit_factor", "final_equity",
         "gross_profit", "gross_loss", "params", "monthly_pnl", "equity_curve",
     ]
+    all_reports = _reports_list()
     result = []
-    for r in _saved_reports[:limit]:
+    for r in all_reports[:limit]:
         entry = {k: r[k] for k in summary_keys if k in r}
         result.append(entry)
     return {"reports": result, "count": len(result)}
@@ -1335,22 +1397,20 @@ async def get_reports(limit: int = 20):
 
 @router.post("/reports")
 async def save_report(report: dict):
-    """手動儲存一筆優化報告到 _saved_reports。"""
-    global _saved_reports
+    """手動儲存一筆優化報告（持久化至 diskcache）。"""
     import datetime as _dt
     report["saved_at"] = report.get("saved_at") or _dt.datetime.now().isoformat()
-    _saved_reports.insert(0, report)
-    if len(_saved_reports) > MAX_SAVED_REPORTS:
-        _saved_reports = _saved_reports[:MAX_SAVED_REPORTS]
-    return {"status": "saved", "total": len(_saved_reports)}
+    _reports_prepend(report)
+    return {"status": "saved", "total": len(_reports_list())}
 
 
 @router.get("/reports/{index}")
 async def get_report_detail(index: int):
     """取得特定報告的完整資料（含 trades）。"""
-    if index < 0 or index >= len(_saved_reports):
+    all_reports = _reports_list()
+    if index < 0 or index >= len(all_reports):
         raise HTTPException(status_code=404, detail="Report not found")
-    return _saved_reports[index]
+    return all_reports[index]
 
 
 @router.post("/parse")
