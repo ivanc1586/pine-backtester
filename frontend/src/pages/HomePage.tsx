@@ -1,15 +1,15 @@
 // HomePage.tsx
-// v1.3.0 - 2026-03-01
-// 首頁：市場概覽（24h走勢 + 點擊跳全頁KLineChart）+ 策略概覽（strategyStore）+ 近期回測活動（/api/strategies/activities）
+// v1.4.0 - 2026-03-01
+// 策略總覽點擊直接查看完整報告；近期回測活動加「看報告」按鈕
 
 import React, { useEffect, useState, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useStrategyStore, Strategy } from '../store/strategyStore'
-import { Edit2, Trash2, Plus } from 'lucide-react'
+import { Edit2, Trash2, Plus, FileText } from 'lucide-react'
 
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------
 // Types
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------
 interface Candle { t: number; o: number; h: number; l: number; c: number; v: number }
 interface MarketTicker {
   symbol: string
@@ -22,6 +22,7 @@ interface MarketTicker {
 }
 interface Activity {
   id?: string
+  name?: string
   symbol?: string
   interval?: string
   saved_at?: string
@@ -29,12 +30,27 @@ interface Activity {
   win_rate?: number
   max_drawdown?: number
   total_trades?: number
+  profit_factor?: number
+  sharpe_ratio?: number
   type?: string
+  // full report fields
+  equity_curve?: number[]
+  monthly_pnl?: Record<string, number>
+  trades?: any[]
+  params?: Record<string, number>
+  final_equity?: number
+  gross_profit?: number
+  gross_loss?: number
+  start_date?: string
+  end_date?: string
+  market_type?: string
+  initial_capital?: number
+  commission_value?: number
 }
 
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------
 // Constants
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------
 const MARKET_SYMBOLS = [
   { symbol: 'BTCUSDT', label: 'BTC / USD' },
   { symbol: 'ETHUSDT', label: 'ETH / USD' },
@@ -43,9 +59,9 @@ const MARKET_SYMBOLS = [
 ]
 const API_BASE = ((import.meta as any).env?.VITE_API_URL ?? '').replace(/\/$/, '')
 
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------
 // Mini spark line chart (24h)
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------
 function SparkLine({ candles, color }: { candles: Candle[]; color: string }) {
   if (!candles || candles.length < 2) return <div className="h-12 w-full bg-gray-800 rounded animate-pulse" />
   const closes = candles.map(c => c.c)
@@ -61,9 +77,9 @@ function SparkLine({ candles, color }: { candles: Candle[]; color: string }) {
   )
 }
 
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------
 // MAIN COMPONENT
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------
 export default function HomePage() {
   const navigate = useNavigate()
   const { strategies, fetchStrategies, deleteStrategy } = useStrategyStore()
@@ -73,59 +89,52 @@ export default function HomePage() {
   const isMountedRef = useRef(false)
 
   // 1) Fetch market tickers in parallel — 24h hourly candles
-  const fetchMarketData = useCallback(async () => {
-    const init: MarketTicker[] = MARKET_SYMBOLS.map(s => ({
-      ...s,
-      candles: [],
-      latest_price: 0,
-      change_pct: 0,
-      loading: true
-    }))
-    setTickers(init)
-    const results = await Promise.allSettled(
-      MARKET_SYMBOLS.map(async (s) => {
-        try {
-          // 24h走勢：1h K線，取24根
-          const url = `https://api.binance.com/api/v3/klines?symbol=${s.symbol}&interval=1h&limit=24`
-          const res = await fetch(url)
+  useEffect(() => {
+    const loadTickers = async () => {
+      const init: MarketTicker[] = MARKET_SYMBOLS.map(s => ({ ...s, candles: [], latest_price: 0, change_pct: 0, loading: true }))
+      setTickers(init)
+      const results = await Promise.allSettled(
+        MARKET_SYMBOLS.map(async ({ symbol, label }) => {
+          const res = await fetch(`${API_BASE}/api/market/candles?symbol=${symbol}&interval=1h&limit=24`)
           if (!res.ok) throw new Error(`HTTP ${res.status}`)
-          const data = await res.json()
-          const candles: Candle[] = data.map((k: any) => ({
-            t: k[0] / 1000,
-            o: parseFloat(k[1]),
-            h: parseFloat(k[2]),
-            l: parseFloat(k[3]),
-            c: parseFloat(k[4]),
-            v: parseFloat(k[5])
-          }))
-          const latest = candles[candles.length - 1]?.c ?? 0
-          const prev = candles[0]?.o ?? 1
-          const pct = ((latest - prev) / prev) * 100
-          return { ...s, candles, latest_price: latest, change_pct: pct, loading: false }
-        } catch (err: any) {
-          return { ...s, candles: [], latest_price: 0, change_pct: 0, loading: false, error: err.message }
-        }
-      })
-    )
-    const tickersData = results.map((r, i) =>
-      r.status === 'fulfilled' ? r.value : { ...MARKET_SYMBOLS[i], candles: [], latest_price: 0, change_pct: 0, loading: false, error: 'Failed' }
-    )
-    setTickers(tickersData)
+          const data: Candle[] = await res.json()
+          if (!data.length) throw new Error('No data')
+          const latest = data[data.length - 1].c
+          const first = data[0].o
+          const change = ((latest - first) / first) * 100
+          return { symbol, label, candles: data, latest_price: latest, change_pct: change, loading: false }
+        })
+      )
+      setTickers(
+        results.map((r, i) =>
+          r.status === 'fulfilled'
+            ? r.value
+            : { ...MARKET_SYMBOLS[i], candles: [], latest_price: 0, change_pct: 0, loading: false, error: 'Failed' }
+        )
+      )
+    }
+    loadTickers()
   }, [])
 
-  // 2) Fetch recent activity records from backend
-  const fetchActivities = useCallback(async () => {
+  // 2) Fetch strategies from store
+  useEffect(() => {
+    if (!isMountedRef.current) {
+      isMountedRef.current = true
+      fetchStrategies()
+    }
+  }, [fetchStrategies])
+
+  // 3) Fetch recent activities
+  const loadActivities = useCallback(async () => {
     setLoadingActivities(true)
     try {
-      const res = await fetch(`${API_BASE}/api/strategies/activities`)
+      const res = await fetch(`${API_BASE}/api/strategies/activities?limit=5`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      const arr: Activity[] = Array.isArray(data) ? data : data.activities ?? []
-      // Only show type=activity records
-      const filtered = arr.filter(a => !a.type || a.type === 'activity')
-      setActivities(filtered.slice(0, 10))
+      // API returns { activities: [...] } or plain array
+      setActivities(Array.isArray(data) ? data : (data.activities ?? []))
     } catch (err) {
-      console.error('Failed to fetch activities:', err)
+      console.error('Failed to load activities:', err)
       setActivities([])
     } finally {
       setLoadingActivities(false)
@@ -133,189 +142,214 @@ export default function HomePage() {
   }, [])
 
   useEffect(() => {
-    if (!isMountedRef.current) {
-      isMountedRef.current = true
-      fetchMarketData()
-      fetchActivities()
-      fetchStrategies()
-    }
-  }, [fetchMarketData, fetchActivities, fetchStrategies])
+    loadActivities()
+  }, [loadActivities])
 
-  // 3) UI helpers
-  const formatPrice = (v?: number) => {
-    if (v == null || isNaN(v)) return '$0.000000'
-    if (v >= 1000) return `$${v.toFixed(2)}`
-    if (v >= 1) return `$${v.toFixed(4)}`
-    return `$${v.toFixed(6)}`
+  // 4) Delete strategy handler
+  const handleDelete = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (!confirm('確定刪除此策略？')) return
+    await deleteStrategy(id)
   }
-  const pctColor = (val?: number) => {
-    if (val == null || isNaN(val)) return 'text-green-400'
-    return val >= 0 ? 'text-green-400' : 'text-red-400'
-  }
-  const formatPct = (val?: number) => {
-    if (val == null || isNaN(val)) return '+0.00%'
-    return `${val >= 0 ? '+' : ''}${val.toFixed(2)}%`
+
+  // 5) Navigate to report — check sessionStorage first, then use id
+  const goToReport = (id: string, activity?: Activity) => {
+    if (activity && id) {
+      // Cache full data in sessionStorage so ReportPage can display without re-fetch
+      const cached = sessionStorage.getItem(`report_${id}`)
+      if (!cached && activity.equity_curve) {
+        sessionStorage.setItem(`report_${id}`, JSON.stringify({ ...activity, id }))
+      }
+    }
+    navigate(`/report/${id}`)
   }
 
   return (
-    <div className="min-h-screen bg-gray-900 text-gray-100">
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 p-6">
+      <div className="max-w-7xl mx-auto space-y-6">
 
-      {/* ── 市場概覽 ── */}
-      <div className="px-6 pt-6">
-        <div className="flex items-center gap-3 mb-4">
-          <span className="text-base font-semibold text-gray-200">市場概覽</span>
-          <span className="text-xs px-2 py-0.5 rounded bg-green-500/20 text-green-400 font-medium">+ LIVE</span>
-          <a href="/chart" className="ml-auto text-xs text-blue-400 hover:text-blue-300">查看所有市場</a>
+        {/* Header */}
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold text-white">Dashboard</h1>
+            <p className="text-gray-400 text-sm mt-1">市場概覽 &amp; 策略管理</p>
+          </div>
         </div>
 
-        <div className="grid grid-cols-2 xl:grid-cols-4 gap-4 mb-8">
-          {tickers.map(t => {
-            const lineColor = t.change_pct >= 0 ? '#10B981' : '#EF4444'
-            return (
-              <div
-                key={t.symbol}
-                onClick={() => navigate(`/chart?symbol=${t.symbol}&interval=1h`)}
-                className="bg-gray-800 rounded-xl p-4 cursor-pointer hover:bg-gray-750 hover:border-blue-500 border border-gray-700 transition-all"
-              >
-                <div className="flex justify-between items-start mb-1">
-                  <span className="text-xs text-gray-400">{t.label}</span>
-                  <span className={`text-xs font-semibold ${pctColor(t.change_pct)}`}>
-                    {t.loading ? '+0.00%' : formatPct(t.change_pct)}
-                  </span>
+        {/* Market Overview (24h) */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          {tickers.map(ticker => (
+            <div
+              key={ticker.symbol}
+              className="bg-slate-800/60 backdrop-blur border border-white/10 rounded-xl p-4 hover:border-purple-500/30 transition-all"
+            >
+              <div className="flex items-center justify-between mb-3">
+                <div>
+                  <div className="text-white font-semibold text-lg">{ticker.label}</div>
+                  <div className="text-gray-500 text-xs">{ticker.symbol}</div>
                 </div>
-                <div className="text-2xl font-bold text-white mb-2">
-                  {t.loading ? '$0.000000' : formatPrice(t.latest_price)}
-                </div>
-                <SparkLine candles={t.candles} color={lineColor} />
+                {ticker.loading ? (
+                  <div className="w-16 h-8 bg-gray-700 rounded animate-pulse" />
+                ) : ticker.error ? (
+                  <div className="text-red-400 text-xs">Error</div>
+                ) : (
+                  <div className="text-right">
+                    <div className="text-white font-mono text-sm">${ticker.latest_price.toLocaleString()}</div>
+                    <div className={`text-xs font-semibold ${ticker.change_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {ticker.change_pct >= 0 ? '+' : ''}{ticker.change_pct.toFixed(2)}%
+                    </div>
+                  </div>
+                )}
               </div>
-            )
-          })}
-        </div>
-      </div>
-
-      {/* ── 策略概覽 ── */}
-      <div className="px-6 mb-8">
-        <div className="flex items-center gap-3 mb-4">
-          <span className="text-base font-semibold text-gray-200">策略概覽</span>
-          <button
-            onClick={() => navigate('/strategy')}
-            className="ml-auto flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-yellow-500 hover:bg-yellow-400 text-gray-900 font-semibold transition-colors"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            新增策略
-          </button>
+              <SparkLine candles={ticker.candles} color={ticker.change_pct >= 0 ? '#4ade80' : '#f87171'} />
+            </div>
+          ))}
         </div>
 
-        {strategies.length === 0 ? (
-          <div className="bg-gray-800 rounded-xl p-6 text-center text-gray-400 border border-gray-700">
-            尚無策略。點擊「新增策略」開始建立。
+        {/* ── Strategy Overview (策略總覽) ── */}
+        <div className="bg-slate-800/60 backdrop-blur border border-white/10 rounded-xl p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-xl font-bold text-white">策略總覽</h2>
+            <button
+              onClick={() => navigate('/strategy')}
+              className="flex items-center gap-2 px-4 py-2 bg-purple-500 hover:bg-purple-600 text-white rounded-lg text-sm font-medium transition-colors"
+            >
+              <Plus className="w-4 h-4" />
+              新增策略
+            </button>
           </div>
-        ) : (
-          <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
-            <table className="w-full text-sm">
-              <thead className="bg-gray-700/50">
-                <tr>
-                  <th className="px-4 py-3 text-left text-gray-400 font-medium">策略名稱</th>
-                  <th className="px-4 py-3 text-left text-gray-400 font-medium">狀態</th>
-                  <th className="px-4 py-3 text-left text-gray-400 font-medium">勝率</th>
-                  <th className="px-4 py-3 text-left text-gray-400 font-medium">淨利率</th>
-                  <th className="px-4 py-3 text-left text-gray-400 font-medium">最大回撤</th>
-                  <th className="px-4 py-3 text-right text-gray-400 font-medium">操作</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-700">
-                {strategies.map((s: Strategy) => (
-                  <tr key={s.id} className="hover:bg-gray-700/30 transition-colors">
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-2.5">
-                        <div className="w-7 h-7 rounded-lg bg-yellow-500/20 flex items-center justify-center">
-                          <span className="text-yellow-400 text-xs">⚡</span>
-                        </div>
-                        <div>
-                          <div className="text-white font-medium text-sm">{s.name}</div>
-                          <div className="text-gray-500 text-xs">{s.description?.slice(0, 30) ?? '-'}</div>
-                        </div>
-                      </div>
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className="text-xs px-2 py-0.5 rounded border border-gray-500 text-gray-400">BACKTEST</span>
-                    </td>
-                    <td className="px-4 py-3 text-gray-300">-</td>
-                    <td className="px-4 py-3 text-gray-300">-</td>
-                    <td className="px-4 py-3 text-red-400">-</td>
-                    <td className="px-4 py-3 text-right">
-                      <div className="flex items-center justify-end gap-2">
-                        <button
-                          onClick={() => navigate('/strategy')}
-                          className="p-1.5 rounded hover:bg-gray-600 text-gray-400 hover:text-white transition-colors"
-                        >
-                          <Edit2 className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          onClick={() => deleteStrategy(s.id)}
-                          className="p-1.5 rounded hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition-colors"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-
-      {/* ── 近期回測活動 ── */}
-      <div className="px-6 pb-8">
-        <div className="flex items-center gap-3 mb-4">
-          <span className="text-base font-semibold text-gray-200">近期回測活動</span>
-        </div>
-
-        {loadingActivities ? (
-          <div className="bg-gray-800 rounded-xl p-6 text-center text-gray-400 border border-gray-700">載入中...</div>
-        ) : activities.length === 0 ? (
-          <div className="bg-gray-800 rounded-xl p-6 text-center text-gray-400 border border-gray-700">
-            尚無回測活動。執行回測後會顯示於此。
-          </div>
-        ) : (
-          <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
-            {activities.map((a, idx) => (
-              <div key={a.id ?? idx} className="flex items-center px-4 py-3 border-b border-gray-700 last:border-0 hover:bg-gray-700/30 transition-colors">
-                <div className="w-7 h-7 rounded-full bg-green-500/20 flex items-center justify-center mr-3 flex-shrink-0">
-                  <span className="text-green-400 text-xs">✓</span>
-                </div>
-                <div className="flex-1">
-                  <div className="text-sm text-white font-medium">
-                    {a.symbol ?? '-'} · {a.interval ?? '-'} · 完成
-                  </div>
-                  <div className="text-xs text-gray-400">
-                    {a.saved_at ? new Date(a.saved_at).toLocaleDateString('zh-TW') : '-'} · 淨利率{' '}
-                    <span className={a.profit_pct != null && a.profit_pct >= 0 ? 'text-green-400' : 'text-red-400'}>
-                      {a.profit_pct != null ? `${a.profit_pct >= 0 ? '+' : ''}${a.profit_pct.toFixed(2)}%` : '-'}
-                    </span>
-                    {a.win_rate != null && (
-                      <> · 勝率 <span className="text-blue-400">{(a.win_rate * 100).toFixed(1)}%</span></>
-                    )}
-                    {a.max_drawdown != null && (
-                      <> · 回撤 <span className="text-red-400">{a.max_drawdown.toFixed(2)}%</span></>
-                    )}
-                    {a.total_trades != null && (
-                      <> · {a.total_trades} 筆</>
-                    )}
-                  </div>
-                </div>
-                <button
-                  onClick={() => navigate('/results')}
-                  className="text-xs text-blue-400 hover:text-blue-300"
+          {strategies.length === 0 ? (
+            <div className="text-gray-400 text-center py-8">尚無策略，請至參數優化頁面執行回測</div>
+          ) : (
+            <div className="space-y-3">
+              {strategies.slice(0, 10).map((s: Strategy) => (
+                <div
+                  key={s.id}
+                  onClick={() => goToReport(s.id)}
+                  className="flex items-center justify-between p-4 bg-slate-700/40 rounded-lg hover:bg-slate-700/70 transition-colors cursor-pointer group"
                 >
-                  查看報告
-                </button>
-              </div>
-            ))}
+                  <div className="flex-1 min-w-0">
+                    <div className="text-white font-semibold group-hover:text-purple-300 transition-colors">{s.name}</div>
+                    <div className="text-gray-400 text-xs mt-1">{s.symbol} • {s.interval}</div>
+                  </div>
+                  {/* Metrics */}
+                  <div className="hidden md:flex items-center gap-6 mx-4 text-right">
+                    {(s as any).profit_pct != null && (
+                      <div>
+                        <div className="text-xs text-gray-500">獲利率</div>
+                        <div className={`text-sm font-semibold ${(s as any).profit_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          {(s as any).profit_pct >= 0 ? '+' : ''}{(s as any).profit_pct?.toFixed(2)}%
+                        </div>
+                      </div>
+                    )}
+                    {(s as any).max_drawdown != null && (
+                      <div>
+                        <div className="text-xs text-gray-500">MDD</div>
+                        <div className="text-sm font-semibold text-red-400">
+                          {((s as any).max_drawdown * 100).toFixed(2)}%
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={e => { e.stopPropagation(); goToReport(s.id) }}
+                      className="flex items-center gap-1 px-3 py-1.5 bg-purple-500/20 hover:bg-purple-500/40 text-purple-300 rounded-lg text-xs font-medium transition-colors"
+                    >
+                      <FileText className="w-3 h-3" />
+                      查看報告
+                    </button>
+                    <button
+                      onClick={e => handleDelete(s.id, e)}
+                      className="p-2 hover:bg-red-500/20 rounded-lg transition-colors"
+                    >
+                      <Trash2 className="w-4 h-4 text-red-400" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {strategies.length > 10 && (
+                <div className="text-gray-500 text-sm text-center pt-2">
+                  顯示前 10 筆，共 {strategies.length} 筆策略
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* ── Recent Activities (近期回測活動) ── */}
+        <div className="bg-slate-800/60 backdrop-blur border border-white/10 rounded-xl p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-xl font-bold text-white">近期回測活動</h2>
+            <button
+              onClick={loadActivities}
+              className="text-gray-400 hover:text-white text-xs px-3 py-1.5 bg-white/5 hover:bg-white/10 rounded-lg transition-colors"
+            >
+              重新整理
+            </button>
           </div>
-        )}
+          {loadingActivities ? (
+            <div className="text-gray-400 text-center py-8">載入中...</div>
+          ) : activities.length === 0 ? (
+            <div className="text-gray-400 text-center py-8">尚無回測記錄，執行優化後自動出現</div>
+          ) : (
+            <div className="space-y-3">
+              {activities.map((a, idx) => (
+                <div
+                  key={a.id || idx}
+                  className="flex items-center justify-between p-4 bg-slate-700/40 rounded-lg hover:bg-slate-700/60 transition-colors"
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="text-white font-semibold truncate">
+                      {a.name ?? `${a.type === 'backtest' ? '回測' : '優化'} - ${a.symbol} (${a.interval})`}
+                    </div>
+                    <div className="text-gray-400 text-xs mt-1">
+                      {a.saved_at ? new Date(a.saved_at).toLocaleString('zh-TW') : '-'}
+                      {a.symbol && ` · ${a.symbol}`}
+                      {a.interval && ` · ${a.interval}`}
+                    </div>
+                  </div>
+                  <div className="hidden sm:grid grid-cols-4 gap-4 text-right mx-4">
+                    <div>
+                      <div className="text-xs text-gray-500">獲利率</div>
+                      <div className={`text-sm font-semibold ${(a.profit_pct ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {(a.profit_pct ?? 0) >= 0 ? '+' : ''}{(a.profit_pct ?? 0).toFixed(2)}%
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500">勝率</div>
+                      <div className="text-sm font-semibold text-white">
+                        {((a.win_rate ?? 0) * 100).toFixed(1)}%
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500">MDD</div>
+                      <div className="text-sm font-semibold text-red-400">
+                        {((a.max_drawdown ?? 0) * 100).toFixed(2)}%
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500">盈虧比</div>
+                      <div className="text-sm font-semibold text-white">
+                        {(a.profit_factor ?? 0).toFixed(2)}
+                      </div>
+                    </div>
+                  </div>
+                  {a.id && (
+                    <button
+                      onClick={() => goToReport(a.id!, a)}
+                      className="flex items-center gap-1 px-3 py-1.5 bg-purple-500/20 hover:bg-purple-500/40 text-purple-300 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ml-2"
+                    >
+                      <FileText className="w-3 h-3" />
+                      看報告
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
       </div>
     </div>
   )
