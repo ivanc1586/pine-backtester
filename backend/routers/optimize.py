@@ -193,10 +193,14 @@ def parse_pine_inputs(pine_script: str) -> list[dict]:
         seen.add(var_name)
 
         def get_named(key: str, default=None):
-            pat = re.compile(rf'{key}\s*=\s*([^,\)]+)', re.IGNORECASE)
-            found = pat.search(args_str)
-            if found:
-                return found.group(1).strip().strip('"\'')
+            # Support quoted values (possibly containing commas/spaces) and unquoted values
+            pat_quoted   = re.compile(rf'{key}\s*=\s*"([^"]*)"', re.IGNORECASE)
+            pat_squoted  = re.compile(rf"{key}\s*=\s*'([^']*)'", re.IGNORECASE)
+            pat_unquoted = re.compile(rf'{key}\s*=\s*([^,\)\s]+)', re.IGNORECASE)
+            for pat in (pat_quoted, pat_squoted, pat_unquoted):
+                found = pat.search(args_str)
+                if found:
+                    return found.group(1).strip()
             return default
 
         positional = re.split(r',(?![^(]*\))', args_str)
@@ -571,8 +575,19 @@ async def translate_with_gemini(pine_script: str, bypass_cache: bool = False) ->
 
 def _get_fallback_strategy() -> str:
     return '''def run_strategy(df: pd.DataFrame, **params) -> dict:
-    fast = int(params.get("fastLength", params.get("fast_length", 9)))
-    slow = int(params.get("slowLength", params.get("slow_length", 21)))
+    # Dynamically pick the first two int-like params as fast/slow period
+    # This ensures fallback works regardless of Pine Script param names
+    _sys_keys = {"initial_capital", "commission", "commission_type", "commission_value", "qty_value", "qty_type"}
+    _int_vals = sorted(
+        [(k, int(v)) for k, v in params.items()
+         if k not in _sys_keys and isinstance(v, (int, float)) and int(v) > 0],
+        key=lambda x: x[1]
+    )
+    fast = _int_vals[0][1] if len(_int_vals) > 0 else 9
+    slow = _int_vals[1][1] if len(_int_vals) > 1 else 21
+    # Ensure fast < slow to produce valid crossover signals
+    if fast >= slow:
+        slow = fast + max(1, fast // 2)
     qty_value = float(params.get("qty_value", 1.0))
     commission_value = float(params.get("commission_value", 0.001))
     capital = float(params.get("initial_capital", 10000.0))
