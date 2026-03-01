@@ -466,9 +466,23 @@ export default function ReportPage() {
   useEffect(() => {
     if (!id) return
     setLoading(true)
+    // 先查 sessionStorage（temp id 或已快取的資料）
+    const cached = sessionStorage.getItem(`report_${id}`)
+    if (cached) {
+      try {
+        setData(JSON.parse(cached))
+        setLoading(false)
+        return
+      } catch (_) {}
+    }
+    // 沒有快取才打後端 API
     fetch(`${API_BASE}/api/strategies/${id}`)
       .then(r => r.ok ? r.json() : Promise.reject(r.statusText))
-      .then(json => setData(json))
+      .then(json => {
+        setData(json)
+        // 快取到 sessionStorage 供後續使用
+        sessionStorage.setItem(`report_${id}`, JSON.stringify(json))
+      })
       .catch(err => console.error('Failed to load report:', err))
       .finally(() => setLoading(false))
   }, [id])
@@ -537,7 +551,7 @@ export default function ReportPage() {
 
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* ── Header ── */}
+      {/* -- Header -- */}
       <div className="bg-white border-b border-gray-200 sticky top-0 z-10">
         <div className="max-w-7xl mx-auto px-4 py-3 flex items-center gap-4">
           <button
@@ -561,7 +575,7 @@ export default function ReportPage() {
           </div>
         </div>
 
-        {/* ── Tabs ── */}
+        {/* -- Tabs -- */}
         <div className="max-w-7xl mx-auto px-4 flex gap-0 overflow-x-auto">
           <TabBtn active={activeTab === 'overview'} onClick={() => setActiveTab('overview')}>績效總覽</TabBtn>
           <TabBtn active={activeTab === 'equity'} onClick={() => setActiveTab('equity')}>資金曲線</TabBtn>
@@ -575,9 +589,7 @@ export default function ReportPage() {
 
       <div className="max-w-7xl mx-auto px-4 py-6">
 
-        {/* ════════════════════════════════════════════════
-            Tab 1: 績效總覽
-        ════════════════════════════════════════════════ */}
+        {/* Tab 1: 績效總覽 */}
         {activeTab === 'overview' && (
           <div className="space-y-6">
             {/* Top metric cards */}
@@ -620,7 +632,7 @@ export default function ReportPage() {
               <EquityDrawdownChart equityData={data.equity_curve} trades={data.trades} />
             </div>
 
-            {/* Detailed stats table — TV style */}
+            {/* Detailed stats table -- TV style */}
             <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
               <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
                 <h2 className="font-semibold text-gray-800">詳細績效統計</h2>
@@ -730,9 +742,7 @@ export default function ReportPage() {
           </div>
         )}
 
-        {/* ════════════════════════════════════════════════
-            Tab 2: 資金曲線
-        ════════════════════════════════════════════════ */}
+        {/* Tab 2: 資金曲線 */}
         {activeTab === 'equity' && (
           <div className="space-y-4">
             <div className="bg-white border border-gray-200 rounded-lg p-6">
@@ -762,9 +772,7 @@ export default function ReportPage() {
           </div>
         )}
 
-        {/* ════════════════════════════════════════════════
-            Tab 3: 月度分析
-        ════════════════════════════════════════════════ */}
+        {/* Tab 3: 月度分析 */}
         {activeTab === 'monthly' && (
           <div className="space-y-6">
             <div className="bg-white border border-gray-200 rounded-lg p-6">
@@ -775,9 +783,7 @@ export default function ReportPage() {
           </div>
         )}
 
-        {/* ════════════════════════════════════════════════
-            Tab 4: 交易明細
-        ════════════════════════════════════════════════ */}
+        {/* Tab 4: 交易明細 */}
         {activeTab === 'trades' && (
           <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
             <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
@@ -788,9 +794,7 @@ export default function ReportPage() {
           </div>
         )}
 
-        {/* ════════════════════════════════════════════════
-            Tab 5: 策略設定
-        ════════════════════════════════════════════════ */}
+        {/* Tab 5: 策略設定 */}
         {activeTab === 'settings' && (
           <div className="grid md:grid-cols-2 gap-6">
             {/* Backtest settings */}
