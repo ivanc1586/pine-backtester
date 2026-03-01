@@ -1,18 +1,22 @@
 import { BrowserRouter, Routes, Route, NavLink, Navigate } from 'react-router-dom'
-import { LineChart, Code2, Settings, BarChart3, TrendingUp, Zap } from 'lucide-react'
+import { LineChart, Code2, Settings, BarChart3, TrendingUp, Zap, Globe } from 'lucide-react'
 import ChartPage from './pages/ChartPage'
 import StrategyPage from './pages/StrategyPage'
 import OptimizePage from './pages/OptimizePage'
 import ResultsPage from './pages/ResultsPage'
 import PerformancePage from './pages/PerformancePage'
+import HomePage from './pages/HomePage'
+import MarketsPage from './pages/MarketsPage'
+import ReportPage from './pages/ReportPage'
 import { useStrategyStore } from './store/strategyStore'
 
 const navItems = [
-  { path: '/chart', label: '即時行情', icon: LineChart },
-  { path: '/strategy', label: '策略管理', icon: Code2 },
-  { path: '/optimize', label: '參數優化', icon: Settings },
-  { path: '/results', label: '回測結果', icon: BarChart3 },
-  { path: '/performance', label: '月度績效', icon: TrendingUp },
+  { path: '/',         label: '首頁',     icon: BarChart3  },
+  { path: '/markets',  label: '市場',     icon: Globe      },
+  { path: '/chart',    label: '即時行情', icon: LineChart   },
+  { path: '/strategy', label: '策略管理', icon: Code2       },
+  { path: '/optimize', label: '參數優化', icon: Settings   },
+  { path: '/results',  label: '回測結果', icon: TrendingUp  },
 ]
 
 export default function App() {
@@ -35,6 +39,7 @@ export default function App() {
               <NavLink
                 key={path}
                 to={path}
+                end={path === '/'}
                 className={({ isActive }) =>
                   `flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-150 ${
                     isActive
@@ -61,12 +66,14 @@ export default function App() {
         {/* Main Content */}
         <main className="flex-1 overflow-hidden flex flex-col">
           <Routes>
-            <Route path="/" element={<Navigate to="/chart" replace />} />
+            <Route path="/" element={<HomePage />} />
+            <Route path="/markets" element={<MarketsPage />} />
             <Route path="/chart" element={<ChartPage />} />
             <Route path="/strategy" element={<StrategyPage />} />
             <Route path="/optimize" element={<OptimizePage />} />
             <Route path="/results" element={<ResultsPage />} />
             <Route path="/performance" element={<PerformancePage />} />
+            <Route path="/report/:id" element={<ReportPage />} />
           </Routes>
         </main>
       </div>
