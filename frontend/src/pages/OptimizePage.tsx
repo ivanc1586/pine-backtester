@@ -1112,20 +1112,6 @@ export default function OptimizePage() {
                                 color: '#848e9c', whiteSpace: 'nowrap',
                               }}
                             >查看報告</button>
-                            <button
-                              onClick={e => { e.stopPropagation(); saveToStrategy(r) }}
-                              disabled={savedToStrategyRanks.has(r.rank) || savingRank === r.rank}
-                              style={{
-                                padding: '4px 8px', borderRadius: 4, fontSize: 10, cursor: savedToStrategyRanks.has(r.rank) ? 'default' : 'pointer', fontWeight: 600,
-                                background: savedToStrategyRanks.has(r.rank) ? 'rgba(38,166,154,0.1)' : 'rgba(240,185,11,0.1)',
-                                border: `1px solid ${savedToStrategyRanks.has(r.rank) ? 'rgba(38,166,154,0.3)' : 'rgba(240,185,11,0.3)'}`,
-                                color: savedToStrategyRanks.has(r.rank) ? '#26a69a' : '#f0b90b',
-                                opacity: savingRank === r.rank ? 0.6 : 1,
-                                whiteSpace: 'nowrap',
-                              }}
-                            >
-                              {savedToStrategyRanks.has(r.rank) ? '已儲存 ✓' : savingRank === r.rank ? '儲存中...' : '儲存到策略總覽'}
-                            </button>
                           </div>
                         </td>
                       </tr>
@@ -1158,20 +1144,6 @@ export default function OptimizePage() {
                 >
                   <Copy size={13} />
                   複製優化代碼
-                </button>
-                <button
-                  onClick={() => selectedResult && saveToStrategy(selectedResult)}
-                  disabled={!!selectedResult && (savedToStrategyRanks.has(selectedResult.rank) || savingRank === selectedResult.rank)}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
-                    background: selectedResult && savedToStrategyRanks.has(selectedResult.rank) ? 'rgba(38,166,154,0.15)' : 'rgba(38,166,154,0.1)',
-                    border: `1px solid rgba(38,166,154,0.3)`,
-                    borderRadius: 4, color: '#26a69a',
-                    fontSize: 12, cursor: selectedResult && savedToStrategyRanks.has(selectedResult.rank) ? 'default' : 'pointer', fontWeight: 600,
-                    opacity: savingRank === selectedResult?.rank ? 0.6 : 1,
-                  }}
-                >
-                  {selectedResult && savedToStrategyRanks.has(selectedResult.rank) ? '已儲存 ✓' : savingRank === selectedResult?.rank ? '儲存中...' : '儲存到策略總覽'}
                 </button>
               </div>
             </div>
@@ -1279,7 +1251,22 @@ export default function OptimizePage() {
                   {copiedCode ? <Check size={14} /> : <Copy size={14} />}
                   {copiedCode ? '已複製到剪貼簿！' : '複製優化後的 Pine Script'}
                 </button>
-
+                <button
+                  onClick={() => selectedResult && saveToStrategy(selectedResult)}
+                  disabled={!!selectedResult && (savedToStrategyRanks.has(selectedResult.rank) || savingRank === selectedResult.rank)}
+                  style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+                    padding: '8px 16px', borderRadius: 4,
+                    background: selectedResult && savedToStrategyRanks.has(selectedResult.rank) ? 'rgba(38,166,154,0.15)' : 'rgba(38,166,154,0.1)',
+                    border: '1px solid rgba(38,166,154,0.3)',
+                    color: '#26a69a',
+                    fontSize: 13, cursor: selectedResult && savedToStrategyRanks.has(selectedResult.rank) ? 'default' : 'pointer', fontWeight: 600,
+                    opacity: savingRank === selectedResult?.rank ? 0.6 : 1,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {selectedResult && savedToStrategyRanks.has(selectedResult.rank) ? '已儲存 ✓' : savingRank === selectedResult?.rank ? '儲存中...' : '儲存到策略總覽'}
+                </button>
               </div>
 
               {/* 代碼預覽 */}
