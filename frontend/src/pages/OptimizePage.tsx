@@ -297,7 +297,18 @@ export default function OptimizePage() {
   const [isRunning,      setIsRunning]      = useState(false)
   const [progress,       setProgress]       = useState(0)
   const [progressText,   setProgressText]   = useState('')
-  const [results,        setResults]        = useState<OptimizeResult[]>([])
+  const [results,        setResults]        = useState<OptimizeResult[]>(() => {
+    // Restore from sessionStorage if within 30-minute TTL
+    try {
+      const raw = sessionStorage.getItem('optimize_results')
+      if (raw) {
+        const { data, savedAt } = JSON.parse(raw)
+        if (Date.now() - savedAt < 30 * 60 * 1000) return data
+        sessionStorage.removeItem('optimize_results')
+      }
+    } catch { /* ignore */ }
+    return []
+  })
   const [selectedResult, setSelectedResult] = useState<OptimizeResult | null>(null)
   const [copiedCode,     setCopiedCode]     = useState(false)
   const [showExportModal, setShowExportModal] = useState(false)
@@ -314,6 +325,15 @@ export default function OptimizePage() {
   const navigate = useNavigate()
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // 優化結果持久化：results 有資料時寫入 sessionStorage（TTL 30 分鐘）
+  useEffect(() => {
+    if (results.length > 0) {
+      try {
+        sessionStorage.setItem('optimize_results', JSON.stringify({ data: results, savedAt: Date.now() }))
+      } catch { /* ignore quota errors */ }
+    }
+  }, [results])
 
   // 日誌自動捲到底
   useEffect(() => {
@@ -538,6 +558,8 @@ export default function OptimizePage() {
     setResults([]); setSelectedResult(null); setErrorMsg('')
     setLogs(['▶ 開始策略優化...'])
     setSavedToStrategyRanks(new Set())
+    // 清除上一次的排行榜暫存，開始全新優化
+    try { sessionStorage.removeItem('optimize_results') } catch { /* ignore */ }
 
     try {
       const res = await fetch(`${API_BASE}/api/optimize/run`, {
