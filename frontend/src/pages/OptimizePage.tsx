@@ -13,6 +13,7 @@
 // =============================================================================
 
 import React, { useState, useRef, useEffect, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
   Play, Sparkles, Settings2, Copy, Check,
   TrendingUp, BarChart2, Zap, AlertCircle, RefreshCw, Target, X, Terminal
@@ -306,6 +307,12 @@ export default function OptimizePage() {
   const [logs, setLogs] = useState<string[]>([])
   const logEndRef = useRef<HTMLDivElement>(null)
 
+  // 防重複儲存：已儲存到策略總覽的 rank set
+  const [savedToStrategyRanks, setSavedToStrategyRanks] = useState<Set<number>>(new Set())
+  const [savingRank, setSavingRank] = useState<number | null>(null)
+
+  const navigate = useNavigate()
+
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // 日誌自動捲到底
@@ -428,6 +435,91 @@ export default function OptimizePage() {
   }
 
   // ---------------------------------------------------------------------------
+  // Save result to strategy overview (manual, with dedup guard)
+  // ---------------------------------------------------------------------------
+  const saveToStrategy = useCallback(async (r: OptimizeResult) => {
+    if (savedToStrategyRanks.has(r.rank)) return
+    setSavingRank(r.rank)
+    try {
+      const res = await fetch(`${API_BASE}/api/strategies`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'strategy',
+          name: `${symbol} ${intervalVal} #${r.rank}`,
+          symbol,
+          market_type: marketType,
+          interval: intervalVal,
+          start_date: startDate,
+          end_date: endDate,
+          profit_pct:    r.profit_pct,
+          win_rate:      r.win_rate,
+          max_drawdown:  r.max_drawdown,
+          sharpe_ratio:  r.sharpe_ratio,
+          profit_factor: r.profit_factor,
+          total_trades:  r.total_trades,
+          final_equity:  r.final_equity,
+          gross_profit:  r.gross_profit,
+          gross_loss:    r.gross_loss,
+          params:        r.params,
+          equity_curve:  r.equity_curve,
+          monthly_pnl:   r.monthly_pnl,
+          trades:        r.trades ?? [],
+          rank: r.rank,
+        }),
+      })
+      if (res.ok) {
+        const saved = await res.json()
+        const savedId = saved.id
+        if (savedId) {
+          const reportPayload = {
+            ...r,
+            id: savedId,
+            name: `${symbol} ${intervalVal} #${r.rank}`,
+            type: 'strategy',
+            symbol,
+            market_type: marketType,
+            interval: intervalVal,
+            start_date: startDate,
+            end_date: endDate,
+            saved_at: new Date().toISOString(),
+            initial_capital: initialCapital,
+            commission_type: commissionType,
+            commission_value: commissionValue,
+          }
+          sessionStorage.setItem(`report_${savedId}`, JSON.stringify(reportPayload))
+        }
+        setSavedToStrategyRanks(prev => new Set(prev).add(r.rank))
+      }
+    } catch (_) {}
+    setSavingRank(null)
+  }, [savedToStrategyRanks, symbol, intervalVal, marketType, startDate, endDate, initialCapital, commissionType, commissionValue])
+
+  // ---------------------------------------------------------------------------
+  // View report for a result (stores in sessionStorage then navigates)
+  // ---------------------------------------------------------------------------
+  const viewReport = useCallback((r: OptimizeResult) => {
+    const tempId = `temp_${r.rank}_${Date.now()}`
+    const reportPayload = {
+      ...r,
+      id: tempId,
+      name: `${symbol} ${intervalVal} #${r.rank}`,
+      type: 'optimize_preview',
+      symbol,
+      market_type: marketType,
+      interval: intervalVal,
+      start_date: startDate,
+      end_date: endDate,
+      saved_at: new Date().toISOString(),
+      initial_capital: initialCapital,
+      commission_type: commissionType,
+      commission_value: commissionValue,
+    }
+    sessionStorage.setItem(`report_${tempId}`, JSON.stringify(reportPayload))
+    navigate(`/report/${tempId}`)
+  }, [symbol, intervalVal, marketType, startDate, endDate, initialCapital, commissionType, commissionValue, navigate])
+
+  // ---------------------------------------------------------------------------
   // Update param range
   // ---------------------------------------------------------------------------
   const updateRange = (name: string, field: keyof ParamRange, value: any) => {
@@ -445,6 +537,7 @@ export default function OptimizePage() {
     setIsRunning(true); setProgress(0); setProgressText('正在初始化...')
     setResults([]); setSelectedResult(null); setErrorMsg('')
     setLogs(['▶ 開始策略優化...'])
+    setSavedToStrategyRanks(new Set())
 
     try {
       const res = await fetch(`${API_BASE}/api/optimize/run`, {
@@ -504,7 +597,7 @@ export default function OptimizePage() {
               const firstResult: OptimizeResult = (data.results as OptimizeResult[])[0]
               if (firstResult) {
                 try {
-                  await fetch(`${API_BASE}/api/strategies`, {
+                  const autoSaveRes = await fetch(`${API_BASE}/api/strategies`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -531,6 +624,28 @@ export default function OptimizePage() {
                       rank: 1,
                     }),
                   })
+                  if (autoSaveRes.ok) {
+                    const autoSaveData = await autoSaveRes.json()
+                    const autoId = autoSaveData.id
+                    if (autoId) {
+                      const reportPayload = {
+                        ...firstResult,
+                        id: autoId,
+                        name: `${symbol} ${intervalVal}`,
+                        type: 'activity',
+                        symbol,
+                        market_type: marketType,
+                        interval: intervalVal,
+                        start_date: startDate,
+                        end_date: endDate,
+                        saved_at: new Date().toISOString(),
+                        initial_capital: initialCapital,
+                        commission_type: commissionType,
+                        commission_value: commissionValue,
+                      }
+                      sessionStorage.setItem(`report_${autoId}`, JSON.stringify(reportPayload))
+                    }
+                  }
                   setLogs(prev => [...prev, `💾 第一名已自動儲存到最近活動`])
                 } catch (_) { /* 儲存失敗不影響主流程 */ }
               }
@@ -943,7 +1058,7 @@ export default function OptimizePage() {
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
                   <tr style={{ borderBottom: '1px solid #2b2b43' }}>
-                    {['排名','參數','總盈利%','MDD%','盈虧比','勝率%','交易數','夏普'].map(h => (
+                    {['排名','參數','總盈利%','MDD%','盈虧比','勝率%','交易數','夏普','操作'].map(h => (
                       <th key={h} style={{ padding: '8px 12px', textAlign: h === '排名' || h === '參數' ? 'left' : 'right', color: '#848e9c', fontWeight: 600 }}>{h}</th>
                     ))}
                   </tr>
@@ -987,6 +1102,32 @@ export default function OptimizePage() {
                         <td style={{ padding: '8px 12px', textAlign: 'right', color: '#d1d4dc' }}>{r.win_rate.toFixed(1)}%</td>
                         <td style={{ padding: '8px 12px', textAlign: 'right', color: '#848e9c' }}>{r.total_trades}</td>
                         <td style={{ padding: '8px 12px', textAlign: 'right', color: '#848e9c' }}>{r.sharpe_ratio.toFixed(2)}</td>
+                        <td style={{ padding: '8px 12px', textAlign: 'right' }}>
+                          <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                            <button
+                              onClick={e => { e.stopPropagation(); viewReport(r) }}
+                              style={{
+                                padding: '4px 8px', borderRadius: 4, fontSize: 10, cursor: 'pointer', fontWeight: 600,
+                                background: 'rgba(132,142,156,0.1)', border: '1px solid rgba(132,142,156,0.3)',
+                                color: '#848e9c', whiteSpace: 'nowrap',
+                              }}
+                            >查看報告</button>
+                            <button
+                              onClick={e => { e.stopPropagation(); saveToStrategy(r) }}
+                              disabled={savedToStrategyRanks.has(r.rank) || savingRank === r.rank}
+                              style={{
+                                padding: '4px 8px', borderRadius: 4, fontSize: 10, cursor: savedToStrategyRanks.has(r.rank) ? 'default' : 'pointer', fontWeight: 600,
+                                background: savedToStrategyRanks.has(r.rank) ? 'rgba(38,166,154,0.1)' : 'rgba(240,185,11,0.1)',
+                                border: `1px solid ${savedToStrategyRanks.has(r.rank) ? 'rgba(38,166,154,0.3)' : 'rgba(240,185,11,0.3)'}`,
+                                color: savedToStrategyRanks.has(r.rank) ? '#26a69a' : '#f0b90b',
+                                opacity: savingRank === r.rank ? 0.6 : 1,
+                                whiteSpace: 'nowrap',
+                              }}
+                            >
+                              {savedToStrategyRanks.has(r.rank) ? '已儲存 ✓' : savingRank === r.rank ? '儲存中...' : '儲存到策略總覽'}
+                            </button>
+                          </div>
+                        </td>
                       </tr>
                     )
                   })}
@@ -1004,19 +1145,35 @@ export default function OptimizePage() {
                 <TrendingUp size={14} color="#f0b90b" />
                 <span style={{ fontWeight: 700, fontSize: 13 }}>第 {selectedResult.rank} 名詳細分析</span>
               </div>
-              <button
-                onClick={() => setShowExportModal(true)}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
-                  background: copiedCode ? 'rgba(38,166,154,0.15)' : 'rgba(240,185,11,0.1)',
-                  border: `1px solid ${copiedCode ? 'rgba(38,166,154,0.3)' : 'rgba(240,185,11,0.3)'}`,
-                  borderRadius: 4, color: copiedCode ? '#26a69a' : '#f0b90b',
-                  fontSize: 12, cursor: 'pointer', fontWeight: 600,
-                }}
-              >
-                {copiedCode ? <Check size={13} /> : <Copy size={13} />}
-                {copiedCode ? '已複製！' : '複製優化代碼'}
-              </button>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  onClick={() => setShowExportModal(true)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+                    background: 'rgba(240,185,11,0.1)',
+                    border: '1px solid rgba(240,185,11,0.3)',
+                    borderRadius: 4, color: '#f0b90b',
+                    fontSize: 12, cursor: 'pointer', fontWeight: 600,
+                  }}
+                >
+                  <Copy size={13} />
+                  複製優化代碼
+                </button>
+                <button
+                  onClick={() => selectedResult && saveToStrategy(selectedResult)}
+                  disabled={!!selectedResult && (savedToStrategyRanks.has(selectedResult.rank) || savingRank === selectedResult.rank)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+                    background: selectedResult && savedToStrategyRanks.has(selectedResult.rank) ? 'rgba(38,166,154,0.15)' : 'rgba(38,166,154,0.1)',
+                    border: `1px solid rgba(38,166,154,0.3)`,
+                    borderRadius: 4, color: '#26a69a',
+                    fontSize: 12, cursor: selectedResult && savedToStrategyRanks.has(selectedResult.rank) ? 'default' : 'pointer', fontWeight: 600,
+                    opacity: savingRank === selectedResult?.rank ? 0.6 : 1,
+                  }}
+                >
+                  {selectedResult && savedToStrategyRanks.has(selectedResult.rank) ? '已儲存 ✓' : savingRank === selectedResult?.rank ? '儲存中...' : '儲存到策略總覽'}
+                </button>
+              </div>
             </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8 }}>
@@ -1122,27 +1279,7 @@ export default function OptimizePage() {
                   {copiedCode ? <Check size={14} /> : <Copy size={14} />}
                   {copiedCode ? '已複製到剪貼簿！' : '複製優化後的 Pine Script'}
                 </button>
-                <button
-                  onClick={() => {
-                    const code = getOptimizedCode()
-                    if (!code) return
-                    const blob = new Blob([code], { type: 'text/plain' })
-                    const url = URL.createObjectURL(blob)
-                    const a = document.createElement('a')
-                    a.href = url
-                    a.download = `optimized_rank${selectedResult.rank}.pine`
-                    a.click()
-                    URL.revokeObjectURL(url)
-                  }}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 6,
-                    padding: '8px 14px', borderRadius: 4,
-                    background: 'rgba(38,166,154,0.1)', border: '1px solid rgba(38,166,154,0.3)',
-                    color: '#26a69a', fontSize: 13, cursor: 'pointer', fontWeight: 600,
-                  }}
-                >
-                  匯出 .pine
-                </button>
+
               </div>
 
               {/* 代碼預覽 */}
