@@ -1,11 +1,10 @@
 # =============================================================================
-# routers/backtest.py  v2.0.0 - 2026-03-01
+# routers/backtest.py  v3.0.0 - 2026-03-01
 # FIXES:
-#   - run_sma_cross: 修正 PnL 計算 bug（原本乘以 equity 導致天文數字）
-#     改為 TV-aligned: units = equity * qty_pct / entry_price
-#     PnL = units*(exit-entry) - comm_entry - comm_exit
-#   - commission 雙向扣除（entry + exit）
-#   - final_equity 正確反映累積複利
+#   - TV-aligned execution: signal detected on bar N close, order fills on bar N+1 OPEN
+#     (matches TradingView default: process_orders_on_close=false)
+#   - Eliminates look-ahead bias: entry/exit price = next bar's open, not signal bar's close
+#   - PnL accounting unchanged (TV-aligned units/commission from v2.0.0)
 # =============================================================================
 
 from fastapi import APIRouter
@@ -15,7 +14,6 @@ import httpx
 import numpy as np
 
 router = APIRouter()
-
 
 class BacktestRequest(BaseModel):
     symbol: str = "BTCUSDT"
@@ -28,7 +26,6 @@ class BacktestRequest(BaseModel):
     qty_type: str = "percent_of_equity"
     qty_value: float = 100.0
     params: dict = {}
-
 
 async def fetch_klines(symbol: str, interval: str, limit: int):
     url = "https://api.binance.com/api/v3/klines"
@@ -49,7 +46,6 @@ async def fetch_klines(symbol: str, interval: str, limit: int):
         for k in data
     ]
 
-
 def run_sma_cross(
     klines: list,
     fast: int = 10,
@@ -62,24 +58,32 @@ def run_sma_cross(
 ):
     """
     TV-aligned SMA cross backtest.
-    units recalculated at each entry using current equity (dynamic compounding).
-    Commission applied on BOTH entry AND exit legs.
+
+    Execution model (process_orders_on_close=false, TV default):
+      - Signal is detected on bar N close (after both MAs are confirmed)
+      - Order fills on bar N+1 OPEN price
+      - This eliminates look-ahead bias and matches TradingView behaviour
+
+    Position sizing: dynamic compounding (recalculate units at each entry using current equity).
+    Commission: applied on BOTH entry AND exit legs.
     Returns (trades, final_equity, equity_curve).
     """
     closes = [k["close"] for k in klines]
+    opens  = [k["open"]  for k in klines]
     n = len(closes)
     trades = []
     position = None
     equity = initial_capital
     equity_curve = [initial_capital]
 
-    for i in range(slow, n):
-        fast_ma = sum(closes[i - fast:i]) / fast
-        slow_ma = sum(closes[i - slow:i]) / slow
-        price = closes[i]
+    # pending_signal: set on bar i, executed on bar i+1 open
+    # None | "entry" | "exit"
+    pending_signal = None
 
-        # --- Entry ---
-        if fast_ma > slow_ma and position is None:
+    for i in range(slow, n):
+        # -- Step 1: Execute pending order from PREVIOUS bar's signal --
+        if pending_signal == "entry" and position is None:
+            price = opens[i]   # fill on this bar's open
             if qty_type == "percent_of_equity":
                 units = (equity * qty_value / 100.0) / price
             elif qty_type == "cash":
@@ -97,15 +101,16 @@ def run_sma_cross(
                 "units":      units,
                 "comm_entry": comm_entry,
             }
+            pending_signal = None
 
-        # --- Exit ---
-        elif fast_ma < slow_ma and position is not None:
+        elif pending_signal == "exit" and position is not None:
+            price = opens[i]   # fill on this bar's open
             units = position["units"]
             comm_exit = (units * price * commission_value
                          if commission_type == "percent"
                          else commission_value)
             gross = units * (price - position["entry"])
-            pnl = gross - position["comm_entry"] - comm_exit
+            pnl   = gross - position["comm_entry"] - comm_exit
             equity += gross - comm_exit
             ep = position["entry"]
             trades.append({
@@ -120,8 +125,24 @@ def run_sma_cross(
             })
             equity_curve.append(round(equity, 2))
             position = None
+            pending_signal = None
 
-    # Close open position at last bar
+        else:
+            pending_signal = None  # stale signal (e.g. already in position), clear it
+
+        # -- Step 2: Detect signal on bar i close --
+        # Use bars [i-fast:i] and [i-slow:i] -- does NOT include bar i+1 (no look-ahead)
+        fast_ma = sum(closes[i - fast + 1 : i + 1]) / fast
+        slow_ma = sum(closes[i - slow + 1 : i + 1]) / slow
+        fast_ma_prev = sum(closes[i - fast : i]) / fast
+        slow_ma_prev = sum(closes[i - slow : i]) / slow
+
+        if fast_ma_prev <= slow_ma_prev and fast_ma > slow_ma and position is None:
+            pending_signal = "entry"   # golden cross confirmed on bar i close -> fill on bar i+1 open
+        elif fast_ma_prev >= slow_ma_prev and fast_ma < slow_ma and position is not None:
+            pending_signal = "exit"    # death cross confirmed on bar i close -> fill on bar i+1 open
+
+    # -- Close open position at last bar (market close) --
     if position is not None:
         price = closes[-1]
         units = position["units"]
@@ -129,7 +150,7 @@ def run_sma_cross(
                      if commission_type == "percent"
                      else commission_value)
         gross = units * (price - position["entry"])
-        pnl = gross - position["comm_entry"] - comm_exit
+        pnl   = gross - position["comm_entry"] - comm_exit
         equity += gross - comm_exit
         ep = position["entry"]
         trades.append({
@@ -145,7 +166,6 @@ def run_sma_cross(
         equity_curve.append(round(equity, 2))
 
     return trades, round(equity, 2), equity_curve
-
 
 def calc_basic_metrics(trades, equity_curve, initial_capital):
     if not trades:
@@ -178,7 +198,6 @@ def calc_basic_metrics(trades, equity_curve, initial_capital):
         "gross_profit":  round(gross_profit, 2),
         "gross_loss":    round(gross_loss, 2),
     }
-
 
 @router.post("/run")
 async def run_backtest(req: BacktestRequest):
