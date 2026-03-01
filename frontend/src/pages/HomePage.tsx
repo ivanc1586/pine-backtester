@@ -96,8 +96,8 @@ const ALL_SYMBOLS: { symbol: string; label: string; name: string }[] = [
   { symbol: 'XAGUSDT',   label: 'XAG/USDT',  name: 'Silver'    },
 ]
 
-// Default 6 shown in dashboard
-const DEFAULT_SYMBOLS = ALL_SYMBOLS.slice(0, 6)
+// Default 4 shown in dashboard
+const DEFAULT_SYMBOLS = ALL_SYMBOLS.slice(0, 4)
 
 // ================================================================
 // SparkLine SVG
@@ -265,7 +265,7 @@ export default function HomePage() {
   const navigate = useNavigate()
   const { strategies, fetchStrategies, deleteStrategy } = useStrategyStore()
 
-  // All tickers state (for modal + default 6 shown)
+  // All tickers state (for modal + default 4 shown)
   const [allTickers, setAllTickers] = useState<TickerState[]>(
     ALL_SYMBOLS.map(s => ({ ...s, price: 0, change_pct: 0, candles: [], loading: true }))
   )
@@ -310,9 +310,9 @@ export default function HomePage() {
     loadAll()
   }, [])
 
-  // ── #8 WebSocket live price update (default 6 symbols only to save connections) ──
+  // ── #8 WebSocket live price update (default 4 symbols only to save connections) ──
   useEffect(() => {
-    const symbols = DEFAULT_SYMBOLS.map(s => s.symbol)
+    const symbols = ALL_SYMBOLS.slice(0, 4).map(s => s.symbol)
     symbols.forEach(symbol => {
       if (wsRefs.current.has(symbol)) return
       const connect = () => {
@@ -428,7 +428,7 @@ export default function HomePage() {
           <div style={sectionHeader}>
             <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>市場概覽</span>
             <button
-              onClick={() => setShowAllMarkets(true)}
+              onClick={() => navigate('/markets')}
               style={{
                 fontSize: 12, fontWeight: 600, color: C.blue,
                 background: 'rgba(41,98,255,0.1)', border: `1px solid rgba(41,98,255,0.3)`,
