@@ -1,27 +1,25 @@
-// ============================================================
+// ===============================================
 // 主程式入口模組
-// ------------------------------------------------------------
+// -----------------------------------------------
+// v1.3.0 - 2026-03-01 - 移除 /results、/performance，新增 /report/:id
 // v1.2.0 - 2026-02-28 - 新增首頁（市場概覽 + 近期策略）
 // v1.1.0 - 2026-02-26 - 新增「參數優化」與「績效分析」頁面
-// ============================================================
+// ===============================================
 
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
-import { Home, LineChart, Code2, Target, BarChart3, TrendingUp } from 'lucide-react'
+import { Home, LineChart, Code2, Target, TrendingUp } from 'lucide-react'
 import HomePage from './pages/HomePage'
 import ChartPage from './pages/ChartPage'
 import StrategyPage from './pages/StrategyPage'
 import OptimizePage from './pages/OptimizePage'
-import ResultsPage from './pages/ResultsPage'
-import PerformancePage from './pages/PerformancePage'
+import ReportPage from './pages/ReportPage'
 import { useStrategyStore } from './store/strategyStore'
 
 const navItems = [
-  { path: '/',            label: '首頁',      icon: Home        },
-  { path: '/chart',       label: '圖表瀏覽器', icon: LineChart   },
-  { path: '/strategy',    label: '策略程式碼', icon: Code2       },
-  { path: '/optimize',    label: '參數優化',   icon: Target      },
-  { path: '/results',     label: '回測結果',   icon: BarChart3   },
-  { path: '/performance', label: '績效分析',   icon: TrendingUp  },
+  { path: '/',           label: '首頁',       icon: Home         },
+  { path: '/chart',      label: '圖表瀏覽器', icon: LineChart    },
+  { path: '/strategy',   label: '策略程式碼', icon: Code2        },
+  { path: '/optimize',   label: '參數優化',   icon: Target       },
 ]
 
 export default function App() {
@@ -62,20 +60,15 @@ export default function App() {
               </NavLink>
             ))}
           </div>
-
-          <div className="p-4 border-t border-white/10">
-            <div className="text-xs text-gray-600 text-center">Pine Backtester v1.2.0</div>
-          </div>
         </nav>
 
-        <main className="flex-1 overflow-auto">
+        <main className="flex-1 overflow-y-auto">
           <Routes>
-            <Route path="/"            element={<HomePage />} />
-            <Route path="/chart"       element={<ChartPage />} />
-            <Route path="/strategy"    element={<StrategyPage />} />
-            <Route path="/optimize"    element={<OptimizePage />} />
-            <Route path="/results"     element={<ResultsPage />} />
-            <Route path="/performance" element={<PerformancePage />} />
+            <Route path="/" element={<HomePage />} />
+            <Route path="/chart" element={<ChartPage />} />
+            <Route path="/strategy" element={<StrategyPage />} />
+            <Route path="/optimize" element={<OptimizePage />} />
+            <Route path="/report/:id" element={<ReportPage />} />
           </Routes>
         </main>
       </div>
