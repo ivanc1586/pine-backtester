@@ -1,11 +1,13 @@
 // HomePage.tsx
-// v1.4.0 - 2026-03-01
-// 策略總覽點擊直接查看完整報告；近期回測活動加「看報告」按鈕
+// v1.5.0 - 2026-03-01
+// - 市場概覽改為直接打 Binance REST API（不走後端 proxy）
+// - 幣對卡片點擊 → 寫入 localStorage chart_symbol 後導航到 /chart
+// - 風格統一暗色主題
 
 import React, { useEffect, useState, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useStrategyStore, Strategy } from '../store/strategyStore'
-import { Edit2, Trash2, Plus, FileText } from 'lucide-react'
+import { Edit2, Trash2, Plus, FileText, ExternalLink } from 'lucide-react'
 
 // --------------------------------------------------------
 // Types
@@ -59,11 +61,14 @@ const MARKET_SYMBOLS = [
 ]
 const API_BASE = ((import.meta as any).env?.VITE_API_URL ?? '').replace(/\/$/, '')
 
+// 直接打 Binance REST（不走後端 proxy，避免後端未實作此端點的問題）
+const BINANCE_SPOT_REST = 'https://api.binance.com/api/v3/klines'
+
 // --------------------------------------------------------
 // Mini spark line chart (24h)
 // --------------------------------------------------------
 function SparkLine({ candles, color }: { candles: Candle[]; color: string }) {
-  if (!candles || candles.length < 2) return <div className="h-12 w-full bg-gray-800 rounded animate-pulse" />
+  if (!candles || candles.length < 2) return <div className="h-12 w-full bg-slate-700 rounded animate-pulse" />
   const closes = candles.map(c => c.c)
   const min = Math.min(...closes)
   const max = Math.max(...closes)
@@ -88,17 +93,19 @@ export default function HomePage() {
   const [loadingActivities, setLoadingActivities] = useState(false)
   const isMountedRef = useRef(false)
 
-  // 1) Fetch market tickers in parallel — 24h hourly candles
+  // 1) Fetch market tickers — 直接打 Binance REST API（24h 小時 K 線）
   useEffect(() => {
     const loadTickers = async () => {
       const init: MarketTicker[] = MARKET_SYMBOLS.map(s => ({ ...s, candles: [], latest_price: 0, change_pct: 0, loading: true }))
       setTickers(init)
       const results = await Promise.allSettled(
         MARKET_SYMBOLS.map(async ({ symbol, label }) => {
-          const res = await fetch(`${API_BASE}/api/market/candles?symbol=${symbol}&interval=1h&limit=24`)
+          const params = new URLSearchParams({ symbol, interval: '1h', limit: '24' })
+          const res = await fetch(`${BINANCE_SPOT_REST}?${params}`)
           if (!res.ok) throw new Error(`HTTP ${res.status}`)
-          const data: Candle[] = await res.json()
-          if (!data.length) throw new Error('No data')
+          const raw: any[][] = await res.json()
+          if (!raw.length) throw new Error('No data')
+          const data: Candle[] = raw.map(k => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] }))
           const latest = data[data.length - 1].c
           const first = data[0].o
           const change = ((latest - first) / first) * 100
@@ -109,7 +116,7 @@ export default function HomePage() {
         results.map((r, i) =>
           r.status === 'fulfilled'
             ? r.value
-            : { ...MARKET_SYMBOLS[i], candles: [], latest_price: 0, change_pct: 0, loading: false, error: 'Failed' }
+            : { ...MARKET_SYMBOLS[i], candles: [], latest_price: 0, change_pct: 0, loading: false, error: 'Failed to load' }
         )
       )
     }
@@ -131,7 +138,6 @@ export default function HomePage() {
       const res = await fetch(`${API_BASE}/api/strategies/activities?limit=5`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      // API returns { activities: [...] } or plain array
       setActivities(Array.isArray(data) ? data : (data.activities ?? []))
     } catch (err) {
       console.error('Failed to load activities:', err)
@@ -155,13 +161,18 @@ export default function HomePage() {
   // 5) Navigate to report — check sessionStorage first, then use id
   const goToReport = (id: string, activity?: Activity) => {
     if (activity && id) {
-      // Cache full data in sessionStorage so ReportPage can display without re-fetch
       const cached = sessionStorage.getItem(`report_${id}`)
       if (!cached && activity.equity_curve) {
         sessionStorage.setItem(`report_${id}`, JSON.stringify({ ...activity, id }))
       }
     }
     navigate(`/report/${id}`)
+  }
+
+  // 6) Navigate to chart with symbol pre-selected
+  const goToChart = (symbol: string) => {
+    localStorage.setItem('chart_symbol', symbol)
+    navigate('/chart')
   }
 
   return (
@@ -177,33 +188,48 @@ export default function HomePage() {
         </div>
 
         {/* Market Overview (24h) */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-          {tickers.map(ticker => (
-            <div
-              key={ticker.symbol}
-              className="bg-slate-800/60 backdrop-blur border border-white/10 rounded-xl p-4 hover:border-purple-500/30 transition-all"
-            >
-              <div className="flex items-center justify-between mb-3">
-                <div>
-                  <div className="text-white font-semibold text-lg">{ticker.label}</div>
-                  <div className="text-gray-500 text-xs">{ticker.symbol}</div>
-                </div>
-                {ticker.loading ? (
-                  <div className="w-16 h-8 bg-gray-700 rounded animate-pulse" />
-                ) : ticker.error ? (
-                  <div className="text-red-400 text-xs">Error</div>
-                ) : (
-                  <div className="text-right">
-                    <div className="text-white font-mono text-sm">${ticker.latest_price.toLocaleString()}</div>
-                    <div className={`text-xs font-semibold ${ticker.change_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                      {ticker.change_pct >= 0 ? '+' : ''}{ticker.change_pct.toFixed(2)}%
+        <div>
+          <h2 className="text-lg font-semibold text-white mb-3">市場概覽</h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+            {tickers.map(ticker => (
+              <div
+                key={ticker.symbol}
+                onClick={() => !ticker.loading && !ticker.error && goToChart(ticker.symbol)}
+                className="bg-slate-800/60 backdrop-blur border border-white/10 rounded-xl p-4 hover:border-purple-500/40 hover:bg-slate-700/60 transition-all cursor-pointer group"
+              >
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <div className="text-white font-semibold text-lg group-hover:text-purple-300 transition-colors">
+                      {ticker.label}
+                    </div>
+                    <div className="text-gray-500 text-xs flex items-center gap-1">
+                      {ticker.symbol}
+                      <ExternalLink className="w-3 h-3 opacity-0 group-hover:opacity-60 transition-opacity" />
                     </div>
                   </div>
+                  {ticker.loading ? (
+                    <div className="w-16 h-8 bg-slate-700 rounded animate-pulse" />
+                  ) : ticker.error ? (
+                    <div className="text-red-400 text-xs bg-red-400/10 px-2 py-1 rounded">載入失敗</div>
+                  ) : (
+                    <div className="text-right">
+                      <div className="text-white font-mono text-sm">${ticker.latest_price.toLocaleString()}</div>
+                      <div className={`text-xs font-semibold ${ticker.change_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {ticker.change_pct >= 0 ? '+' : ''}{ticker.change_pct.toFixed(2)}%
+                      </div>
+                    </div>
+                  )}
+                </div>
+                {ticker.loading ? (
+                  <div className="h-12 w-full bg-slate-700 rounded animate-pulse" />
+                ) : ticker.error ? (
+                  <div className="h-12 flex items-center justify-center text-gray-600 text-xs">無法取得行情資料</div>
+                ) : (
+                  <SparkLine candles={ticker.candles} color={ticker.change_pct >= 0 ? '#4ade80' : '#f87171'} />
                 )}
               </div>
-              <SparkLine candles={ticker.candles} color={ticker.change_pct >= 0 ? '#4ade80' : '#f87171'} />
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
 
         {/* ── Strategy Overview (策略總覽) ── */}
