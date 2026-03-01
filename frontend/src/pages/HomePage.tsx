@@ -438,7 +438,7 @@ export default function HomePage() {
               查看所有市場
             </button>
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
             {defaultTickers.map(ticker => (
               <TickerCard key={ticker.symbol} ticker={ticker} onClick={() => goToChart(ticker.symbol)} />
             ))}
