@@ -506,11 +506,29 @@ PERFORMANCE RULES — MANDATORY:
         trade_pnl         = np.empty(n, dtype=np.float64)
         trade_side        = np.empty(n, dtype=np.int64)   # 1=long, -1=short  (int, NOT str)
         trade_count = 0
+        just_exited = False  # prevent same-bar exit+entry (flip detection)
         for i in range(n):
             price = close_arr[i]
+            just_exited = False
             # --- your signal logic here (use only numeric comparisons) ---
-            # entry:
-            if signal_entry and position == 0:
+            # exit first (TV processes exits before entries on same bar):
+            if signal_exit and position != 0:
+                entry_comm = (entry_units * entry_price * commission_value) if commission_type_id == 0 else commission_value
+                comm = (entry_units * price * commission_value) if commission_type_id == 0 else commission_value
+                gross = entry_units * (price - entry_price) * position  # *position handles short
+                pnl = gross - entry_comm - comm
+                equity += gross - comm
+                trade_entry_price[trade_count] = entry_price
+                trade_exit_price[trade_count]  = price
+                trade_entry_idx[trade_count]   = entry_idx
+                trade_exit_idx[trade_count]    = i
+                trade_pnl[trade_count]         = pnl
+                trade_side[trade_count]        = position   # 1 or -1, converted to "long"/"short" in Python
+                trade_count += 1
+                position = 0
+                just_exited = True
+            # entry (only if not just closed a position on this bar):
+            if signal_entry and position == 0 and not just_exited:
                 if qty_type_id == 0:   # percent_of_equity
                     units = (equity * qty_value / 100.0) / price
                 elif qty_type_id == 1: # cash
@@ -523,20 +541,6 @@ PERFORMANCE RULES — MANDATORY:
                 entry_price = price
                 entry_units = units
                 entry_idx = i
-            # exit:
-            elif signal_exit and position != 0:
-                comm = (entry_units * price * commission_value) if commission_type_id == 0 else commission_value
-                gross = entry_units * (price - entry_price) * position  # *position handles short
-                pnl = gross - comm
-                equity += gross - comm
-                trade_entry_price[trade_count] = entry_price
-                trade_exit_price[trade_count]  = price
-                trade_entry_idx[trade_count]   = entry_idx
-                trade_exit_idx[trade_count]    = i
-                trade_pnl[trade_count]         = pnl
-                trade_side[trade_count]        = position   # 1 or -1, converted to "long"/"short" in Python
-                trade_count += 1
-                position = 0
             # equity curve (mark-to-market)
             if position != 0:
                 eq_curve[i] = equity + entry_units * (price - entry_price) * position
@@ -681,7 +685,28 @@ def _get_fallback_strategy() -> str:
         price = close.iloc[i]
         ts = str(df.index[i])
 
-        if prev_f <= prev_s and curr_f > curr_s and position == 0:
+        just_exited = False
+
+        if prev_f >= prev_s and curr_f < curr_s and position == 1:
+            if commission_type == "percent":
+                comm_exit = entry_units * price * commission_value
+            else:
+                comm_exit = commission_value
+            gross = entry_units * (price - entry_price)
+            # pnl = gross - BOTH commissions (TV-aligned: entry already deducted from equity)
+            pnl = gross - entry_comm - comm_exit
+            equity += gross - comm_exit
+            trades.append({
+                "entry_time": entry_time, "exit_time": ts,
+                "entry_price": round(entry_price, 4), "exit_price": round(price, 4),
+                "side": "long", "pnl": round(pnl, 4),
+                "pnl_pct": round((price - entry_price) / entry_price * 100, 4)
+            })
+            position = 0
+            entry_comm = 0.0
+            just_exited = True
+
+        if prev_f <= prev_s and curr_f > curr_s and position == 0 and not just_exited:
             # TV-aligned position sizing — dynamic compounding (use current equity)
             if qty_type == "percent_of_equity":
                 units = (equity * qty_value / 100.0) / price
@@ -700,24 +725,6 @@ def _get_fallback_strategy() -> str:
             entry_units = units
             entry_time = ts
             entry_comm = comm_entry  # stored for exit pnl calculation
-
-        elif prev_f >= prev_s and curr_f < curr_s and position == 1:
-            if commission_type == "percent":
-                comm_exit = entry_units * price * commission_value
-            else:
-                comm_exit = commission_value
-            gross = entry_units * (price - entry_price)
-            # pnl = gross - BOTH commissions (TV-aligned: entry already deducted from equity)
-            pnl = gross - entry_comm - comm_exit
-            equity += gross - comm_exit
-            trades.append({
-                "entry_time": entry_time, "exit_time": ts,
-                "entry_price": round(entry_price, 4), "exit_price": round(price, 4),
-                "side": "long", "pnl": round(pnl, 4),
-                "pnl_pct": round((price - entry_price) / entry_price * 100, 4)
-            })
-            position = 0
-            entry_comm = 0.0
 
         equity_curve.append(float(equity))
 
