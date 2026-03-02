@@ -1,8 +1,11 @@
 // ================================================================
-// HomePage.tsx  v2.1.0 - 2026-03-02
+// HomePage.tsx  v2.0.0 - 2026-03-01
 // ----------------------------------------------------------------
-// fix: XAUUSDT/XAGUSDT 改抓 Binance futures (fapi/fstream)
-// fix: SparkLine crash guard (empty candles)
+// #3  回測結果暫存：goToReport 寫入 sessionStorage，30min TTL
+// #5  擴增幣對（主流 + XAUUSDT/XAGUSDT）+ 查看所有市場 Modal
+// #6  首頁暗色主題統一（#131722 / #1e222d）+ 策略/活動改 SQLite 後更快
+// #7  幣對卡片版面：幣名左上、大價格左中、漲跌右上、迷你K線底部
+// #8  Binance WebSocket 即時更新幣對卡片價格與漲跌
 // ================================================================
 
 import React, { useEffect, useState, useRef, useCallback } from 'react'
@@ -12,6 +15,7 @@ import { Trash2, Plus, FileText, RefreshCw, X, TrendingUp, TrendingDown } from '
 
 const API_BASE = ((import.meta as any).env?.VITE_API_URL ?? '').replace(/\/$/, '')
 
+// ── colour tokens (same as OptimizePage / ReportPage) ───────────
 const C = {
   bg:     '#131722',
   card:   '#1e222d',
@@ -26,6 +30,9 @@ const C = {
   purple: '#7c3aed',
 }
 
+// ================================================================
+// Types
+// ================================================================
 interface Candle { t: number; o: number; h: number; l: number; c: number; v: number }
 
 interface TickerState {
@@ -88,17 +95,17 @@ const ALL_SYMBOLS: { symbol: string; label: string; name: string }[] = [
   { symbol: 'XAGUSDT',   label: 'XAG/USDT',  name: 'Silver'    },
 ]
 
+// Default 4 shown in dashboard
 const DEFAULT_SYMBOLS = ALL_SYMBOLS.slice(0, 4)
 
-// ── SparkLine (crash-safe) ──────────────────────────────────────
+// ================================================================
+// SparkLine SVG
+// ================================================================
 function SparkLine({ candles, color }: { candles: Candle[]; color: string }) {
   if (!candles || candles.length < 2) {
     return <div style={{ height: 48, background: 'rgba(255,255,255,0.03)', borderRadius: 4 }} />
   }
-  const closes = candles.map(c => c.c).filter(v => isFinite(v) && !isNaN(v))
-  if (closes.length < 2) {
-    return <div style={{ height: 48, background: 'rgba(255,255,255,0.03)', borderRadius: 4 }} />
-  }
+  const closes = candles.map(c => c.c)
   const min = Math.min(...closes)
   const max = Math.max(...closes)
   const range = max - min || 1
@@ -121,13 +128,14 @@ function SparkLine({ candles, color }: { candles: Candle[]; color: string }) {
   )
 }
 
-// ── Ticker Card ──────────────────────────────────────────────────
+// ================================================================
+// Ticker Card — #7 layout: name top-left, big price mid-left, change top-right, sparkline bottom
+// ================================================================
 function TickerCard({ ticker, onClick }: { ticker: TickerState; onClick: () => void }) {
   const isUp = ticker.change_pct >= 0
   const color = isUp ? C.green : C.red
 
   const formatPrice = (p: number) => {
-    if (!isFinite(p) || isNaN(p)) return '—'
     if (p >= 1000) return p.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
     if (p >= 1)    return p.toFixed(4)
     return p.toFixed(6)
@@ -144,6 +152,7 @@ function TickerCard({ ticker, onClick }: { ticker: TickerState; onClick: () => v
       onMouseEnter={e => (e.currentTarget.style.borderColor = C.purple + '80')}
       onMouseLeave={e => (e.currentTarget.style.borderColor = C.border)}
     >
+      {/* Row 1: name + change badge */}
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
         <div>
           <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{ticker.label}</div>
@@ -165,18 +174,22 @@ function TickerCard({ ticker, onClick }: { ticker: TickerState; onClick: () => v
         )}
       </div>
 
+      {/* Row 2: big price */}
       <div style={{ fontSize: 20, fontWeight: 700, color: C.text, letterSpacing: '-0.5px', fontVariantNumeric: 'tabular-nums' }}>
         {ticker.loading ? (
           <div style={{ width: 100, height: 24, background: C.hover, borderRadius: 4 }} />
         ) : ticker.error ? '—' : `$${formatPrice(ticker.price)}`}
       </div>
 
+      {/* Row 3: sparkline */}
       <SparkLine candles={ticker.candles} color={color} />
     </div>
   )
 }
 
-// ── All Markets Modal ────────────────────────────────────────────
+// ================================================================
+// All Markets Modal
+// ================================================================
 function AllMarketsModal({
   tickers, onClose, onSelect,
 }: {
@@ -197,6 +210,7 @@ function AllMarketsModal({
         }}
         onClick={e => e.stopPropagation()}
       >
+        {/* Header */}
         <div style={{
           padding: '16px 20px', borderBottom: `1px solid ${C.border}`,
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -206,14 +220,11 @@ function AllMarketsModal({
             <X style={{ width: 18, height: 18 }} />
           </button>
         </div>
+        {/* List */}
         <div style={{ overflowY: 'auto', padding: '8px 0' }}>
           {tickers.map(t => {
             const isUp = t.change_pct >= 0
             const color = isUp ? C.green : C.red
-            const pStr = !t.price || isNaN(t.price) ? '—' :
-              t.price >= 1000
-                ? t.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-                : t.price.toFixed(4)
             return (
               <div
                 key={t.symbol}
@@ -231,7 +242,7 @@ function AllMarketsModal({
                 </div>
                 <div style={{ textAlign: 'right' }}>
                   <div style={{ fontSize: 14, fontWeight: 600, color: C.text, fontVariantNumeric: 'tabular-nums' }}>
-                    {t.loading ? '...' : t.error ? '—' : `$${pStr}`}
+                    {t.loading ? '...' : t.error ? '—' : `$${t.price >= 1000 ? t.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : t.price.toFixed(4)}`}
                   </div>
                   <div style={{ fontSize: 12, fontWeight: 600, color }}>
                     {t.loading ? '' : `${isUp ? '+' : ''}${t.change_pct.toFixed(2)}%`}
@@ -253,6 +264,7 @@ export default function HomePage() {
   const navigate = useNavigate()
   const { strategies, fetchStrategies, deleteStrategy } = useStrategyStore()
 
+  // All tickers state (for modal + default 4 shown)
   const [allTickers, setAllTickers] = useState<TickerState[]>(
     ALL_SYMBOLS.map(s => ({ ...s, price: 0, change_pct: 0, candles: [], loading: true }))
   )
@@ -262,32 +274,28 @@ export default function HomePage() {
   const wsRefs = useRef<Map<string, WebSocket>>(new Map())
   const isMountedRef = useRef(false)
 
-  // ── Load initial candles + 24h ticker ──────────────────────────
+  // ── Load initial candles + 24h ticker ───────────────────────────
   useEffect(() => {
     const loadAll = async () => {
       await Promise.allSettled(
         ALL_SYMBOLS.map(async ({ symbol }) => {
           try {
-            const isFutures = PRECIOUS.has(symbol)
-            const tickerUrl = isFutures
-              ? `https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${symbol}`
-              : `https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`
-            const klUrl = isFutures
-              ? `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=24`
-              : `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=24`
-
-            const [tickerRes, klRes] = await Promise.all([fetch(tickerUrl), fetch(klUrl)])
+            // 24h ticker for correct priceChangePercent
+            const tickerRes = await fetch(
+              `https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`
+            )
             const td = await tickerRes.json()
+            // 24h hourly candles for sparkline
+            const klRes = await fetch(
+              `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=24`
+            )
             const kd: any[][] = await klRes.json()
-            const candles: Candle[] = Array.isArray(kd) ? kd.map(k => ({
+            const candles: Candle[] = kd.map(k => ({
               t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5],
-            })) : []
-            const price = +(td.lastPrice ?? td.price ?? 0)
-            const change_pct = +(td.priceChangePercent ?? 0)
-            if (!isFinite(price)) throw new Error('invalid price')
+            }))
             setAllTickers(prev => prev.map(t =>
               t.symbol === symbol
-                ? { ...t, price, change_pct, candles, loading: false, error: undefined }
+                ? { ...t, price: +td.lastPrice, change_pct: +td.priceChangePercent, candles, loading: false, error: undefined }
                 : t
             ))
           } catch {
@@ -301,28 +309,21 @@ export default function HomePage() {
     loadAll()
   }, [])
 
-  // ── WebSocket live price (default 4 symbols) ────────────────────
+  // ── #8 WebSocket live price update (default 4 symbols only to save connections) ──
   useEffect(() => {
     const symbols = ALL_SYMBOLS.slice(0, 4).map(s => s.symbol)
     symbols.forEach(symbol => {
       if (wsRefs.current.has(symbol)) return
-      const isFutures = PRECIOUS.has(symbol)
-      const wsBase = isFutures
-        ? 'wss://fstream.binance.com/ws'
-        : 'wss://stream.binance.com:9443/ws'
       const connect = () => {
-        const ws = new WebSocket(`${wsBase}/${symbol.toLowerCase()}@ticker`)
+        const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@ticker`)
         wsRefs.current.set(symbol, ws)
         ws.onmessage = e => {
-          try {
-            const d = JSON.parse(e.data)
-            const price = +(d.c ?? d.p ?? 0)
-            const change_pct = +(d.P ?? 0)
-            if (!isFinite(price) || price === 0) return
-            setAllTickers(prev => prev.map(t =>
-              t.symbol === symbol ? { ...t, price, change_pct } : t
-            ))
-          } catch {}
+          const d = JSON.parse(e.data)
+          setAllTickers(prev => prev.map(t =>
+            t.symbol === symbol
+              ? { ...t, price: +d.c, change_pct: +d.P }
+              : t
+          ))
         }
         ws.onclose = () => {
           wsRefs.current.delete(symbol)
@@ -338,7 +339,7 @@ export default function HomePage() {
     }
   }, [])
 
-  // ── Fetch strategies ───────────────────────────────────────────
+  // ── Fetch strategies ─────────────────────────────────────────────
   useEffect(() => {
     if (!isMountedRef.current) {
       isMountedRef.current = true
@@ -346,7 +347,7 @@ export default function HomePage() {
     }
   }, [fetchStrategies])
 
-  // ── Fetch activities ───────────────────────────────────────────
+  // ── Fetch activities ─────────────────────────────────────────────
   const loadActivities = useCallback(async () => {
     setLoadingActivities(true)
     try {
@@ -363,12 +364,17 @@ export default function HomePage() {
 
   useEffect(() => { loadActivities() }, [loadActivities])
 
+  // ── #3 Go to report (sessionStorage cache, 30min TTL) ────────────
   const goToReport = useCallback((id: string, activity?: Activity) => {
     if (activity && id) {
       try {
         const existing = sessionStorage.getItem(`report_${id}`)
         if (!existing && activity.equity_curve) {
-          const payload = { ...activity, id, _cached_at: Date.now(), _ttl_ms: 30 * 60 * 1000 }
+          const payload = {
+            ...activity, id,
+            _cached_at: Date.now(),
+            _ttl_ms: 30 * 60 * 1000,
+          }
           sessionStorage.setItem(`report_${id}`, JSON.stringify(payload))
         }
       } catch {}
@@ -376,11 +382,15 @@ export default function HomePage() {
     navigate(`/report/${id}`)
   }, [navigate])
 
+  // ── Navigate to chart ────────────────────────────────────────────
+  const PREC_SYMBOLS = ['XAUUSDT', 'XAGUSDT']
   const goToChart = useCallback((symbol: string) => {
     localStorage.setItem('chart_symbol', symbol)
+    localStorage.setItem('chart_market', PREC_SYMBOLS.includes(symbol) ? 'futures' : 'spot')
     navigate('/chart')
   }, [navigate])
 
+  // ── Delete strategy ──────────────────────────────────────────────
   const handleDelete = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation()
     if (!confirm('確定刪除此策略？')) return
@@ -389,6 +399,7 @@ export default function HomePage() {
 
   const defaultTickers = allTickers.filter(t => DEFAULT_SYMBOLS.some(d => d.symbol === t.symbol))
 
+  // ── Shared section style ─────────────────────────────────────────
   const section: React.CSSProperties = {
     background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: 20,
   }
@@ -407,12 +418,13 @@ export default function HomePage() {
 
       <div style={{ maxWidth: 1280, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 24 }}>
 
+        {/* Header */}
         <div>
           <h1 style={{ fontSize: 26, fontWeight: 700, color: C.text, margin: 0 }}>Dashboard</h1>
           <p style={{ fontSize: 13, color: C.muted, margin: '4px 0 0' }}>市場概覽 &amp; 策略管理</p>
         </div>
 
-        {/* Market Overview */}
+        {/* ── Market Overview ── */}
         <div>
           <div style={sectionHeader}>
             <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>市場概覽</span>
@@ -434,7 +446,7 @@ export default function HomePage() {
           </div>
         </div>
 
-        {/* Strategy Overview */}
+        {/* ── Strategy Overview ── */}
         <div style={section}>
           <div style={sectionHeader}>
             <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>策略總覽</span>
@@ -529,7 +541,7 @@ export default function HomePage() {
           )}
         </div>
 
-        {/* Recent Activities */}
+        {/* ── Recent Activities ── */}
         <div style={section}>
           <div style={sectionHeader}>
             <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>近期回測活動</span>
@@ -608,6 +620,7 @@ export default function HomePage() {
 
       </div>
 
+      {/* All Markets Modal */}
       {showAllMarkets && (
         <AllMarketsModal
           tickers={allTickers}
