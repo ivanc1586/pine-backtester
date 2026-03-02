@@ -759,11 +759,26 @@ export default function ChartPage() {
 
         {/* Spot / Futures */}
         <div style={{ display:'flex', background:'#1e222d', borderRadius:4, border:'1px solid #2b2b43', overflow:'hidden', marginRight:8 }}>
-          {(['spot','futures'] as MarketType[]).map(m => (
-            <button key={m} onClick={() => switchPair(m, symbol, interval)}
-              style={{ padding:'3px 9px', fontSize:11, cursor:'pointer', border:'none', fontWeight: marketType===m ? 700 : 400, background: marketType===m ? '#f0b90b' : 'transparent', color: marketType===m ? '#000' : '#848e9c' }}
-            >{m === 'spot' ? '現貨' : '合約'}</button>
-          ))}
+          {(['spot','futures'] as MarketType[]).map(m => {
+            const noSpot = m === 'spot' && ['XAUUSDT','XAGUSDT'].includes(symbol)
+            return (
+              <button key={m}
+                disabled={noSpot}
+                onClick={() => !noSpot && switchPair(m, symbol, interval)}
+                title={noSpot ? '貴金屬無現貨交易對' : undefined}
+                style={{
+                  padding:'3px 9px', fontSize:11,
+                  cursor: noSpot ? 'not-allowed' : 'pointer',
+                  border:'none',
+                  fontWeight: marketType===m ? 700 : 400,
+                  background: marketType===m && !noSpot ? '#f0b90b' : 'transparent',
+                  color: noSpot ? '#444' : marketType===m ? '#000' : '#848e9c',
+                  opacity: noSpot ? 0.4 : 1,
+                  textDecoration: noSpot ? 'line-through' : 'none',
+                }}
+              >{m === 'spot' ? '現貨' : '合約'}</button>
+            )
+          })}
         </div>
 
         {/* Divider */}
