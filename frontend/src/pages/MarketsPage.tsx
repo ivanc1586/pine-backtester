@@ -1,13 +1,26 @@
 // ================================================================
-// MarketsPage.tsx  v3.0.0 - 2026-03-02
+// MarketsPage.tsx  v2.0.0 - 2026-03-01
 // ----------------------------------------------------------------
-// v3.0.0 - 移除期貨區塊，加入 WebSocket 即時更新所有加密貨幣卡片
-//          XAUUSDT/XAGUSDT 貴金屬納入加密貨幣區塊
+// /markets 子頁面 — 需求 #B 完整規格
+// 功能：
+//   - 頂部「市場概覽」標題 + LIVE 標籤 + 最後更新時間「即時更新」
+//   - 右上角手動刷新按鈕
+//   - 加密貨幣區塊（含 LIVE 標籤）
+//   - 期貨區塊（即時報價）
+//   - 卡片：幣種 icon + 幣對名稱 + 類別標籤
+//           右上：24h 漲跌幅（紅/綠）
+//           中間：大字即時價格（幣種對應顏色）
+//           中下：迷你走勢折線圖（漲綠跌紅）
+//           底部左：H: $xxx  L: $xxx
+//           底部右：「回測 →」按鈕
+//   - 詳細數據表格：資產/最新價/24H漲跌/24H漲跌幅/日高/日低/操作
+//   - 點擊卡片切換到 K 線圖（原有功能保留）
+//   - 加密貨幣標注「即時收盤價」
 // ================================================================
 
-import React, { useEffect, useState, useCallback, useRef } from 'react'
+import React, { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { TrendingUp, TrendingDown, ArrowUpDown, RefreshCw, Zap } from 'lucide-react'
+import { TrendingUp, TrendingDown, ArrowUpDown, RefreshCw, Zap, BarChart2 } from 'lucide-react'
 
 const C = {
   bg:     '#131722',
@@ -21,13 +34,16 @@ const C = {
   blue:   '#2962ff',
   hover:  '#2a2e39',
   orange: '#f7931a',
+  purple: '#7c3aed',
+  indigo: '#6366f1',
 }
 
+// ── 幣種配色 ─────────────────────────────────────────────────
 const SYMBOL_COLORS: Record<string, string> = {
-  BTCUSDT:   '#f7931a',
+  BTCUSDT:   C.orange,
   ETHUSDT:   '#7c3aed',
   SOLUSDT:   '#9945ff',
-  BNBUSDT:   '#f0b90b',
+  BNBUSDT:   C.gold,
   XRPUSDT:   '#006ab4',
   ADAUSDT:   '#0033ad',
   DOGEUSDT:  '#c8a400',
@@ -40,13 +56,20 @@ const SYMBOL_COLORS: Record<string, string> = {
   ATOMUSDT:  '#6f7390',
   XAUUSDT:   '#ffd700',
   XAGUSDT:   '#aaaaaa',
+  // Futures
+  'ES=F':    '#2196f3',
+  'NQ=F':    '#00bcd4',
+  'CL=F':    '#795548',
+  'GC=F':    '#ffd700',
 }
 
+// ── 幣種 Icon (emoji fallback) ────────────────────────────────
 const SYMBOL_ICONS: Record<string, string> = {
   BTCUSDT: '₿', ETHUSDT: 'Ξ', SOLUSDT: '◎', BNBUSDT: '⬡',
   XRPUSDT: '✕', ADAUSDT: '₳', DOGEUSDT: 'Ð', AVAXUSDT: '△',
   DOTUSDT: '●', LINKUSDT: '⬡', MATICUSDT: '◈', LTCUSDT: 'Ł',
-  UNIUSDT: 'U', ATOMUSDT: '⛛', XAUUSDT: 'AU', XAGUSDT: 'AG',
+  UNIUSDT: '🦄', ATOMUSDT: '⚛', XAUUSDT: '◉', XAGUSDT: '◎',
+  'ES=F': 'S', 'NQ=F': 'N', 'CL=F': '🛢', 'GC=F': '◉',
 }
 
 interface Candle { t: number; o: number; h: number; l: number; c: number; v: number }
@@ -55,9 +78,10 @@ interface MarketTicker {
   symbol:      string
   label:       string
   name:        string
+  category:    'crypto' | 'futures'
   price:       number
-  change:      number
-  change_pct:  number
+  change:      number   // 24h 漲跌金額
+  change_pct:  number   // 24h 漲跌幅
   high24h:     number
   low24h:      number
   volume24h:   number
@@ -85,6 +109,13 @@ const CRYPTO_SYMBOLS: { symbol: string; label: string; name: string }[] = [
   { symbol: 'XAGUSDT',   label: 'XAG/USDT',  name: 'Silver'    },
 ]
 
+const FUTURES_SYMBOLS: { symbol: string; label: string; name: string }[] = [
+  { symbol: 'ES=F', label: 'ES/USD',  name: 'S&P 500 Futures' },
+  { symbol: 'NQ=F', label: 'NQ/USD',  name: 'Nasdaq Futures'  },
+  { symbol: 'CL=F', label: 'CL/USD',  name: 'Crude Oil'       },
+  { symbol: 'GC=F', label: 'GC/USD',  name: 'Gold Futures'    },
+]
+
 function formatPrice(p: number) {
   if (p >= 1000) return p.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   if (p >= 1)    return p.toFixed(4)
@@ -100,19 +131,19 @@ function formatVolume(v: number) {
 
 // ── SparkLine ──────────────────────────────────────────────────
 function SparkLine({ candles, color }: { candles: Candle[]; color: string }) {
-  if (!candles || candles.length < 2) return <div style={{ height: 44 }} />
+  if (!candles || candles.length < 2) return <div style={{ height: 72 }} />
   const closes = candles.map(c => c.c)
   const min = Math.min(...closes)
   const max = Math.max(...closes)
   const range = max - min || 1
-  const W = 160, H = 44
+  const W = 160, H = 72
   const pts = closes.map((v, i) =>
     `${(i / (closes.length - 1)) * W},${H - ((v - min) / range) * (H - 4) - 2}`
   ).join(' ')
   const fillPts = `0,${H} ${pts} ${W},${H}`
-  const gradId = `spark-${Math.random().toString(36).slice(2, 8)}`
+  const gradId = `spark-${color.replace('#', '')}-${Math.random().toString(36).slice(2, 6)}`
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 44 }}>
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 72 }}>
       <defs>
         <linearGradient id={gradId} x1="0" x2="0" y1="0" y2="1">
           <stop offset="0%" stopColor={color} stopOpacity="0.3" />
@@ -147,21 +178,31 @@ function MarketCard({ ticker, onChart, onBacktest }: {
       onMouseEnter={e => (e.currentTarget.style.borderColor = accent + '80')}
       onMouseLeave={e => (e.currentTarget.style.borderColor = C.border)}
     >
-      {/* Row 1: icon + 名稱 | 漲跌幅 */}
+      {/* Row 1: icon + 名稱 + 類別標籤 | 漲跌幅 */}
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <div style={{
             width: 32, height: 32, borderRadius: 8, background: accent + '22',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: 13, fontWeight: 700, color: accent, flexShrink: 0,
+            fontSize: 15, fontWeight: 700, color: accent, flexShrink: 0,
           }}>
             {icon}
           </div>
           <div>
             <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{ticker.label}</div>
-            <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>{ticker.name}</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 2 }}>
+              <span style={{ fontSize: 10, color: C.muted }}>{ticker.name}</span>
+              <span style={{
+                fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 3,
+                background: ticker.category === 'crypto' ? 'rgba(38,166,154,0.15)' : 'rgba(41,98,255,0.15)',
+                color: ticker.category === 'crypto' ? C.green : C.blue,
+              }}>
+                {ticker.category === 'crypto' ? '加密貨幣' : '期貨'}
+              </span>
+            </div>
           </div>
         </div>
+        {/* 24h 漲跌幅 */}
         {ticker.loading ? (
           <div style={{ width: 60, height: 22, background: C.hover, borderRadius: 4, animation: 'pulse 1.5s infinite' }} />
         ) : (
@@ -176,7 +217,7 @@ function MarketCard({ ticker, onChart, onBacktest }: {
         )}
       </div>
 
-      {/* Row 2: 大字即時價格 */}
+      {/* Row 2: 大字即時價格（幣種對應顏色） */}
       <div style={{ fontSize: 22, fontWeight: 700, color: accent, letterSpacing: '-0.5px', fontVariantNumeric: 'tabular-nums' }}>
         {ticker.loading
           ? <div style={{ width: 120, height: 28, background: C.hover, borderRadius: 4 }} />
@@ -189,7 +230,7 @@ function MarketCard({ ticker, onChart, onBacktest }: {
       {/* Row 4: 底部 H/L + 回測按鈕 */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         {!ticker.loading && !ticker.error ? (
-          <div style={{ display: 'flex', gap: 12, fontSize: 11 }}>
+          <div style={{ display: 'flex', gap: 8, fontSize: 10 }}>
             <span style={{ color: C.muted }}>H: <span style={{ color: C.green }}>${formatPrice(ticker.high24h)}</span></span>
             <span style={{ color: C.muted }}>L: <span style={{ color: C.red }}>${formatPrice(ticker.low24h)}</span></span>
           </div>
@@ -197,7 +238,7 @@ function MarketCard({ ticker, onChart, onBacktest }: {
         <button
           onClick={e => { e.stopPropagation(); onBacktest(e) }}
           style={{
-            fontSize: 11, fontWeight: 600, padding: '4px 10px',
+            fontSize: 10, fontWeight: 600, padding: '3px 8px',
             background: 'rgba(41,98,255,0.12)', color: C.blue,
             border: `1px solid rgba(41,98,255,0.3)`, borderRadius: 5, cursor: 'pointer',
           }}
@@ -218,21 +259,21 @@ type SortDir   = 'asc' | 'desc'
 // ================================================================
 export default function MarketsPage() {
   const navigate = useNavigate()
-  const wsRefs = useRef<Map<string, WebSocket>>(new Map())
 
-  const makeInitial = (): MarketTicker[] =>
-    CRYPTO_SYMBOLS.map(s => ({
-      ...s, price: 0, change: 0, change_pct: 0,
-      high24h: 0, low24h: 0, volume24h: 0, candles: [], loading: true,
-    }))
+  const makeInitial = (list: { symbol: string; label: string; name: string }[], cat: 'crypto' | 'futures'): MarketTicker[] =>
+    list.map(s => ({ ...s, category: cat, price: 0, change: 0, change_pct: 0, high24h: 0, low24h: 0, volume24h: 0, candles: [], loading: true }))
 
-  const [tickers,    setTickers]    = useState<MarketTicker[]>(makeInitial())
+  const [tickers, setTickers] = useState<MarketTicker[]>([
+    ...makeInitial(CRYPTO_SYMBOLS, 'crypto'),
+    ...makeInitial(FUTURES_SYMBOLS, 'futures'),
+  ])
   const [loading,    setLoading]    = useState(true)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
   const [sortField,  setSortField]  = useState<SortField>('label')
   const [sortDir,    setSortDir]    = useState<SortDir>('asc')
   const [search,     setSearch]     = useState('')
 
+  // Binance API with fallback hosts (api.binance.com is blocked on GCP/Railway)
   const BINANCE_HOSTS = [
     'https://api.binance.us',
     'https://api1.binance.com',
@@ -249,26 +290,35 @@ export default function MarketsPage() {
           new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
         ]) as Response
         if (res.ok) return res
-      } catch (e) { lastErr = e }
+      } catch (e) {
+        lastErr = e
+      }
     }
     throw lastErr ?? new Error('All Binance hosts failed')
   }
 
-  // ── REST 初始載入（含 K 線）──────────────────────────────────
   const loadAll = useCallback(async () => {
     setLoading(true)
+    // Reset loading state
     setTickers(prev => prev.map(t => ({ ...t, loading: true, error: undefined })))
 
     await Promise.allSettled(
       CRYPTO_SYMBOLS.map(async ({ symbol }) => {
         try {
+          const isPrecious = symbol === 'XAUUSDT' || symbol === 'XAGUSDT'
+          const tickerUrl = isPrecious
+            ? `https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${symbol}`
+            : undefined
+          const klUrl = isPrecious
+            ? `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=24`
+            : undefined
           const [tickerRes, klRes] = await Promise.all([
-            fetchBinance(`/api/v3/ticker/24hr?symbol=${symbol}`),
-            fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=1h&limit=24`),
+            isPrecious ? fetch(tickerUrl!) : fetchBinance(`/api/v3/ticker/24hr?symbol=${symbol}`),
+            isPrecious ? fetch(klUrl!)     : fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=1h&limit=24`),
           ])
           const td = await tickerRes.json()
           const kd: any[][] = await klRes.json()
-          const candles: Candle[] = kd.map(k => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] }))
+          const candles: Candle[] = Array.isArray(kd) ? kd.map(k => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] })) : []
           setTickers(prev => prev.map(t =>
             t.symbol === symbol
               ? {
@@ -291,40 +341,51 @@ export default function MarketsPage() {
       })
     )
 
+    // Futures: mark as not available (no free public API)
+    setTickers(prev => prev.map(t =>
+      t.category === 'futures' ? { ...t, loading: false, price: 0, error: 'N/A' } : t
+    ))
+
     setLoading(false)
     setLastUpdate(new Date())
   }, [])
 
-  // ── WebSocket 即時更新（價格 + 漲跌幅）───────────────────────
+  useEffect(() => { loadAll() }, [loadAll])
+
+  // ── WebSocket live price updates ─────────────────────────────
+  const wsRefs = React.useRef<Map<string, WebSocket>>(new Map())
+
   useEffect(() => {
-    const connectWS = (symbol: string) => {
+    CRYPTO_SYMBOLS.forEach(({ symbol }) => {
       if (wsRefs.current.has(symbol)) return
-      const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@ticker`)
-      wsRefs.current.set(symbol, ws)
-      ws.onmessage = e => {
-        const d = JSON.parse(e.data)
-        setTickers(prev => prev.map(t =>
-          t.symbol === symbol
-            ? { ...t, price: +d.c, change: +d.p, change_pct: +d.P, high24h: +d.h, low24h: +d.l, volume24h: +d.q }
-            : t
-        ))
+      const isPrecious = symbol === 'XAUUSDT' || symbol === 'XAGUSDT'
+      const wsBase = isPrecious
+        ? 'wss://fstream.binance.com/ws'
+        : 'wss://stream.binance.com:9443/ws'
+      const connect = () => {
+        const ws = new WebSocket(`${wsBase}/${symbol.toLowerCase()}@ticker`)
+        wsRefs.current.set(symbol, ws)
+        ws.onmessage = e => {
+          try {
+            const d = JSON.parse(e.data)
+            const price = +(d.c ?? d.p ?? 0)
+            const change_pct = +(d.P ?? 0)
+            if (!isFinite(price) || price === 0) return
+            setTickers(prev => prev.map(t =>
+              t.symbol === symbol
+                ? { ...t, price, change_pct }
+                : t
+            ))
+          } catch {}
+        }
+        ws.onclose = () => { wsRefs.current.delete(symbol); setTimeout(connect, 3000) }
+        ws.onerror = () => ws.close()
       }
-      ws.onclose = () => {
-        wsRefs.current.delete(symbol)
-        setTimeout(() => connectWS(symbol), 3000)
-      }
-      ws.onerror = () => ws.close()
-    }
-
-    CRYPTO_SYMBOLS.forEach(({ symbol }) => connectWS(symbol))
-
-    return () => {
-      wsRefs.current.forEach(ws => ws.close())
-      wsRefs.current.clear()
-    }
+      connect()
+    })
+    return () => { wsRefs.current.forEach(ws => ws.close()); wsRefs.current.clear() }
   }, [])
 
-  useEffect(() => { loadAll() }, [loadAll])
 
   const handleSort = (field: SortField) => {
     if (sortField === field) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
@@ -341,6 +402,9 @@ export default function MarketsPage() {
     if (sortField === 'label') return dir * a.label.localeCompare(b.label)
     return dir * ((a[sortField] as number) - (b[sortField] as number))
   })
+
+  const cryptoTickers   = tickers.filter(t => t.category === 'crypto').slice(0, 4)
+  const futuresTickers  = tickers.filter(t => t.category === 'futures').slice(0, 4)
 
   const thStyle: React.CSSProperties = {
     padding: '10px 14px', textAlign: 'left', fontSize: 11,
@@ -369,12 +433,20 @@ export default function MarketsPage() {
         ::-webkit-scrollbar-thumb { background:${C.border}; border-radius:3px; }
       `}</style>
 
+        {!loading && tickers.every(t => !!t.error) && (
+          <div style={{ textAlign: 'center', padding: '80px 0', color: C.muted }}>
+            <div style={{ fontSize: 18, marginBottom: 8 }}>無法載入市場資料</div>
+            <div style={{ fontSize: 13 }}>Binance API 連線失敗，請點擊重新整理或稍後再試</div>
+          </div>
+        )}
+
       <div style={{ maxWidth: 1440, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 28 }}>
 
         {/* ── 頁面標題 ── */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <h1 style={{ fontSize: 24, fontWeight: 700, color: C.text, margin: 0 }}>市場概覽</h1>
+            {/* LIVE 標籤 */}
             <div style={{
               display: 'flex', alignItems: 'center', gap: 5,
               background: 'rgba(38,166,154,0.12)', border: '1px solid rgba(38,166,154,0.3)',
@@ -404,7 +476,7 @@ export default function MarketsPage() {
           </div>
         </div>
 
-        {/* ── 加密貨幣卡片區（4 欄 grid）── */}
+        {/* ── 加密貨幣區塊 ── */}
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
             <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>加密貨幣</span>
@@ -419,18 +491,37 @@ export default function MarketsPage() {
             <span style={{ fontSize: 11, color: C.muted }}>即時收盤價</span>
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14 }}>
-            {tickers.map(ticker => (
+            {cryptoTickers.map(ticker => (
               <MarketCard
                 key={ticker.symbol}
                 ticker={ticker}
-                onChart={() => {
-                  localStorage.setItem('chart_symbol', ticker.symbol)
-                  navigate('/chart')
-                }}
-                onBacktest={e => {
-                  e.stopPropagation()
-                  navigate(`/optimize?symbol=${ticker.symbol}`)
-                }}
+                onChart={() => navigate(`/chart?symbol=${ticker.symbol}`)}
+                onBacktest={() => navigate(`/optimize?symbol=${ticker.symbol}`)}
+              />
+            ))}
+          </div>
+        </div>
+
+        {/* ── 期貨區塊 ── */}
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+            <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>期貨</span>
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 5,
+              background: 'rgba(41,98,255,0.12)', border: '1px solid rgba(41,98,255,0.3)',
+              borderRadius: 5, padding: '2px 8px',
+            }}>
+              <BarChart2 size={10} style={{ color: C.blue }} />
+              <span style={{ fontSize: 10, fontWeight: 700, color: C.blue }}>LIVE</span>
+            </div>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14 }}>
+            {futuresTickers.map(ticker => (
+              <MarketCard
+                key={ticker.symbol}
+                ticker={ticker}
+                onChart={() => navigate(`/chart?symbol=${ticker.symbol}`)}
+                onBacktest={() => navigate(`/optimize?symbol=${ticker.symbol}`)}
               />
             ))}
           </div>
@@ -438,6 +529,7 @@ export default function MarketsPage() {
 
         {/* ── 詳細數據表格 ── */}
         <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' }}>
+          {/* Table header row */}
           <div style={{
             padding: '14px 18px', borderBottom: `1px solid ${C.border}`,
             display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -458,12 +550,24 @@ export default function MarketsPage() {
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr style={{ background: 'rgba(0,0,0,0.2)' }}>
-                  <th style={thStyle} onClick={() => handleSort('label')}>資產 <SortIcon field="label" /></th>
-                  <th style={{ ...thStyle, textAlign: 'right' }} onClick={() => handleSort('price')}>最新價 <SortIcon field="price" /></th>
-                  <th style={{ ...thStyle, textAlign: 'right' }} onClick={() => handleSort('change')}>24H 漲跌 <SortIcon field="change" /></th>
-                  <th style={{ ...thStyle, textAlign: 'right' }} onClick={() => handleSort('change_pct')}>24H 漲跌幅 <SortIcon field="change_pct" /></th>
-                  <th style={{ ...thStyle, textAlign: 'right' }} onClick={() => handleSort('high24h')}>日高 <SortIcon field="high24h" /></th>
-                  <th style={{ ...thStyle, textAlign: 'right' }} onClick={() => handleSort('low24h')}>日低 <SortIcon field="low24h" /></th>
+                  <th style={thStyle} onClick={() => handleSort('label')}>
+                    資產 <SortIcon field="label" />
+                  </th>
+                  <th style={{ ...thStyle, textAlign: 'right' }} onClick={() => handleSort('price')}>
+                    最新價 <SortIcon field="price" />
+                  </th>
+                  <th style={{ ...thStyle, textAlign: 'right' }} onClick={() => handleSort('change')}>
+                    24H 漲跌 <SortIcon field="change" />
+                  </th>
+                  <th style={{ ...thStyle, textAlign: 'right' }} onClick={() => handleSort('change_pct')}>
+                    24H 漲跌幅 <SortIcon field="change_pct" />
+                  </th>
+                  <th style={{ ...thStyle, textAlign: 'right' }} onClick={() => handleSort('high24h')}>
+                    日高 <SortIcon field="high24h" />
+                  </th>
+                  <th style={{ ...thStyle, textAlign: 'right' }} onClick={() => handleSort('low24h')}>
+                    日低 <SortIcon field="low24h" />
+                  </th>
                   <th style={{ ...thStyle, textAlign: 'center' }}>操作</th>
                 </tr>
               </thead>
@@ -481,6 +585,7 @@ export default function MarketsPage() {
                       onMouseEnter={e => (e.currentTarget.style.background = C.hover)}
                       onMouseLeave={e => (e.currentTarget.style.background = i % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.01)')}
                     >
+                      {/* 資產 */}
                       <td style={{ padding: '10px 14px' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                           <div style={{
@@ -497,11 +602,13 @@ export default function MarketsPage() {
                           </div>
                         </div>
                       </td>
+                      {/* 最新價 */}
                       <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
                         {t.loading
                           ? <div style={{ width: 80, height: 16, background: C.hover, borderRadius: 4, marginLeft: 'auto' }} />
                           : <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>${formatPrice(t.price)}</span>}
                       </td>
+                      {/* 24H 漲跌金額 */}
                       <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
                         {t.loading
                           ? <div style={{ width: 60, height: 16, background: C.hover, borderRadius: 4, marginLeft: 'auto' }} />
@@ -509,6 +616,7 @@ export default function MarketsPage() {
                               {t.change >= 0 ? '+' : ''}{formatPrice(Math.abs(t.change))}
                             </span>}
                       </td>
+                      {/* 24H 漲跌幅 */}
                       <td style={{ padding: '10px 14px', textAlign: 'right' }}>
                         {t.loading
                           ? <div style={{ width: 60, height: 16, background: C.hover, borderRadius: 4, marginLeft: 'auto' }} />
@@ -520,12 +628,15 @@ export default function MarketsPage() {
                               {isUp ? '+' : ''}{t.change_pct.toFixed(2)}%
                             </span>}
                       </td>
+                      {/* 日高 */}
                       <td style={{ padding: '10px 14px', textAlign: 'right', fontSize: 12, color: C.green, fontVariantNumeric: 'tabular-nums' }}>
                         {t.loading ? '—' : `$${formatPrice(t.high24h)}`}
                       </td>
+                      {/* 日低 */}
                       <td style={{ padding: '10px 14px', textAlign: 'right', fontSize: 12, color: C.red, fontVariantNumeric: 'tabular-nums' }}>
                         {t.loading ? '—' : `$${formatPrice(t.low24h)}`}
                       </td>
+                      {/* 操作 */}
                       <td style={{ padding: '10px 14px', textAlign: 'center' }}>
                         <button
                           onClick={() => navigate(`/optimize?symbol=${t.symbol}`)}
@@ -539,10 +650,7 @@ export default function MarketsPage() {
                           回測
                         </button>
                         <button
-                          onClick={() => {
-                            localStorage.setItem('chart_symbol', t.symbol)
-                            navigate('/chart')
-                          }}
+                          onClick={() => navigate(`/chart?symbol=${t.symbol}`)}
                           style={{
                             padding: '4px 12px', fontSize: 11, fontWeight: 600,
                             background: 'rgba(255,255,255,0.05)', color: C.muted,
