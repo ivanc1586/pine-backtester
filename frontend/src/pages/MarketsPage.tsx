@@ -247,7 +247,7 @@ type SortDir   = 'asc' | 'desc'
 export default function MarketsPage() {
   const navigate = useNavigate()
 
-  const makeInitial = (list: { symbol: string; label: string; name: string }[], cat: 'crypto' | 'futures'): MarketTicker[] =>
+  const makeInitial = (list: { symbol: string; label: string; name: string }[], cat: 'crypto'): MarketTicker[] =>
     list.map(s => ({ ...s, category: cat, price: 0, change: 0, change_pct: 0, high24h: 0, low24h: 0, volume24h: 0, candles: [], loading: true }))
 
   const [tickers, setTickers] = useState<MarketTicker[]>([
@@ -384,7 +384,7 @@ export default function MarketsPage() {
     return dir * ((a[sortField] as number) - (b[sortField] as number))
   })
 
-  const cryptoTickers   = tickers.filter(t => t.category === 'crypto')
+  const cryptoTickers = tickers.filter(t => t.category === 'crypto')
 
   const thStyle: React.CSSProperties = {
     padding: '10px 14px', textAlign: 'left', fontSize: 11,
