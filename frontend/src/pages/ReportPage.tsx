@@ -104,6 +104,17 @@ function fmtPct(n: number | undefined | null) {
   if (n == null || isNaN(n)) return '—'
   return (n >= 0 ? '+' : '') + n.toFixed(2) + '%'
 }
+function fmtTime(t: string | undefined | null): string {
+  if (!t) return '—'
+  // t is a UTC pandas Timestamp string, e.g. "2024-01-15 08:00:00"
+  // Parse as UTC and display in user's local timezone
+  const dt = new Date(t.replace(' ', 'T') + 'Z')
+  if (isNaN(dt.getTime())) return t
+  return dt.toLocaleString(undefined, {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  })
+}
 
 // ================================================================
 // SVG Equity + Drawdown Chart (dark)
@@ -407,8 +418,8 @@ function TradeTable({ trades }: { trades: TradeRecord[] }) {
                 onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
               >
                 <td style={{ padding: '7px 12px', color: C.muted }}>{trade._idx}</td>
-                <td style={{ padding: '7px 12px', color: C.text, fontVariantNumeric: 'tabular-nums' }}>{trade.entry_time ?? '—'}</td>
-                <td style={{ padding: '7px 12px', color: C.text, fontVariantNumeric: 'tabular-nums' }}>{trade.exit_time ?? '—'}</td>
+                <td style={{ padding: '7px 12px', color: C.text, fontVariantNumeric: 'tabular-nums' }}>{fmtTime(trade.entry_time)}</td>
+                <td style={{ padding: '7px 12px', color: C.text, fontVariantNumeric: 'tabular-nums' }}>{fmtTime(trade.exit_time)}</td>
                 <td style={{ padding: '7px 12px' }}>
                   <span style={{
                     padding: '2px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600,
