@@ -6,7 +6,6 @@
 //   - 頂部「市場概覽」標題 + LIVE 標籤 + 最後更新時間「即時更新」
 //   - 右上角手動刷新按鈕
 //   - 加密貨幣區塊（含 LIVE 標籤）
-//   - 期貨區塊（即時報價）
 //   - 卡片：幣種 icon + 幣對名稱 + 類別標籤
 //           右上：24h 漲跌幅（紅/綠）
 //           中間：大字即時價格（幣種對應顏色）
@@ -20,7 +19,7 @@
 
 import React, { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { TrendingUp, TrendingDown, ArrowUpDown, RefreshCw, Zap, BarChart2 } from 'lucide-react'
+import { TrendingUp, TrendingDown, ArrowUpDown, RefreshCw, Zap } from 'lucide-react'
 
 const C = {
   bg:     '#131722',
@@ -56,11 +55,6 @@ const SYMBOL_COLORS: Record<string, string> = {
   ATOMUSDT:  '#6f7390',
   XAUUSDT:   '#ffd700',
   XAGUSDT:   '#aaaaaa',
-  // Futures
-  'ES=F':    '#2196f3',
-  'NQ=F':    '#00bcd4',
-  'CL=F':    '#795548',
-  'GC=F':    '#ffd700',
 }
 
 // ── 幣種 Icon (emoji fallback) ────────────────────────────────
@@ -69,7 +63,6 @@ const SYMBOL_ICONS: Record<string, string> = {
   XRPUSDT: '✕', ADAUSDT: '₳', DOGEUSDT: 'Ð', AVAXUSDT: '△',
   DOTUSDT: '●', LINKUSDT: '⬡', MATICUSDT: '◈', LTCUSDT: 'Ł',
   UNIUSDT: '🦄', ATOMUSDT: '⚛', XAUUSDT: '◉', XAGUSDT: '◎',
-  'ES=F': 'S', 'NQ=F': 'N', 'CL=F': '🛢', 'GC=F': '◉',
 }
 
 interface Candle { t: number; o: number; h: number; l: number; c: number; v: number }
@@ -78,7 +71,7 @@ interface MarketTicker {
   symbol:      string
   label:       string
   name:        string
-  category:    'crypto' | 'futures'
+  category:    'crypto'
   price:       number
   change:      number   // 24h 漲跌金額
   change_pct:  number   // 24h 漲跌幅
@@ -109,12 +102,6 @@ const CRYPTO_SYMBOLS: { symbol: string; label: string; name: string }[] = [
   { symbol: 'XAGUSDT',   label: 'XAG/USDT',  name: 'Silver'    },
 ]
 
-const FUTURES_SYMBOLS: { symbol: string; label: string; name: string }[] = [
-  { symbol: 'ES=F', label: 'ES/USD',  name: 'S&P 500 Futures' },
-  { symbol: 'NQ=F', label: 'NQ/USD',  name: 'Nasdaq Futures'  },
-  { symbol: 'CL=F', label: 'CL/USD',  name: 'Crude Oil'       },
-  { symbol: 'GC=F', label: 'GC/USD',  name: 'Gold Futures'    },
-]
 
 function formatPrice(p: number) {
   if (p >= 1000) return p.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -194,10 +181,10 @@ function MarketCard({ ticker, onChart, onBacktest }: {
               <span style={{ fontSize: 10, color: C.muted }}>{ticker.name}</span>
               <span style={{
                 fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 3,
-                background: ticker.category === 'crypto' ? 'rgba(38,166,154,0.15)' : 'rgba(41,98,255,0.15)',
-                color: ticker.category === 'crypto' ? C.green : C.blue,
+                background: 'rgba(38,166,154,0.15)',
+                color: C.green,
               }}>
-                {ticker.category === 'crypto' ? '加密貨幣' : '期貨'}
+                加密貨幣
               </span>
             </div>
           </div>
@@ -265,7 +252,6 @@ export default function MarketsPage() {
 
   const [tickers, setTickers] = useState<MarketTicker[]>([
     ...makeInitial(CRYPTO_SYMBOLS, 'crypto'),
-    ...makeInitial(FUTURES_SYMBOLS, 'futures'),
   ])
   const [loading,    setLoading]    = useState(true)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
@@ -341,11 +327,6 @@ export default function MarketsPage() {
       })
     )
 
-    // Futures: mark as not available (no free public API)
-    setTickers(prev => prev.map(t =>
-      t.category === 'futures' ? { ...t, loading: false, price: 0, error: 'N/A' } : t
-    ))
-
     setLoading(false)
     setLastUpdate(new Date())
   }, [])
@@ -403,8 +384,7 @@ export default function MarketsPage() {
     return dir * ((a[sortField] as number) - (b[sortField] as number))
   })
 
-  const cryptoTickers   = tickers.filter(t => t.category === 'crypto').slice(0, 4)
-  const futuresTickers  = tickers.filter(t => t.category === 'futures').slice(0, 4)
+  const cryptoTickers   = tickers.filter(t => t.category === 'crypto')
 
   const thStyle: React.CSSProperties = {
     padding: '10px 14px', textAlign: 'left', fontSize: 11,
@@ -492,31 +472,6 @@ export default function MarketsPage() {
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14 }}>
             {cryptoTickers.map(ticker => (
-              <MarketCard
-                key={ticker.symbol}
-                ticker={ticker}
-                onChart={() => navigate(`/chart?symbol=${ticker.symbol}`)}
-                onBacktest={() => navigate(`/optimize?symbol=${ticker.symbol}`)}
-              />
-            ))}
-          </div>
-        </div>
-
-        {/* ── 期貨區塊 ── */}
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
-            <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>期貨</span>
-            <div style={{
-              display: 'flex', alignItems: 'center', gap: 5,
-              background: 'rgba(41,98,255,0.12)', border: '1px solid rgba(41,98,255,0.3)',
-              borderRadius: 5, padding: '2px 8px',
-            }}>
-              <BarChart2 size={10} style={{ color: C.blue }} />
-              <span style={{ fontSize: 10, fontWeight: 700, color: C.blue }}>LIVE</span>
-            </div>
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14 }}>
-            {futuresTickers.map(ticker => (
               <MarketCard
                 key={ticker.symbol}
                 ticker={ticker}
