@@ -44,6 +44,7 @@ const POPULAR_SYMBOLS = [
   'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT',
   'ADAUSDT','DOGEUSDT','AVAXUSDT','DOTUSDT','MATICUSDT',
   'LINKUSDT','UNIUSDT','LTCUSDT','ATOMUSDT','NEARUSDT',
+  'XAUUSDT','XAGUSDT',
 ]
 const LINE_COLORS = ['#f0b90b','#2196f3','#e040fb','#00e5ff','#ff5252','#69f0ae','#ff6d00','#40c4ff']
 
@@ -746,7 +747,7 @@ export default function ChartPage() {
               <div style={{ maxHeight:220, overflowY:'auto' }}>
                 {filteredSyms.map(s => (
                   <div key={s}
-                    onClick={() => { switchPair(marketType, s, interval); setShowSymP(false); setSearchQ('') }}
+                    onClick={() => { switchPair(['XAUUSDT','XAGUSDT'].includes(s) ? 'futures' : marketType, s, interval); setShowSymP(false); setSearchQ('') }}
                     style={{ padding:'6px 12px', fontSize:12, cursor:'pointer', background: s === symbol ? '#2b2b43' : 'transparent', color: s === symbol ? '#f0b90b' : '#d1d4dc' }}
                     onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = '#2b2b43' }}
                     onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = s === symbol ? '#2b2b43' : 'transparent' }}
@@ -759,26 +760,11 @@ export default function ChartPage() {
 
         {/* Spot / Futures */}
         <div style={{ display:'flex', background:'#1e222d', borderRadius:4, border:'1px solid #2b2b43', overflow:'hidden', marginRight:8 }}>
-          {(['spot','futures'] as MarketType[]).map(m => {
-            const noSpot = m === 'spot' && ['XAUUSDT','XAGUSDT'].includes(symbol)
-            return (
-              <button key={m}
-                disabled={noSpot}
-                onClick={() => !noSpot && switchPair(m, symbol, interval)}
-                title={noSpot ? '貴金屬無現貨交易對' : undefined}
-                style={{
-                  padding:'3px 9px', fontSize:11,
-                  cursor: noSpot ? 'not-allowed' : 'pointer',
-                  border:'none',
-                  fontWeight: marketType===m ? 700 : 400,
-                  background: marketType===m && !noSpot ? '#f0b90b' : 'transparent',
-                  color: noSpot ? '#444' : marketType===m ? '#000' : '#848e9c',
-                  opacity: noSpot ? 0.4 : 1,
-                  textDecoration: noSpot ? 'line-through' : 'none',
-                }}
-              >{m === 'spot' ? '現貨' : '合約'}</button>
-            )
-          })}
+          {(['spot','futures'] as MarketType[]).map(m => (
+            <button key={m} onClick={() => switchPair(m, symbol, interval)}
+              style={{ padding:'3px 9px', fontSize:11, cursor:'pointer', border:'none', fontWeight: marketType===m ? 700 : 400, background: marketType===m ? '#f0b90b' : 'transparent', color: marketType===m ? '#000' : '#848e9c' }}
+            >{m === 'spot' ? '現貨' : '合約'}</button>
+          ))}
         </div>
 
         {/* Divider */}
