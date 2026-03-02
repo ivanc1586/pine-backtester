@@ -6,6 +6,7 @@
 //   - 頂部「市場概覽」標題 + LIVE 標籤 + 最後更新時間「即時更新」
 //   - 右上角手動刷新按鈕
 //   - 加密貨幣區塊（含 LIVE 標籤）
+//   - 期貨區塊（即時報價）
 //   - 卡片：幣種 icon + 幣對名稱 + 類別標籤
 //           右上：24h 漲跌幅（紅/綠）
 //           中間：大字即時價格（幣種對應顏色）
@@ -19,7 +20,7 @@
 
 import React, { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { TrendingUp, TrendingDown, ArrowUpDown, RefreshCw, Zap } from 'lucide-react'
+import { TrendingUp, TrendingDown, ArrowUpDown, RefreshCw, Zap, BarChart2 } from 'lucide-react'
 
 const C = {
   bg:     '#131722',
@@ -55,6 +56,11 @@ const SYMBOL_COLORS: Record<string, string> = {
   ATOMUSDT:  '#6f7390',
   XAUUSDT:   '#ffd700',
   XAGUSDT:   '#aaaaaa',
+  // Futures
+  'ES=F':    '#2196f3',
+  'NQ=F':    '#00bcd4',
+  'CL=F':    '#795548',
+  'GC=F':    '#ffd700',
 }
 
 // ── 幣種 Icon (emoji fallback) ────────────────────────────────
@@ -63,6 +69,7 @@ const SYMBOL_ICONS: Record<string, string> = {
   XRPUSDT: '✕', ADAUSDT: '₳', DOGEUSDT: 'Ð', AVAXUSDT: '△',
   DOTUSDT: '●', LINKUSDT: '⬡', MATICUSDT: '◈', LTCUSDT: 'Ł',
   UNIUSDT: '🦄', ATOMUSDT: '⚛', XAUUSDT: '◉', XAGUSDT: '◎',
+  'ES=F': 'S', 'NQ=F': 'N', 'CL=F': '🛢', 'GC=F': '◉',
 }
 
 interface Candle { t: number; o: number; h: number; l: number; c: number; v: number }
@@ -71,7 +78,7 @@ interface MarketTicker {
   symbol:      string
   label:       string
   name:        string
-  category:    'crypto'
+  category:    'crypto' | 'futures'
   price:       number
   change:      number   // 24h 漲跌金額
   change_pct:  number   // 24h 漲跌幅
@@ -102,6 +109,12 @@ const CRYPTO_SYMBOLS: { symbol: string; label: string; name: string }[] = [
   { symbol: 'XAGUSDT',   label: 'XAG/USDT',  name: 'Silver'    },
 ]
 
+const FUTURES_SYMBOLS: { symbol: string; label: string; name: string }[] = [
+  { symbol: 'ES=F', label: 'ES/USD',  name: 'S&P 500 Futures' },
+  { symbol: 'NQ=F', label: 'NQ/USD',  name: 'Nasdaq Futures'  },
+  { symbol: 'CL=F', label: 'CL/USD',  name: 'Crude Oil'       },
+  { symbol: 'GC=F', label: 'GC/USD',  name: 'Gold Futures'    },
+]
 
 function formatPrice(p: number) {
   if (p >= 1000) return p.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -118,19 +131,19 @@ function formatVolume(v: number) {
 
 // ── SparkLine ──────────────────────────────────────────────────
 function SparkLine({ candles, color }: { candles: Candle[]; color: string }) {
-  if (!candles || candles.length < 2) return <div style={{ height: 72 }} />
+  if (!candles || candles.length < 2) return <div style={{ height: 44 }} />
   const closes = candles.map(c => c.c)
   const min = Math.min(...closes)
   const max = Math.max(...closes)
   const range = max - min || 1
-  const W = 160, H = 72
+  const W = 160, H = 44
   const pts = closes.map((v, i) =>
     `${(i / (closes.length - 1)) * W},${H - ((v - min) / range) * (H - 4) - 2}`
   ).join(' ')
   const fillPts = `0,${H} ${pts} ${W},${H}`
   const gradId = `spark-${color.replace('#', '')}-${Math.random().toString(36).slice(2, 6)}`
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 72 }}>
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 44 }}>
       <defs>
         <linearGradient id={gradId} x1="0" x2="0" y1="0" y2="1">
           <stop offset="0%" stopColor={color} stopOpacity="0.3" />
@@ -181,10 +194,10 @@ function MarketCard({ ticker, onChart, onBacktest }: {
               <span style={{ fontSize: 10, color: C.muted }}>{ticker.name}</span>
               <span style={{
                 fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 3,
-                background: 'rgba(38,166,154,0.15)',
-                color: C.green,
+                background: ticker.category === 'crypto' ? 'rgba(38,166,154,0.15)' : 'rgba(41,98,255,0.15)',
+                color: ticker.category === 'crypto' ? C.green : C.blue,
               }}>
-                加密貨幣
+                {ticker.category === 'crypto' ? '加密貨幣' : '期貨'}
               </span>
             </div>
           </div>
@@ -217,7 +230,7 @@ function MarketCard({ ticker, onChart, onBacktest }: {
       {/* Row 4: 底部 H/L + 回測按鈕 */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         {!ticker.loading && !ticker.error ? (
-          <div style={{ display: 'flex', gap: 8, fontSize: 10 }}>
+          <div style={{ display: 'flex', gap: 12, fontSize: 11 }}>
             <span style={{ color: C.muted }}>H: <span style={{ color: C.green }}>${formatPrice(ticker.high24h)}</span></span>
             <span style={{ color: C.muted }}>L: <span style={{ color: C.red }}>${formatPrice(ticker.low24h)}</span></span>
           </div>
@@ -225,7 +238,7 @@ function MarketCard({ ticker, onChart, onBacktest }: {
         <button
           onClick={e => { e.stopPropagation(); onBacktest(e) }}
           style={{
-            fontSize: 10, fontWeight: 600, padding: '3px 8px',
+            fontSize: 11, fontWeight: 600, padding: '4px 10px',
             background: 'rgba(41,98,255,0.12)', color: C.blue,
             border: `1px solid rgba(41,98,255,0.3)`, borderRadius: 5, cursor: 'pointer',
           }}
@@ -252,6 +265,7 @@ export default function MarketsPage() {
 
   const [tickers, setTickers] = useState<MarketTicker[]>([
     ...makeInitial(CRYPTO_SYMBOLS, 'crypto'),
+    ...makeInitial(FUTURES_SYMBOLS, 'futures'),
   ])
   const [loading,    setLoading]    = useState(true)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
@@ -291,20 +305,13 @@ export default function MarketsPage() {
     await Promise.allSettled(
       CRYPTO_SYMBOLS.map(async ({ symbol }) => {
         try {
-          const isPrecious = symbol === 'XAUUSDT' || symbol === 'XAGUSDT'
-          const tickerUrl = isPrecious
-            ? `https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${symbol}`
-            : undefined
-          const klUrl = isPrecious
-            ? `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=24`
-            : undefined
           const [tickerRes, klRes] = await Promise.all([
-            isPrecious ? fetch(tickerUrl!) : fetchBinance(`/api/v3/ticker/24hr?symbol=${symbol}`),
-            isPrecious ? fetch(klUrl!)     : fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=1h&limit=24`),
+            fetchBinance(`/api/v3/ticker/24hr?symbol=${symbol}`),
+            fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=1h&limit=24`),
           ])
           const td = await tickerRes.json()
           const kd: any[][] = await klRes.json()
-          const candles: Candle[] = Array.isArray(kd) ? kd.map(k => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] })) : []
+          const candles: Candle[] = kd.map(k => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] }))
           setTickers(prev => prev.map(t =>
             t.symbol === symbol
               ? {
@@ -327,46 +334,16 @@ export default function MarketsPage() {
       })
     )
 
+    // Futures: mark as not available (no free public API)
+    setTickers(prev => prev.map(t =>
+      t.category === 'futures' ? { ...t, loading: false, price: 0, error: 'N/A' } : t
+    ))
+
     setLoading(false)
     setLastUpdate(new Date())
   }, [])
 
   useEffect(() => { loadAll() }, [loadAll])
-
-  // ── WebSocket live price updates ─────────────────────────────
-  const wsRefs = React.useRef<Map<string, WebSocket>>(new Map())
-
-  useEffect(() => {
-    CRYPTO_SYMBOLS.forEach(({ symbol }) => {
-      if (wsRefs.current.has(symbol)) return
-      const isPrecious = symbol === 'XAUUSDT' || symbol === 'XAGUSDT'
-      const wsBase = isPrecious
-        ? 'wss://fstream.binance.com/ws'
-        : 'wss://stream.binance.com:9443/ws'
-      const connect = () => {
-        const ws = new WebSocket(`${wsBase}/${symbol.toLowerCase()}@ticker`)
-        wsRefs.current.set(symbol, ws)
-        ws.onmessage = e => {
-          try {
-            const d = JSON.parse(e.data)
-            const price = +(d.c ?? d.p ?? 0)
-            const change_pct = +(d.P ?? 0)
-            if (!isFinite(price) || price === 0) return
-            setTickers(prev => prev.map(t =>
-              t.symbol === symbol
-                ? { ...t, price, change_pct }
-                : t
-            ))
-          } catch {}
-        }
-        ws.onclose = () => { wsRefs.current.delete(symbol); setTimeout(connect, 3000) }
-        ws.onerror = () => ws.close()
-      }
-      connect()
-    })
-    return () => { wsRefs.current.forEach(ws => ws.close()); wsRefs.current.clear() }
-  }, [])
-
 
   const handleSort = (field: SortField) => {
     if (sortField === field) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
@@ -384,7 +361,8 @@ export default function MarketsPage() {
     return dir * ((a[sortField] as number) - (b[sortField] as number))
   })
 
-  const cryptoTickers   = tickers.filter(t => t.category === 'crypto')
+  const cryptoTickers   = tickers.filter(t => t.category === 'crypto').slice(0, 4)
+  const futuresTickers  = tickers.filter(t => t.category === 'futures').slice(0, 4)
 
   const thStyle: React.CSSProperties = {
     padding: '10px 14px', textAlign: 'left', fontSize: 11,
@@ -475,7 +453,40 @@ export default function MarketsPage() {
               <MarketCard
                 key={ticker.symbol}
                 ticker={ticker}
-                onChart={() => navigate(`/chart?symbol=${ticker.symbol}`)}
+                onChart={() => {
+                  localStorage.setItem('chart_symbol', ticker.symbol)
+                  localStorage.setItem('chart_market', ['XAUUSDT','XAGUSDT'].includes(ticker.symbol) ? 'futures' : 'spot')
+                  navigate('/chart')
+                }}
+                onBacktest={() => navigate(`/optimize?symbol=${ticker.symbol}`)}
+              />
+            ))}
+          </div>
+        </div>
+
+        {/* ── 期貨區塊 ── */}
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+            <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>期貨</span>
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 5,
+              background: 'rgba(41,98,255,0.12)', border: '1px solid rgba(41,98,255,0.3)',
+              borderRadius: 5, padding: '2px 8px',
+            }}>
+              <BarChart2 size={10} style={{ color: C.blue }} />
+              <span style={{ fontSize: 10, fontWeight: 700, color: C.blue }}>LIVE</span>
+            </div>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14 }}>
+            {futuresTickers.map(ticker => (
+              <MarketCard
+                key={ticker.symbol}
+                ticker={ticker}
+                onChart={() => {
+                  localStorage.setItem('chart_symbol', ticker.symbol)
+                  localStorage.setItem('chart_market', ['XAUUSDT','XAGUSDT'].includes(ticker.symbol) ? 'futures' : 'spot')
+                  navigate('/chart')
+                }}
                 onBacktest={() => navigate(`/optimize?symbol=${ticker.symbol}`)}
               />
             ))}
@@ -605,7 +616,11 @@ export default function MarketsPage() {
                           回測
                         </button>
                         <button
-                          onClick={() => navigate(`/chart?symbol=${t.symbol}`)}
+                          onClick={() => {
+                            localStorage.setItem('chart_symbol', t.symbol)
+                            localStorage.setItem('chart_market', ['XAUUSDT','XAGUSDT'].includes(t.symbol) ? 'futures' : 'spot')
+                            navigate('/chart')
+                          }}
                           style={{
                             padding: '4px 12px', fontSize: 11, fontWeight: 600,
                             background: 'rgba(255,255,255,0.05)', color: C.muted,
