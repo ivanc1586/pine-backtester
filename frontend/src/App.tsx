@@ -1,22 +1,25 @@
 // ===============================================
 // 主程式入口模組
 // -----------------------------------------------
+// v1.4.0 - 2026-03-02 - 新增 /markets 路由與導覽項目
 // v1.3.0 - 2026-03-01 - 移除 /results、/performance，新增 /report/:id
 // v1.2.0 - 2026-02-28 - 新增首頁（市場概覽 + 近期策略）
 // v1.1.0 - 2026-02-26 - 新增「參數優化」與「績效分析」頁面
 // ===============================================
 
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
-import { Home, LineChart, Code2, Target, TrendingUp } from 'lucide-react'
+import { Home, LineChart, Code2, Target, TrendingUp, BarChart2 } from 'lucide-react'
 import HomePage from './pages/HomePage'
 import ChartPage from './pages/ChartPage'
 import StrategyPage from './pages/StrategyPage'
 import OptimizePage from './pages/OptimizePage'
 import ReportPage from './pages/ReportPage'
+import MarketsPage from './pages/MarketsPage'
 import { useStrategyStore } from './store/strategyStore'
 
 const navItems = [
   { path: '/',           label: '首頁',       icon: Home         },
+  { path: '/markets',    label: '市場',        icon: BarChart2    },
   { path: '/chart',      label: '圖表瀏覽器', icon: LineChart    },
   { path: '/strategy',   label: '策略程式碼', icon: Code2        },
   { path: '/optimize',   label: '參數優化',   icon: Target       },
@@ -65,6 +68,7 @@ export default function App() {
         <main className="flex-1 overflow-y-auto">
           <Routes>
             <Route path="/" element={<HomePage />} />
+            <Route path="/markets" element={<MarketsPage />} />
             <Route path="/chart" element={<ChartPage />} />
             <Route path="/strategy" element={<StrategyPage />} />
             <Route path="/optimize" element={<OptimizePage />} />
