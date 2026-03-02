@@ -30,6 +30,32 @@ const C = {
   purple: '#7c3aed',
 }
 
+const SYMBOL_COLORS: Record<string, string> = {
+  BTCUSDT:   '#f7931a',
+  ETHUSDT:   '#7c3aed',
+  SOLUSDT:   '#9945ff',
+  BNBUSDT:   '#f0b90b',
+  XRPUSDT:   '#006ab4',
+  ADAUSDT:   '#0033ad',
+  DOGEUSDT:  '#c8a400',
+  AVAXUSDT:  '#e84142',
+  DOTUSDT:   '#e6007a',
+  LINKUSDT:  '#2a5ada',
+  MATICUSDT: '#8247e5',
+  LTCUSDT:   '#bfbbbb',
+  UNIUSDT:   '#ff007a',
+  ATOMUSDT:  '#6f7390',
+  XAUUSDT:   '#ffd700',
+  XAGUSDT:   '#aaaaaa',
+}
+
+const SYMBOL_ICONS: Record<string, string> = {
+  BTCUSDT: '\u20BF', ETHUSDT: '\u039E', SOLUSDT: '\u25CE', BNBUSDT: '\u2B21',
+  XRPUSDT: '\u2715', ADAUSDT: '\u20B3', DOGEUSDT: '\u00D0', AVAXUSDT: '\u25B3',
+  DOTUSDT: '\u25CF', LINKUSDT: '\u2B21', MATICUSDT: '\u25C8', LTCUSDT: '\u0141',
+  UNIUSDT: 'U', ATOMUSDT: '\u26DB', XAUUSDT: 'AU', XAGUSDT: 'AG',
+}
+
 // ================================================================
 // Types
 // ================================================================
@@ -132,65 +158,66 @@ function SparkLine({ candles, color }: { candles: Candle[]; color: string }) {
 // ================================================================
 // Ticker Card — #7 layout: name top-left, big price mid-left, change top-right, sparkline bottom
 // ================================================================
-function TickerCard({ ticker, onClick }: { ticker: TickerState; onClick: () => void }) {
-  const isUp = ticker.change_pct >= 0
-  const color = isUp ? C.green : C.red
-
-  const formatPrice = (p: number) => {
-    if (p >= 1000) return p.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-    if (p >= 1)    return p.toFixed(4)
-    return p.toFixed(6)
-  }
+function TickerCard({ ticker, onClick }: { ticker: Ticker; onClick: () => void }) {
+  const isUp   = ticker.change_pct >= 0
+  const color  = ticker.loading ? C.muted : (isUp ? C.green : C.red)
+  const accent = SYMBOL_COLORS[ticker.symbol] ?? C.blue
+  const icon   = SYMBOL_ICONS[ticker.symbol] ?? '\u25CE'
 
   return (
     <div
       onClick={onClick}
       style={{
-        background: C.card, border: `1px solid ${C.border}`, borderRadius: 10,
-        padding: '14px 16px', cursor: 'pointer', transition: 'border-color 0.15s',
-        display: 'flex', flexDirection: 'column', gap: 4,
+        background: C.card, border: `1px solid ${C.border}`, borderRadius: 12,
+        padding: '16px 18px', cursor: 'pointer', transition: 'border-color 0.15s',
+        display: 'flex', flexDirection: 'column', gap: 8,
       }}
-      onMouseEnter={e => (e.currentTarget.style.borderColor = C.purple + '80')}
+      onMouseEnter={e => (e.currentTarget.style.borderColor = accent + '80')}
       onMouseLeave={e => (e.currentTarget.style.borderColor = C.border)}
     >
-      {/* Row 1: name + change badge */}
+      {/* Row 1: icon + 名稱 | 漲跌幅 */}
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
-        <div>
-          <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{ticker.label}</div>
-          <div style={{ fontSize: 11, color: C.muted }}>{ticker.name}</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{
+            width: 32, height: 32, borderRadius: 8, background: accent + '22',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 13, fontWeight: 700, color: accent, flexShrink: 0,
+          }}>
+            {icon}
+          </div>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{ticker.label}</div>
+            <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>{ticker.name}</div>
+          </div>
         </div>
         {ticker.loading ? (
-          <div style={{ width: 56, height: 22, background: C.hover, borderRadius: 4, animation: 'pulse 1.5s infinite' }} />
-        ) : ticker.error ? (
-          <div style={{ fontSize: 11, color: C.red }}>Error</div>
+          <div style={{ width: 60, height: 22, background: C.hover, borderRadius: 4, animation: 'pulse 1.5s infinite' }} />
         ) : (
           <div style={{
-            display: 'flex', alignItems: 'center', gap: 4,
+            display: 'flex', alignItems: 'center', gap: 3,
             background: isUp ? 'rgba(38,166,154,0.15)' : 'rgba(239,83,80,0.15)',
             color, borderRadius: 6, padding: '3px 8px', fontSize: 12, fontWeight: 700,
           }}>
-            {isUp ? <TrendingUp style={{ width: 12, height: 12 }} /> : <TrendingDown style={{ width: 12, height: 12 }} />}
+            {isUp ? <TrendingUp style={{ width: 11, height: 11 }} /> : <TrendingDown style={{ width: 11, height: 11 }} />}
             {ticker.change_pct >= 0 ? '+' : ''}{ticker.change_pct.toFixed(2)}%
           </div>
         )}
       </div>
 
-      {/* Row 2: big price */}
-      <div style={{ fontSize: 20, fontWeight: 700, color: C.text, letterSpacing: '-0.5px', fontVariantNumeric: 'tabular-nums' }}>
-        {ticker.loading ? (
-          <div style={{ width: 100, height: 24, background: C.hover, borderRadius: 4 }} />
-        ) : ticker.error ? '—' : `$${formatPrice(ticker.price)}`}
+      {/* Row 2: 大字即時價格 */}
+      <div style={{ fontSize: 22, fontWeight: 700, color: accent, letterSpacing: '-0.5px', fontVariantNumeric: 'tabular-nums' }}>
+        {ticker.loading
+          ? <div style={{ width: 120, height: 28, background: C.hover, borderRadius: 4 }} />
+          : ticker.error ? '—' : `$${formatPrice(ticker.price)}`}
       </div>
 
-      {/* Row 3: sparkline */}
-      <SparkLine candles={ticker.candles} color={color} />
+      {/* Row 3: 迷你走勢折線圖 */}
+      <SparkLine candles={ticker.candles} color={ticker.loading || ticker.error ? C.muted : color} />
     </div>
   )
 }
 
-// ================================================================
-// All Markets Modal
-// ================================================================
+
 function AllMarketsModal({
   tickers, onClose, onSelect,
 }: {
