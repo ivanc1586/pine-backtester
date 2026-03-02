@@ -281,12 +281,24 @@ export default function MarketsPage() {
     await Promise.allSettled(
       CRYPTO_SYMBOLS.map(async ({ symbol }) => {
         try {
-          const [tickerRes, klRes] = await Promise.all([
-            fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`),
-            fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=24`),
-          ])
-          const td = await tickerRes.json()
-          const kd: any[][] = await klRes.json()
+          const binanceHosts = ['https://api.binance.us', 'https://api.binance.com']
+          let td: any = null
+          let kd: any[][] = []
+          for (const host of binanceHosts) {
+            try {
+              const [tickerRes, klRes] = await Promise.all([
+                fetch(`${host}/api/v3/ticker/24hr?symbol=${symbol}`),
+                fetch(`${host}/api/v3/klines?symbol=${symbol}&interval=1h&limit=24`),
+              ])
+              if (!tickerRes.ok || !klRes.ok) throw new Error('HTTP error')
+              td = await tickerRes.json()
+              kd = await klRes.json()
+              break
+            } catch {
+              continue
+            }
+          }
+          if (!td) throw new Error('All Binance endpoints failed')
           const candles: Candle[] = kd.map(k => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] }))
           setTickers(prev => prev.map(t =>
             t.symbol === symbol
@@ -366,6 +378,13 @@ export default function MarketsPage() {
         ::-webkit-scrollbar-track { background:${C.bg}; }
         ::-webkit-scrollbar-thumb { background:${C.border}; border-radius:3px; }
       `}</style>
+
+        {!loading && tickers.every(t => !!t.error) && (
+          <div style={{ textAlign: 'center', padding: '80px 0', color: C.muted }}>
+            <div style={{ fontSize: 18, marginBottom: 8 }}>無法載入市場資料</div>
+            <div style={{ fontSize: 13 }}>Binance API 連線失敗，請點擊重新整理或稍後再試</div>
+          </div>
+        )}
 
       <div style={{ maxWidth: 1440, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 28 }}>
 
